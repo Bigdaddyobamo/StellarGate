@@ -369,5 +369,14 @@ pub fn render(webhook: &WebhookMetrics, auth: &AuthMetrics, tasks: &crate::TaskH
         ));
     }
 
+    out.push_str(
+        "# HELP stellargate_gateway_account_exists Whether the gateway account exists on the ledger (1) or not (0).\n",
+    );
+    out.push_str("# TYPE stellargate_gateway_account_exists gauge\n");
+    out.push_str(&format!(
+        "stellargate_gateway_account_exists {}\n",
+        if tasks.gateway_account_exists() { 1 } else { 0 }
+    ));
+
     out
 }

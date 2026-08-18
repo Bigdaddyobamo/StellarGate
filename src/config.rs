@@ -222,6 +222,8 @@ pub struct Config {
     /// means no proxy is trusted and the headers are always ignored — the
     /// safe default for a directly-exposed gateway.
     pub trusted_proxy_cidrs: Vec<IpNet>,
+    /// Whether to abort boot if the configured gateway account does not exist.
+    pub require_gateway_account: bool,
 }
 
 impl Config {
@@ -324,6 +326,7 @@ impl Config {
             trusted_proxy_cidrs: parse_cidrs(
                 &std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
             )?,
+            require_gateway_account: parse_env("REQUIRE_GATEWAY_ACCOUNT", false)?,
         };
         config.validate_addresses()?;
         config.validate_timing()?;

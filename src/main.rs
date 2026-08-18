@@ -71,7 +71,7 @@ async fn main() -> Result<()> {
     });
 
     if state.config.gateway_configured() {
-        report_trustlines(&state).await;
+        horizon::verify_gateway_account(&state).await?;
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -185,21 +185,7 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client> {
         .build()?)
 }
 
-/// Report whether every accepted asset has a trustline on the gateway account.
-/// Advisory only: a missing trustline doesn't block boot, it just means
-/// payments in that asset will bounce until the trustline is added.
-async fn report_trustlines(state: &Arc<AppState>) {
-    match horizon::check_trustlines(state).await {
-        Ok(missing) if missing.is_empty() => {
-            info!("gateway trustlines verified for all accepted assets")
-        }
-        Ok(missing) => info!(
-            ?missing,
-            "accepted assets with no trustline on the gateway account"
-        ),
-        Err(e) => warn!(error = %e, "could not verify gateway trustlines at startup"),
-    }
-}
+
 
 /// Await a supervisor during shutdown. Panics are caught inside the
 /// supervisor's child spawn, so a `JoinError` here means the supervisor
