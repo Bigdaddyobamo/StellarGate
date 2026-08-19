@@ -10,13 +10,26 @@ use stellargate::{
     db, AppState,
 };
 use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// A fresh, uniquely-named in-memory SQLite database with `cache=shared`, so
+/// every connection the pool opens talks to the SAME database. A bare
+/// `sqlite::memory:` DSN gives each pooled connection its own private
+/// database — with the default multi-connection pool these tests build, a
+/// query could land on a connection that has never seen data written by an
+/// earlier query in the same test, and the suite would only pass by
+/// connection-reuse luck (issue #309). The random name keeps parallel test
+/// binaries from colliding with each other.
+fn shared_memory_dsn() -> String {
+    format!("sqlite:file:{}?mode=memory&cache=shared", Uuid::new_v4())
+}
 
 fn make_config() -> Config {
     Config {
         port: 0,
-        database_url: "sqlite::memory:".into(),
+        database_url: shared_memory_dsn(),
         network: "testnet".into(),
         horizon_url: String::new(),
         gateway_public: "UNCONFIGURED".into(),
@@ -54,7 +67,10 @@ fn make_config() -> Config {
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
         request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
+        max_payment_amount: Default::default(),
+        min_payment_amount: Default::default(),
     }
 }
 
@@ -77,11 +93,10 @@ async fn server_with_config_and_health(
     task_health: stellargate::TaskHealth,
 ) -> (TestServer, db::Db) {
     let pool = SqlitePoolOptions::new()
-        .connect_with(
-            SqliteConnectOptions::from_str(&cfg.database_url)
-                .unwrap()
-                .create_if_missing(true),
-        )
+        // A shared-cache in-memory database is dropped once its last
+        // connection closes — keep exactly one open for the pool's lifetime.
+        .min_connections(1)
+        .connect_with(SqliteConnectOptions::from_str(&cfg.database_url).unwrap())
         .await
         .unwrap();
     db::migrate(&pool).await.unwrap();
@@ -820,6 +835,106 @@ async fn test_create_invalid_amount() {
     res.assert_status(StatusCode::BAD_REQUEST);
 }
 
+// ── Configurable min/max payment amount (issue #310) ───────────────────────
+
+/// An amount over the configured `MAX_PAYMENT_AMOUNT` is rejected with a
+/// distinct code and a message naming the configured limit — not the
+/// overflow-derived `invalid_amount` used for genuinely malformed input.
+#[tokio::test]
+async fn test_create_amount_over_configured_max_is_rejected() {
+    let mut cfg = make_config();
+    cfg.max_payment_amount =
+        stellargate::config::AmountLimit::parse("100", "MAX_PAYMENT_AMOUNT").unwrap();
+    let (server, _pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "100.0000001", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert_eq!(body["code"], "amount_out_of_range");
+    let message = body["error"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("100"),
+        "message must name the configured limit: {message}"
+    );
+}
+
+/// The boundary itself — exactly the configured maximum — is accepted, not
+/// rejected: the limit is inclusive.
+#[tokio::test]
+async fn test_create_amount_at_configured_max_is_accepted() {
+    let mut cfg = make_config();
+    cfg.max_payment_amount =
+        stellargate::config::AmountLimit::parse("100", "MAX_PAYMENT_AMOUNT").unwrap();
+    let (server, _pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "100", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// An amount under the configured `MIN_PAYMENT_AMOUNT` is rejected the same
+/// way, and the boundary itself is accepted.
+#[tokio::test]
+async fn test_create_amount_under_configured_min_is_rejected() {
+    let mut cfg = make_config();
+    cfg.min_payment_amount =
+        stellargate::config::AmountLimit::parse("1", "MIN_PAYMENT_AMOUNT").unwrap();
+    let (server, _pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "0.9999999", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "amount_out_of_range");
+
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "1", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
+/// A per-asset override (`USDC:50`) wins over the bare default (`100`) for
+/// that asset specifically, while every other asset still uses the default.
+#[tokio::test]
+async fn test_create_amount_per_asset_override_wins_over_default() {
+    let mut cfg = make_config();
+    cfg.max_payment_amount =
+        stellargate::config::AmountLimit::parse("100,USDC:50", "MAX_PAYMENT_AMOUNT").unwrap();
+    let (server, _pool) = server_with_config(cfg).await;
+    let key = provision_merchant(&server).await;
+
+    // USDC: the specific 50 cap applies, not the 100 default.
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "60", "asset": "USDC" }))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    assert_eq!(res.json::<Value>()["code"], "amount_out_of_range");
+
+    // XLM has no specific entry, so the 100 default applies — 60 is fine.
+    let res = server
+        .post("/payments")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .json(&json!({ "amount": "60", "asset": "XLM" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+}
+
 #[tokio::test]
 async fn test_get_by_id() {
     let server = test_server().await;
@@ -1444,6 +1559,39 @@ async fn test_list_cursor_invalid() {
         .add_header("Authorization", format!("Bearer {key}"))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
+}
+
+/// Regression for #303: `offset` beyond the documented ceiling must be
+/// rejected rather than answered with a full scan-and-skip.
+#[tokio::test]
+async fn test_list_offset_above_max_is_rejected() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments?offset=10001")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::BAD_REQUEST);
+    let body: Value = res.json();
+    assert_eq!(body["code"], "invalid_offset");
+    assert!(
+        body["error"].as_str().unwrap().contains("cursor"),
+        "error message should point callers at cursor pagination, got: {}",
+        body["error"]
+    );
+}
+
+/// The ceiling itself must still be answered normally — only values *above*
+/// it are rejected.
+#[tokio::test]
+async fn test_list_offset_at_max_is_accepted() {
+    let server = test_server().await;
+    let key = provision_merchant(&server).await;
+    let res = server
+        .get("/payments?offset=10000")
+        .add_header("Authorization", format!("Bearer {key}"))
+        .await;
+    res.assert_status(StatusCode::OK);
 }
 
 #[tokio::test]

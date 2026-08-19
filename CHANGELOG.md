@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Audit events for every state-changing operation.** Authentication
+  outcomes and key issuance/revocation were already logged with
+  `merchant_id`/`source_ip`, but payment creation, webhook redelivery
+  (single and bulk), and merchant provisioning logged nothing — and
+  provisioning, the one action that mints a credential, logged only its
+  *failures*. Each now emits a structured `tracing` event carrying a stable
+  `audit = true` marker plus `action`, `actor` (`merchant`/`admin`),
+  `merchant_id`, `source_ip`, `request_id`, `outcome`, and the affected
+  resource id, documented in a new "Audit events" section of the README.
+  `client_ip_key` (the fail-closed IP attribution already used for rate
+  limiting and auth logs) is now reusable from any handler via
+  `client_ip_key_from_parts`, so every audit event uses the same source
+  attribution as everything else (issue #305).
+
 ### Fixed
+
+- **Test pools now use a genuinely shared in-memory SQLite database.** Every
+  test suite built its pool from the DSN `sqlite::memory:` while allowing
+  more than one pooled connection (the default). A bare `sqlite::memory:`
+  DSN gives each connection its own **private** database, so which data a
+  query saw depended on which pooled connection it happened to get — the
+  suite passed by connection-reuse luck, not by construction.
+  `tests/concurrency_tests.rs` was the sharpest instance: it exists to prove
+  the single-settlement guarantee under *concurrent* reconciliation (issue
+  #78), which only means something if concurrent tasks can land on genuinely
+  different pooled connections talking to the *same* database. Every test
+  pool now connects with `sqlite:file:<random-name>?mode=memory&cache=shared`
+  plus `min_connections(1)` (so the shared database survives for the pool's
+  lifetime), and a new `tests/db_shared_memory_tests.rs` proves both that the
+  fixture is genuinely shared and that the old bare-DSN form is not, so the
+  footgun can't be silently reintroduced (issue #309).
 
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
