@@ -300,14 +300,10 @@ impl TaskHealth {
         unix_now_secs().saturating_sub(self.inner.last_success_unix.load(Ordering::Relaxed))
     }
 
-    pub fn set_gateway_account_exists(&self, exists: bool) {
-        self.inner
-            .gateway_account_exists
-            .store(exists, Ordering::Relaxed);
-    }
-
-    pub fn gateway_account_exists(&self) -> bool {
-        self.inner.gateway_account_exists.load(Ordering::Relaxed)
+    /// The raw Unix timestamp `note_success` last recorded (`0` if it never
+    /// has). Exposed as a gauge on `/metrics` (issue #313).
+    pub fn last_success_unix(&self) -> i64 {
+        self.inner.last_success_unix.load(Ordering::Relaxed)
     }
 }
 
@@ -341,6 +337,10 @@ pub struct AppState {
     /// Exposed via `GET /metrics` so credential-stuffing or misconfigured
     /// clients are visible without grepping logs.
     pub auth_metrics: metrics::AuthMetrics,
+    /// Horizon poll cycle outcome counters: success/rate_limited/error.
+    /// Exposed via `GET /metrics` so sustained throttling is a queryable fact
+    /// rather than indistinguishable `warn!` lines (issue #313).
+    pub horizon_metrics: metrics::HorizonMetrics,
     /// Background task health: per-task liveness (drives `/health`), the last
     /// successful on-chain progress (drives `/ready`'s cursor-freshness check),
     /// and started/stopped/failure/restart counts for monitoring and alerting.
