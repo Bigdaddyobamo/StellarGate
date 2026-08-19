@@ -421,7 +421,12 @@ pub async fn verify_gateway_account(state: &Arc<AppState>) -> anyhow::Result<()>
     }
 
     let resp = resp.error_for_status().map_err(|e| {
-        anyhow::anyhow!("HTTP status client error ({}): could not verify gateway trustlines", e.status().map(|s| s.to_string()).unwrap_or_else(|| "unknown".into()))
+        anyhow::anyhow!(
+            "HTTP status client error ({}): could not verify gateway trustlines",
+            e.status()
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "unknown".into())
+        )
     })?;
 
     state.task_health.set_gateway_account_exists(true);

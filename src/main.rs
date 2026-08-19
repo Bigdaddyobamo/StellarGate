@@ -205,8 +205,6 @@ fn http_client(timeout: Duration) -> Result<reqwest::Client> {
         .build()?)
 }
 
-
-
 /// Await a supervisor during shutdown. Panics are caught inside the
 /// supervisor's child spawn, so a `JoinError` here means the supervisor
 /// itself failed — record it so the failure counter still fires.
