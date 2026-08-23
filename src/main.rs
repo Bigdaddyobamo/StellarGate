@@ -58,6 +58,7 @@ async fn main() -> Result<()> {
     let pool = open_pool(&cfg).await?;
     db::migrate(&pool).await?;
     db::backfill_asset_issuers(&pool, &cfg.accepted_assets).await?;
+    db::optimize(&pool).await?;
 
     let state = Arc::new(AppState {
         pool,
@@ -151,6 +152,7 @@ async fn main() -> Result<()> {
 
     // Captured before `state` is moved into `api::router` below.
     let shutdown_grace = Duration::from_secs(state.config.shutdown_grace_secs);
+    let pool_for_optimize = state.pool.clone();
 
     axum::serve(
         listener,
@@ -177,6 +179,12 @@ async fn main() -> Result<()> {
         );
     }
 
+    // Run PRAGMA optimize before final shutdown to update query planner stats
+    // for the next boot. This is SQLite's recommended shutdown sequence.
+    if let Err(e) = db::optimize(&pool_for_optimize).await {
+        warn!(error = %e, "PRAGMA optimize failed during shutdown");
+    }
+
     info!("shutdown complete");
     Ok(())
 }
@@ -195,19 +203,19 @@ async fn main() -> Result<()> {
 ///   checkpointing alone does not provide: a `PASSIVE` checkpoint skips
 ///   rather than blocks when it cannot get the read lock it needs, so a
 ///   long-lived reader can defer it indefinitely and let the WAL grow
-///   without bound under sustained write load. `journal_size_limit` caps
-///   how large the `-wal` file is allowed to grow before SQLite truncates
-///   it back down on the next checkpoint that *does* run, regardless of how
-///   much of the WAL that checkpoint actually flushed — so the on-disk
-///   footprint has a hard ceiling even when checkpoints are being starved.
+///   without bound under sustained write load. Configurable via
+///   `SQLITE_WAL_AUTOCHECKPOINT` and capped by `SQLITE_JOURNAL_SIZE_LIMIT`,
+///   which truncates the -wal file at a hard ceiling regardless of whether
+///   checkpoints are starved.
 async fn open_pool(cfg: &Config) -> Result<db::Db> {
     let opts = SqliteConnectOptions::from_str(&cfg.database_url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .busy_timeout(Duration::from_millis(cfg.db_busy_timeout_ms))
-        .pragma("wal_autocheckpoint", "1000")
-        .pragma("journal_size_limit", "67108864");
+        .pragma("wal_autocheckpoint", cfg.sqlite_wal_autocheckpoint.to_string())
+        .pragma("journal_size_limit", cfg.sqlite_journal_size_limit.to_string())
+        .pragma("cache_size", cfg.sqlite_cache_size.to_string());
 
     Ok(SqlitePoolOptions::new()
         .max_connections(cfg.db_pool_max_connections)

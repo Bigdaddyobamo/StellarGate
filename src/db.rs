@@ -3,6 +3,16 @@ use sqlx::{Pool, Row, Sqlite};
 
 pub type Db = Pool<Sqlite>;
 
+/// Run `PRAGMA optimize` to update SQLite query planner statistics. Should be
+/// called periodically (e.g., at startup after migration and during graceful
+/// shutdown) to keep query plans aligned with actual table sizes and
+/// distributions. Without this, every index added by the schema is used
+/// according to whatever the planner guesses, not what ANALYZE has measured.
+pub async fn optimize(pool: &Db) -> Result<()> {
+    sqlx::query("PRAGMA optimize").execute(pool).await?;
+    Ok(())
+}
+
 /// Normalize a raw SQLite timestamp to strict RFC 3339 UTC with a Z suffix.
 ///
 /// Handles both legacy rows (`"2026-04-29 15:00:00"` / `"2026-04-29T15:00:00"`)

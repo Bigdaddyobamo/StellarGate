@@ -416,6 +416,23 @@ pub struct Config {
     /// picked up next cycle, so a backlog drains over several passes instead
     /// of one long stall. Defaults to 50,000.
     pub retention_max_rows_per_cycle: u64,
+    /// SQLite WAL auto-checkpoint threshold, in pages. SQLite checkpoints
+    /// (flushes WAL to main DB) when a write transaction ends and the WAL
+    /// has grown past this size, but only if no reader holds an old snapshot.
+    /// Under sustained write load with long-lived readers, checkpoints can be
+    /// starved and the WAL grows unbounded. `journal_size_limit` caps the
+    /// on-disk footprint regardless. Defaults to 1000 pages.
+    pub sqlite_wal_autocheckpoint: u32,
+    /// Maximum size (bytes) the -wal file may grow before SQLite truncates it
+    /// on the next successful checkpoint. Even when checkpoints are starved by
+    /// long-lived readers, this ensures the on-disk footprint has a hard
+    /// ceiling. Defaults to 64 MiB (67108864 bytes).
+    pub sqlite_journal_size_limit: i64,
+    /// SQLite page cache size, in pages (negative) or KiB (positive). A
+    /// negative value means pages; the default of -2000 is ~2000 pages × 4 KiB
+    /// ≈ 8 MiB for the payments workload. Raising this reduces disk I/O on
+    /// index-heavy queries at the cost of resident memory. Defaults to -2000.
+    pub sqlite_cache_size: i32,
 }
 
 impl Config {
@@ -556,11 +573,15 @@ impl Config {
             horizon_page_limit: parse_env("HORIZON_PAGE_LIMIT", 200)?,
             db_prune_batch_size: parse_env("DB_PRUNE_BATCH_SIZE", 500)?,
             retention_max_rows_per_cycle: parse_env("RETENTION_MAX_ROWS_PER_CYCLE", 50_000)?,
+            sqlite_wal_autocheckpoint: parse_env("SQLITE_WAL_AUTOCHECKPOINT", 1000)?,
+            sqlite_journal_size_limit: parse_env("SQLITE_JOURNAL_SIZE_LIMIT", 67_108_864)?,
+            sqlite_cache_size: parse_env("SQLITE_CACHE_SIZE", -2000)?,
         };
         config.validate_addresses()?;
         config.validate_timing()?;
         config.validate_amount_limits()?;
         config.validate_limits()?;
+        config.validate_sqlite()?;
         Ok(config)
     }
 
@@ -720,6 +741,38 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "RETENTION_MAX_ROWS_PER_CYCLE must be > 0 (got 0). \
                  A zero per-cycle cap would make retention pruning a no-op."
+            ));
+        }
+
+        Ok(())
+    }
+
+    /// Validate SQLite tuning parameters. These directly affect database
+    /// behavior and can cause performance issues or unbounded growth if
+    /// misconfigured.
+    fn validate_sqlite(&self) -> Result<()> {
+        if self.sqlite_wal_autocheckpoint == 0 {
+            return Err(anyhow::anyhow!(
+                "SQLITE_WAL_AUTOCHECKPOINT must be > 0 (got 0). \
+                 A zero threshold disables auto-checkpointing entirely, allowing \
+                 the WAL to grow without bound."
+            ));
+        }
+
+        if self.sqlite_journal_size_limit <= 0 {
+            return Err(anyhow::anyhow!(
+                "SQLITE_JOURNAL_SIZE_LIMIT must be > 0 (got {}). \
+                 A zero or negative limit would make the WAL file grow unchecked, \
+                 risking disk-full outages.",
+                self.sqlite_journal_size_limit
+            ));
+        }
+
+        if self.sqlite_cache_size == 0 {
+            return Err(anyhow::anyhow!(
+                "SQLITE_CACHE_SIZE must be non-zero (got 0). \
+                 A zero cache disables page caching entirely, severely degrading \
+                 query performance."
             ));
         }
 
