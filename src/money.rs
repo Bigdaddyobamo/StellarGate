@@ -242,8 +242,8 @@ mod property_tests {
                     canonical2,
                     "Canonicalization not idempotent: '{}' -> '{}' -> '{}'",
                     s,
-                    canonical1,
-                    canonical2
+                    canonical1.clone(),
+                    canonical2.clone()
                 );
             }
         }
@@ -428,4 +428,3 @@ mod property_tests {
         }
     }
 }
-
