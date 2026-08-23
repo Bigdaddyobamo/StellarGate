@@ -137,6 +137,22 @@ signing, and the HTTP API (create, fetch, list/filter, validation).
 
 ## API Reference
 
+### Error responses
+
+All JSON error responses use the following envelope:
+
+```json
+{
+  "error": "invalid request body",
+  "code": "invalid_request",
+  "request_id": "2f4a8d7e-1c1f-4b9b-9e4d-6f1c7d9f4f20"
+}
+```
+
+The `request_id` value matches the `X-Request-Id` response header. Include it
+when reporting an error so operators can correlate the response with server
+logs.
+
 ### `POST /merchants`
 
 Provision a new merchant and return its API key. This is an **admin-only**

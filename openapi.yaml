@@ -331,9 +331,13 @@ components:
 
     ErrorResponse:
       type: object
-      required: [error, code]
+      required: [error, code, request_id]
       properties:
         error:
           type: string
         code:
           type: string
+        request_id:
+          type: string
+          format: uuid
+          description: Request correlation ID. It matches the X-Request-Id response header.

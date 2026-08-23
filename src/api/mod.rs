@@ -1,9 +1,10 @@
 use crate::{db, AppState};
 use axum::{
+    body::{to_bytes, Body},
     extract::{ConnectInfo, Request, State},
     http::{header, HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json,
 };
@@ -13,6 +14,7 @@ use std::net::SocketAddr;
 use std::num::NonZeroU32;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tracing::Instrument;
 use tower_http::{
     cors::CorsLayer,
     limit::RequestBodyLimitLayer,
@@ -89,6 +91,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(request_id_context))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(RequestBodyLimitLayer::new(MAX_BODY_BYTES))
         .layer(middleware::from_fn_with_state(
@@ -101,6 +104,56 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
             request_timeout,
         ))
         .with_state(state)
+}
+
+async fn request_id_context(req: Request, next: Next) -> Response {
+    let request_id = req
+        .headers()
+        .get(header::HeaderName::from_static("x-request-id"))
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("missing");
+    let span = tracing::info_span!("http_request", request_id = %request_id);
+    let response = next.run(req).instrument(span).await;
+
+    add_request_id_to_error(response, request_id).await
+}
+
+async fn add_request_id_to_error(response: Response, request_id: &str) -> Response {
+    if !(response.status().is_client_error() || response.status().is_server_error()) {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let is_json = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"));
+    if !is_json {
+        return Response::from_parts(parts, body);
+    }
+
+    let Ok(bytes) = to_bytes(body, 1024 * 1024).await else {
+        return Response::from_parts(parts, Body::empty());
+    };
+    let Ok(mut value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "request_id".to_string(),
+            serde_json::Value::String(request_id.to_string()),
+        );
+        if let Ok(body) = serde_json::to_vec(&value) {
+            let mut parts = parts;
+            if let Ok(content_length) = HeaderValue::from_str(&body.len().to_string()) {
+                parts.headers.insert(header::CONTENT_LENGTH, content_length);
+            }
+            return Response::from_parts(parts, Body::from(body));
+        }
+    }
+
+    Response::from_parts(parts, Body::from(bytes))
 }
 
 async fn auth_middleware(
