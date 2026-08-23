@@ -1,5 +1,5 @@
 use anyhow::Result;
-use sqlx::{Pool, Row, Sqlite};
+use sqlx::{Acquire, Pool, Row, Sqlite};
 
 pub type Db = Pool<Sqlite>;
 
@@ -24,6 +24,8 @@ fn normalize_ts(raw: &str) -> String {
 }
 
 pub async fn migrate(pool: &Db) -> Result<()> {
+    let mut tx = pool.begin().await?;
+
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS payments (
             id TEXT PRIMARY KEY,
@@ -41,7 +43,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             expires_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now','+1 hour'))
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Bring pre-existing payment tables up to schema. New databases already have
@@ -51,11 +53,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_expires_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_expires_at == 0 {
         sqlx::query("ALTER TABLE payments ADD COLUMN expires_at TEXT")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
     /* Backfill any row without an expiry (legacy rows, or rows inserted in the
@@ -66,19 +68,19 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour')
           WHERE expires_at IS NULL",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     sqlx::query(
@@ -94,7 +96,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Bring pre-existing delivery tables up to schema. `event_type` records
@@ -105,11 +107,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_event_type: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'event_type'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_event_type == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -122,7 +124,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Merchants are provisioned via POST /merchants. The raw API key is never
@@ -135,7 +137,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Idempotency keys for payment creation. A key is unique per merchant and
@@ -151,7 +153,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             PRIMARY KEY (merchant_id, idempotency_key)
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Every on-chain transaction we credit to an intent, one row per
@@ -169,7 +171,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             PRIMARY KEY (payment_id, tx_hash)
         )",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
@@ -180,7 +182,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         "SELECT id, tx_hash, paid_amount FROM payments
          WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
     for row in &legacy {
         let id: String = row.get("id");
@@ -195,7 +197,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .bind(&id)
             .bind(&tx_hash)
             .bind(stroops)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
         }
     }
@@ -213,9 +215,10 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             tbl_col.0,
             col = tbl_col.1
         );
-        sqlx::query(&sql).execute(pool).await?;
+        sqlx::query(&sql).execute(&mut *tx).await?;
     }
 
+    tx.commit().await?;
     Ok(())
 }
 
