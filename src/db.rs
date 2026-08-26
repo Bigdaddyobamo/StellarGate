@@ -1564,35 +1564,52 @@ pub async fn create_api_key(
 
 /// Resolve a raw API key to its merchant, rejecting revoked keys.
 ///
-/// Also refreshes `last_used_at`, but at most once a minute per key: this runs
-/// on every authenticated request, and SQLite takes a write lock for each
-/// update, so touching it unconditionally would put a write in the path of
-/// every read. Minute granularity is plenty to spot a key that has gone quiet
-/// or one that is being used when it should not be.
+/// Also refreshes `last_used_at`, but at most once a minute per key: the
+/// SELECT fetches the current value and only issues an UPDATE when it is
+/// NULL or stale, avoiding a write transaction on every authenticated request.
+/// Minute granularity is plenty to spot a key that has gone quiet or one that
+/// is being used when it should not be.
 pub async fn find_merchant_by_key(pool: &Db, raw_key: &str) -> Result<Option<String>> {
     let hash = hash_api_key(raw_key);
 
-    let row: Option<(String, String)> = sqlx::query_as(
-        "SELECT id, merchant_id FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
+    let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT id, merchant_id, last_used_at FROM api_keys WHERE key_hash = ? AND revoked_at IS NULL",
     )
     .bind(&hash)
     .fetch_optional(pool)
     .await?;
 
-    let Some((key_id, merchant_id)) = row else {
+    let Some((key_id, merchant_id, last_used_at)) = row else {
         return Ok(None);
     };
 
-    sqlx::query(
-        "UPDATE api_keys
-            SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
-          WHERE id = ?
-            AND (last_used_at IS NULL
-                 OR last_used_at < strftime('%Y-%m-%dT%H:%M:%SZ','now','-60 seconds'))",
-    )
-    .bind(&key_id)
-    .execute(pool)
-    .await?;
+    // Only issue the UPDATE if last_used_at is stale or NULL. Parse the
+    // timestamp and compare in application code to avoid a write transaction
+    // on every request — SQLite takes a write lock even for a zero-row UPDATE.
+    let needs_update = match last_used_at {
+        None => true,
+        Some(ts) => {
+            // Parse the stored RFC 3339 timestamp and check if it's older than 60 seconds.
+            match time::OffsetDateTime::parse(&ts, &time::format_description::well_known::Rfc3339)
+            {
+                Ok(last_used) => {
+                    let now = time::OffsetDateTime::now_utc();
+                    let age = now - last_used;
+                    age.whole_seconds() >= 60
+                }
+                Err(_) => true, // If parse fails, update to fix the bad timestamp
+            }
+        }
+    };
+
+    if needs_update {
+        sqlx::query(
+            "UPDATE api_keys SET last_used_at = strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id = ?",
+        )
+        .bind(&key_id)
+        .execute(pool)
+        .await?;
+    }
 
     Ok(Some(merchant_id))
 }
