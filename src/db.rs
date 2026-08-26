@@ -1,6 +1,5 @@
 use anyhow::Result;
-use sqlx::{Pool, Row, Sqlite};
-use tracing::info;
+use sqlx::{Acquire, Pool, Row, Sqlite};
 
 pub type Db = Pool<Sqlite>;
 
@@ -86,11 +85,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_expires_at: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_expires_at == 0 {
         sqlx::query("ALTER TABLE payments ADD COLUMN expires_at TEXT")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
     /* Backfill any row without an expiry (legacy rows, or rows inserted in the
@@ -101,7 +100,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             SET expires_at = strftime('%Y-%m-%dT%H:%M:%SZ', created_at, '+1 hour')
           WHERE expires_at IS NULL",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Pin each intent to the issuer it was priced in. Rows written before this
@@ -119,15 +118,15 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     }
 
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_memo ON payments(memo)")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)")
-        .execute(pool)
+        .execute(&mut *tx)
         .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_payments_created_id ON payments(created_at DESC, id DESC)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
     sqlx::query(
         "CREATE INDEX IF NOT EXISTS idx_payments_status_expires_at ON payments(status, expires_at)
@@ -163,11 +162,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     let has_event_type: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('webhook_deliveries') WHERE name = 'event_type'",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await?;
     if has_event_type == 0 {
         sqlx::query("ALTER TABLE webhook_deliveries ADD COLUMN event_type TEXT")
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
     }
 
@@ -297,7 +296,7 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_payment
          ON webhook_deliveries(payment_id)",
     )
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
     /* Idempotency keys for payment creation. A key is unique per merchant and
@@ -338,42 +337,29 @@ pub async fn migrate(pool: &Db) -> Result<()> {
 
     /* Backfill from legacy rows that recorded only the most-recent `tx_hash`
     and a cumulative `paid_amount`, so upgrading preserves the received-amount
-    ledger for intents that are still in flight. This is a one-time upgrade
-    step: it only needs to run once per database, so it is gated behind a
-    `kv_state` flag rather than re-scanning the full `payments` table (and
-    re-issuing one INSERT per matching row) on every boot (issue #266).
-    Startup cost would otherwise grow, forever, with lifetime payment volume. */
-    const BACKFILL_PROCESSED_TRANSACTIONS: &str = "backfill_processed_transactions";
-    if migration_applied(pool, BACKFILL_PROCESSED_TRANSACTIONS).await? {
-        info!(
-            migration = BACKFILL_PROCESSED_TRANSACTIONS,
-            "migration skipped (already applied)"
-        );
-    } else {
-        let legacy = sqlx::query(
-            "SELECT id, tx_hash, paid_amount FROM payments
-             WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
-        )
-        .fetch_all(pool)
-        .await?;
-        let mut backfilled = 0u64;
-        for row in &legacy {
-            let id: String = row.get("id");
-            let tx_hash: String = row.get("tx_hash");
-            let paid_amount: String = row.get("paid_amount");
-            if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
-                let result = sqlx::query(
-                    "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
-                     VALUES (?, ?, ?)
-                     ON CONFLICT(payment_id, tx_hash) DO NOTHING",
-                )
-                .bind(&id)
-                .bind(&tx_hash)
-                .bind(stroops)
-                .execute(pool)
-                .await?;
-                backfilled += result.rows_affected();
-            }
+    ledger for intents that are still in flight. Idempotent via ON CONFLICT, so
+    it is safe to run on every startup. */
+    let legacy = sqlx::query(
+        "SELECT id, tx_hash, paid_amount FROM payments
+         WHERE tx_hash IS NOT NULL AND tx_hash <> '' AND paid_amount IS NOT NULL",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    for row in &legacy {
+        let id: String = row.get("id");
+        let tx_hash: String = row.get("tx_hash");
+        let paid_amount: String = row.get("paid_amount");
+        if let Some(stroops) = crate::money::parse_stroops(&paid_amount) {
+            sqlx::query(
+                "INSERT INTO processed_transactions (payment_id, tx_hash, amount_stroops)
+                 VALUES (?, ?, ?)
+                 ON CONFLICT(payment_id, tx_hash) DO NOTHING",
+            )
+            .bind(&id)
+            .bind(&tx_hash)
+            .bind(stroops)
+            .execute(&mut *tx)
+            .await?;
         }
         mark_migration_applied(pool, BACKFILL_PROCESSED_TRANSACTIONS).await?;
         info!(
@@ -422,8 +408,10 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             migration = NORMALIZE_LEGACY_TIMESTAMPS,
             normalized, "migration applied"
         );
+        sqlx::query(&sql).execute(&mut *tx).await?;
     }
 
+    tx.commit().await?;
     Ok(())
 }
 
