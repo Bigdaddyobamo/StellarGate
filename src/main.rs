@@ -269,6 +269,12 @@ async fn join_task(handle: JoinHandle<()>, health: &TaskHealth, name: &'static s
 }
 
 async fn shutdown_signal() {
+    // `with_graceful_shutdown` requires a `Future<Output = ()>`, so a signal
+    // registration failure can't be propagated as a `Result` here. Handler
+    // registration only fails on OS-level resource exhaustion, at which
+    // point the process cannot honor graceful shutdown at all — panicking
+    // immediately with a clear message is preferable to silently running
+    // with no way to drain in-flight requests on SIGTERM/Ctrl-C.
     let ctrl_c = async {
         tokio::signal::ctrl_c()
             .await

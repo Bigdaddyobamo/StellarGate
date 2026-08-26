@@ -108,3 +108,15 @@ jobs:
       # Major pinned to match what the spec was validated against locally.
       - name: Lint openapi.yaml
         run: npx --yes @redocly/cli@1 lint openapi.yaml
+
+  deploy-consistency:
+    name: deploy asset consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Catches Dockerfile/compose port or healthcheck drift, and a real
+      # secret slipping into deploy/stellargate.env.example, before it merges
+      # rather than at deploy time (issues #444, #447).
+      - name: Check deploy assets against Dockerfile
+        run: bash scripts/check-deploy-consistency.sh
