@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Unknown query parameters on the listing endpoints are now rejected
+  instead of ignored.** `GET /payments`, `GET /payments/:id/webhooks`, and
+  `GET /payments/webhooks` deserialized the parameters they knew and discarded
+  everything else, so a typo returned `200 OK` with an unfiltered first page:
+  `?stauts=completed` listed every payment including pending ones, and a
+  merchant reconciliation script that filtered server-side would read unpaid
+  intents as paid (issue #352). All three parameter sets are now closed, and
+  an unrecognised key is a `400` `unknown_parameter` naming it — the same
+  treatment request bodies already got via `unknown_field` (issue #329). A
+  malformed *value* (`?limit=abc`) now also returns the standard JSON error
+  envelope under `invalid_query`, where it previously produced axum's
+  plaintext `400`. **Breaking for any client currently sending a stray
+  parameter**, which is the point: it was never being applied.
+
+- **Manual webhook redelivery no longer consumes the automatic redrive
+  budget.** `POST /payments/:id/webhooks/:delivery_id/redeliver` used to
+  increment the same `attempts` counter the background redrive worker
+  compares against `WEBHOOK_REDRIVE_MAX_ATTEMPTS`, and refreshed
+  `last_attempt` on every click — so a merchant recovering a delivery could
+  permanently disable automatic retries for it (issue #235). Manual
+  redeliveries now bump a separate `manual_attempts` column and leave
+  `attempts` / `last_attempt` alone; listings expose both counts.
+
 ### Added
 
 - **Log rotation and resource limits on both compose stacks.** Neither
@@ -69,7 +94,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   subsection, with a migration note for existing `full`-payload receivers
   (issue #306).
 
+- **A tagged release now publishes deployable artifacts.** Previously nothing
+  did — CI built and tested every push and PR but produced nothing
+  installable, so the only way to deploy was cloning the repo onto the
+  production VM and building from source there (`docker-compose.yml`'s
+  `build: .`), which is slow on the target 1-OCPU host, non-reproducible
+  across hosts/times without `--locked` everywhere, gives no way to roll back
+  short of checking out an older commit and rebuilding, and ships with no
+  checksums, SBOM, or signature. A new `.github/workflows/release.yml`,
+  triggered on `v*` tags, now builds and pushes a multi-arch image to
+  `ghcr.io/stellargatelabs/stellargate`, cross-compiles `x86_64`/`aarch64`
+  release binaries with SHA-256 checksums, generates a CycloneDX SBOM, and
+  attests build provenance for all of it via GitHub's OIDC-backed
+  attestation. `deploy/docker-compose.prod.yml` now runs that published image
+  (pinned by the new `STELLARGATE_VERSION` in `deploy/stellargate.env`)
+  instead of building on the host; the root `docker-compose.yml` keeps
+  `build: .` for local development. Documented in a new "Release artifacts"
+  section of DEPLOYMENT.md, and "Upgrades and rollback" is now a version bump
+  and restart rather than a `git checkout` and rebuild.
+
 ### Fixed
+
+- **`GET /payments` no longer discards `offset` when a `cursor` is also
+  supplied.** The handler branched on the presence of `cursor`: the keyset
+  path read `cursor` and `limit` and never looked at `offset`, so a request
+  carrying both was answered from the cursor with the offset dropped and no
+  indication that it had been. The response shapes differ too, so the caller
+  also silently lost the `offset` field it was reading. This landed hardest on
+  the migration the endpoint itself encourages, since the offset branch
+  returns a `next_cursor` specifically to invite a move to keyset paging, and
+  a client following that hint naturally sends both for a request or two.
+  Sending both is now `400 conflicting_pagination`, decided on presence rather
+  than value so an old `offset=0` alongside a new cursor is rejected too, and
+  the two modes with their distinct response shapes are documented side by
+  side in the README and modelled in `openapi.yaml` (issue #259).
 
 - **`RATE_LIMIT_REQUESTS_PER_SEC=0` no longer boots into the most aggressive
   limit the system can apply.** `Config::validate_timing` rejects
@@ -117,6 +175,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   lifetime), and a new `tests/db_shared_memory_tests.rs` proves both that the
   fixture is genuinely shared and that the old bare-DSN form is not, so the
   footgun can't be silently reintroduced (issue #309).
+
+- **Removed the stale `migrations/` directory; the live schema now verifies
+  itself.** The schema existed twice: as hand-written DDL inside
+  `db::migrate` (the only one that ever ran) and as SQL files in
+  `migrations/`, which nothing in the codebase read. The files had already
+  drifted — missing `merchants`, `api_keys`, `processed_transactions`, and
+  `webhook_deliveries.event_type` — so a database built from them could not
+  authenticate a request or record a settlement. They looked authoritative
+  (numbered, in the conventional location), which made a contributor or
+  reviewer trusting them actively misled rather than merely working from an
+  incomplete reference. `migrations/` is now deleted, and a new
+  `tests/schema_snapshot_test.rs` asserts a freshly migrated database matches
+  a checked-in `tests/schema_snapshot.sql` exactly, so a schema change that
+  isn't reflected there fails CI instead of drifting silently — the same
+  failure mode the old directory had, closed by making `db::migrate` itself
+  self-verifying instead of hand-copied. `CONTRIBUTING.md`, `DEPLOYMENT.md`,
+  and `SECURITY.md` no longer reference `migrations/`; `DEPLOYMENT.md` in
+  particular had claimed migrations were "recorded in `_sqlx_migrations`",
+  a table that has never existed in this codebase (issue #308).
 
 - **Issuer-less non-native assets fail at boot.** `ACCEPTED_ASSETS=XLM,USDC`
   (forgetting `:ISSUER`) used to parse as an issuer-less USDC entry, and
