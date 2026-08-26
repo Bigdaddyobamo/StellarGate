@@ -859,6 +859,8 @@ async fn rate_limit_middleware(
     let limiter = rate_limit.limiters.get_with(key, || {
         Arc::new(
             governor::RateLimiter::direct(governor::Quota::per_second(
+                // SAFETY: `.max(1)` above ensures effective_rps >= 1, so
+                // NonZeroU32::new can never return None here.
                 NonZeroU32::new(effective_rps).unwrap(),
             ))
             .with_middleware::<StateInformationMiddleware>(),
@@ -933,6 +935,10 @@ async fn merchant_rate_limit_middleware(
             let rps = merchant_quota_rps(&rate_limit, &merchant_id).await;
             let fresh = Arc::new(
                 governor::RateLimiter::direct(governor::Quota::per_second(
+                    // SAFETY: `merchant_quota_rps` always returns a value >= 1:
+                    // `default_rps` is guarded by `.max(1)` in
+                    // `MerchantRateLimitState::new`, and the custom override path
+                    // only accepts `custom > 0`.
                     NonZeroU32::new(rps).unwrap(),
                 ))
                 .with_middleware::<StateInformationMiddleware>(),
@@ -1269,7 +1275,7 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
             o.parse().unwrap_or_else(|e| {
                 // Origins are validated in Config::from_env, so this branch is
                 // unreachable in production. Treat it as a programming error.
-                panic!("BUG: unparseable CORS origin {o:?} reached build_cors: {e}")
+                unreachable!("BUG: unparseable CORS origin {o:?} reached build_cors: {e}")
             })
         })
         .collect();

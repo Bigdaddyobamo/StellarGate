@@ -567,7 +567,10 @@ pub async fn save_idempotency_key(
     .execute(pool)
     .await?;
 
-    // Re-read so a concurrent insert that won the race returns the canonical id.
+    // A concurrent insert may have won the race; re-read to get the canonical
+    // payment_id. If the row is missing despite the insert (which cannot happen
+    // given SQLite's serialised writes), fall back to our own value so the
+    // caller still gets a usable id rather than an error.
     let stored = find_payment_id_by_idempotency_key(pool, merchant_id, key)
         .await?
         .unwrap_or_else(|| payment_id.to_string());
@@ -997,6 +1000,10 @@ impl WebhookDelivery {
         if let Some(event) = &self.event_type {
             return event.clone();
         }
+        // Every payload this gateway has ever written carries an `event` field,
+        // so this fallback is only reached for payloads written by a future
+        // schema change or external tooling. FALLBACK_EVENT is a safe last
+        // resort rather than a panic.
         serde_json::from_str::<serde_json::Value>(&self.payload)
             .ok()
             .and_then(|v| v.get("event")?.as_str().map(str::to_string))
@@ -1303,6 +1310,9 @@ pub async fn ping(pool: &Db) -> Result<()> {
 /// backing file to `stat()`.
 fn sqlite_path(database_url: &str) -> Option<&str> {
     let rest = database_url.strip_prefix("sqlite:")?;
+    // `split('?').next()` always returns Some on a non-empty iterator, so
+    // this fallback to `rest` is unreachable — it is here to satisfy the
+    // type-checker without an unwrap that could panic.
     let rest = rest.split('?').next().unwrap_or(rest);
     let rest = rest.trim_start_matches("//");
     if rest.is_empty() || rest == ":memory:" {

@@ -723,6 +723,9 @@ impl Config {
             ));
         }
 
+        // Strip a trailing empty segment (from a trailing slash) so path
+        // joining with `join()` or `push()` is predictable. The `?` converts
+        // the `cannot-be-a-base` error into an anyhow error that aborts boot.
         url.path_segments_mut()
             .map_err(|_| anyhow::anyhow!("STELLAR_HORIZON_URL cannot be used as a path base"))?
             .pop_if_empty();

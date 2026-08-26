@@ -75,3 +75,79 @@ async fn migration_rolls_back_schema_changes_when_backfill_fails() {
     .unwrap();
     assert_eq!(committed_tables, 0);
 }
+
+/// Regression for issue #269: the offset path must order by (created_at DESC,
+/// id DESC) so a full page-walk returns every row exactly once even when many
+/// rows share the same whole-second timestamp.
+///
+/// Creates more payments than fit in one page, all with the same created_at,
+/// walks pages until exhausted, and asserts every id appears exactly once.
+#[tokio::test]
+async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
+    let pool = SqlitePoolOptions::new()
+        .min_connections(1)
+        .connect_with(
+            SqliteConnectOptions::from_str("sqlite::memory:")
+                .unwrap()
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    let (raw_key, prefix) = db::generate_api_key();
+    db::create_merchant(&pool, "m1", &raw_key, &prefix, None)
+        .await
+        .unwrap();
+
+    // Insert 25 payments all stamped at the same second so every page boundary
+    // falls inside a tie group — the most adversarial case for a missing tiebreaker.
+    let ts = "2026-01-01T00:00:00Z";
+    for i in 0..25u32 {
+        let id = format!("pay-{i:03}");
+        let memo = format!("MEMO-{i:03}");
+        sqlx::query(
+            "INSERT INTO payments
+                (id, merchant_id, destination_address, memo, amount, asset, status,
+                 created_at, updated_at, expires_at)
+             VALUES (?, 'm1', 'GDEST', ?, '1', 'XLM', 'pending', ?, ?, ?)",
+        )
+        .bind(&id)
+        .bind(&memo)
+        .bind(ts)
+        .bind(ts)
+        .bind("2026-01-01T01:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+
+    // Walk all pages with limit=7 (not a divisor of 25 to catch the last partial page).
+    let page_size = 7i64;
+    let mut seen = std::collections::HashSet::new();
+    let mut offset = 0i64;
+    loop {
+        let page = db::list_payments(&pool, "m1", None, page_size, offset)
+            .await
+            .unwrap();
+        if page.is_empty() {
+            break;
+        }
+        for p in &page {
+            assert!(
+                seen.insert(p.id.clone()),
+                "payment {} appeared more than once during offset walk (offset={})",
+                p.id,
+                offset
+            );
+        }
+        offset += page.len() as i64;
+    }
+
+    assert_eq!(
+        seen.len(),
+        25,
+        "offset walk must return all 25 payments exactly once"
+    );
+}
