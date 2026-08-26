@@ -281,13 +281,22 @@ async fn openapi_documents_exactly_the_intended_paths() {
 
     let expected: BTreeSet<String> = [
         "/health",
+        // Operator / merchant management.
+        "/merchants",
+        "/merchants/{id}/keys",
+        "/merchants/{id}/keys/{key_id}",
+        "/merchants/{id}/rate-limit",
         // Canonical /v1 surface.
         "/v1/payments",
+        "/v1/payments/webhooks",
+        "/v1/payments/webhooks/redeliver",
         "/v1/payments/{id}",
         "/v1/payments/{id}/webhooks",
         "/v1/payments/{id}/webhooks/{delivery_id}/redeliver",
         // Deprecated unprefixed twins.
         "/payments",
+        "/payments/webhooks",
+        "/payments/webhooks/redeliver",
         "/payments/{id}",
         "/payments/{id}/webhooks",
         "/payments/{id}/webhooks/{delivery_id}/redeliver",
