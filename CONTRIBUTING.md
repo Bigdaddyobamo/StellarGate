@@ -77,10 +77,14 @@ docker compose up --build
    should come with test coverage in `tests/api_tests.rs` (integration) or
    inline `#[cfg(test)]` modules (unit). If you're fixing a bug, add a test
    that fails before your fix and passes after.
-4. **Add a migration if you touch the schema.** New migrations go in
-   `migrations/<next_number>_<short_description>.sql`. Never edit an
-   already-merged migration — schema changes are append-only so existing
-   databases upgrade cleanly. See "Database Migrations" in the README.
+4. **Add the statement to `db::migrate` if you touch the schema.** `src/db.rs`'s
+   `db::migrate` is the only schema definition in this repository — there is
+   no `migrations/` directory. Add your `CREATE TABLE IF NOT EXISTS` /
+   `ALTER TABLE ... ADD COLUMN` statement there, keep it idempotent (it runs
+   on every startup of every existing deployment), and update
+   `tests/schema_snapshot.sql` to match (`cargo test --test
+   schema_snapshot_test -- --nocapture` prints the exact text to paste in on
+   a mismatch). See "Database Migrations" in the README.
 5. **Update docs.** If you change environment variables, API request/response
    shapes, or webhook payloads, update the README and (for `.env.example`-
    affecting changes) `.env.example` in the same PR.
@@ -99,6 +103,10 @@ If you touched `Cargo.toml`/`Cargo.lock`, also expect the supply-chain
 workflow (`cargo audit` via `cargo-deny`) to run in CI — check `deny.toml` if
 you're adding a new dependency with a license or advisory it doesn't already
 allow.
+
+## Toolchain & CI Policy
+
+Blocking CI jobs (like formatting and clippy) are strictly tied to our pinned MSRV (1.88) as defined in `rust-toolchain.toml`. This ensures that your local `cargo clippy` and `cargo fmt` results perfectly match CI. An advisory lint job runs on the latest stable toolchain to catch upcoming lints, but it is set to `continue-on-error: true` and will not block your pull request.
 
 ## Commit Messages
 
