@@ -88,6 +88,19 @@ impl Default for TaskHealthInner {
     }
 }
 
+/// Locks `mutex`, recovering from poison instead of propagating the panic.
+///
+/// Every `TaskHealthInner` field is plain bookkeeping (liveness flags,
+/// counters, names) mutated only by short, infallible inserts — there is no
+/// invariant a panicking holder could leave broken. `/health` and `/metrics`
+/// read these locks on every request, so re-panicking on a poisoned lock
+/// would take the health/metrics endpoints down along with whatever
+/// unrelated task actually panicked while holding it, which is strictly
+/// worse than serving a possibly-stale snapshot.
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 impl TaskHealth {
     pub fn new() -> Self {
         Self {
@@ -99,25 +112,25 @@ impl TaskHealth {
     /// healthy. `/health` returns `503` while any required task is not running
     /// (issue #315). Call before the task is spawned.
     pub fn require(&self, name: &'static str) {
-        self.inner.required.lock().unwrap().push(name);
+        lock(&self.inner.required).push(name);
     }
 
     pub fn task_started(&self, name: &'static str) {
         self.inner.started.fetch_add(1, Ordering::Relaxed);
-        self.inner.running.lock().unwrap().insert(name, true);
+        lock(&self.inner.running).insert(name, true);
     }
 
     pub fn task_stopped(&self, name: &'static str) {
         self.inner.stopped.fetch_add(1, Ordering::Relaxed);
-        self.inner.running.lock().unwrap().insert(name, false);
+        lock(&self.inner.running).insert(name, false);
     }
 
     pub fn task_failed(&self, name: &'static str) {
         self.inner.failed.fetch_add(1, Ordering::Relaxed);
         // A failed task is by definition not running; reflect that in the
         // liveness map even if `task_stopped` never ran for it.
-        self.inner.running.lock().unwrap().insert(name, false);
-        let mut consecutive = self.inner.consecutive_failures.lock().unwrap();
+        lock(&self.inner.running).insert(name, false);
+        let mut consecutive = lock(&self.inner.consecutive_failures);
         *consecutive.entry(name).or_insert(0) += 1;
     }
 
@@ -125,7 +138,7 @@ impl TaskHealth {
     /// panic or unexpected return. Distinct from [`task_started`]: a restart
     /// is the event operators alert on (issue #316).
     pub fn task_restarted(&self, name: &'static str) {
-        let mut restarts = self.inner.restarts.lock().unwrap();
+        let mut restarts = lock(&self.inner.restarts);
         *restarts.entry(name).or_insert(0) += 1;
     }
 
@@ -137,13 +150,13 @@ impl TaskHealth {
     /// as a failure (issue #317).
     pub fn task_disabled(&self, name: &'static str, reason: &'static str) {
         self.inner.stopped.fetch_add(1, Ordering::Relaxed);
-        self.inner.running.lock().unwrap().insert(name, false);
-        self.inner.disabled.lock().unwrap().insert(name, reason);
+        lock(&self.inner.running).insert(name, false);
+        lock(&self.inner.disabled).insert(name, reason);
     }
 
     /// Whether a task exited via [`task_disabled`](Self::task_disabled), and why.
     pub fn disabled_reason(&self, name: &'static str) -> Option<&'static str> {
-        self.inner.disabled.lock().unwrap().get(name).copied()
+        lock(&self.inner.disabled).get(name).copied()
     }
 
     /// How many workers this deployment expects to be running: the required
@@ -154,8 +167,8 @@ impl TaskHealth {
     /// shutdown, configuration-disabled exit and fault, so even once exposed
     /// the arithmetic would have been wrong (issue #317).
     pub fn expected_tasks(&self) -> usize {
-        let required = self.inner.required.lock().unwrap();
-        let disabled = self.inner.disabled.lock().unwrap();
+        let required = lock(&self.inner.required);
+        let disabled = lock(&self.inner.disabled);
         required
             .iter()
             .filter(|name| !disabled.contains_key(*name))
@@ -165,9 +178,9 @@ impl TaskHealth {
     /// How many of the expected workers are actually running right now.
     /// Compare against [`expected_tasks`](Self::expected_tasks).
     pub fn live_tasks(&self) -> usize {
-        let running = self.inner.running.lock().unwrap();
-        let required = self.inner.required.lock().unwrap();
-        let disabled = self.inner.disabled.lock().unwrap();
+        let running = lock(&self.inner.running);
+        let required = lock(&self.inner.required);
+        let disabled = lock(&self.inner.disabled);
         required
             .iter()
             .filter(|name| !disabled.contains_key(*name))
@@ -179,11 +192,7 @@ impl TaskHealth {
     /// as stable. Clears the consecutive-failure streak so a one-off panic
     /// later does not keep `/health` red forever.
     pub fn note_stable(&self, name: &'static str) {
-        self.inner
-            .consecutive_failures
-            .lock()
-            .unwrap()
-            .insert(name, 0);
+        lock(&self.inner.consecutive_failures).insert(name, 0);
     }
 
     pub fn started(&self) -> u64 {
@@ -199,20 +208,11 @@ impl TaskHealth {
     }
 
     pub fn restarts(&self, name: &'static str) -> u64 {
-        self.inner
-            .restarts
-            .lock()
-            .unwrap()
-            .get(name)
-            .copied()
-            .unwrap_or(0)
+        lock(&self.inner.restarts).get(name).copied().unwrap_or(0)
     }
 
     pub fn consecutive_failures(&self, name: &'static str) -> u32 {
-        self.inner
-            .consecutive_failures
-            .lock()
-            .unwrap()
+        lock(&self.inner.consecutive_failures)
             .get(name)
             .copied()
             .unwrap_or(0)
@@ -221,9 +221,9 @@ impl TaskHealth {
     /// Names of required tasks that are not currently running. Empty when the
     /// service is healthy; drives `/health`.
     pub fn dead_required_tasks(&self) -> Vec<&'static str> {
-        let running = self.inner.running.lock().unwrap();
-        let required = self.inner.required.lock().unwrap();
-        let disabled = self.inner.disabled.lock().unwrap();
+        let running = lock(&self.inner.running);
+        let required = lock(&self.inner.required);
+        let disabled = lock(&self.inner.disabled);
         required
             .iter()
             .copied()
@@ -237,8 +237,8 @@ impl TaskHealth {
     /// Required tasks whose consecutive panics have reached
     /// [`CRASH_LOOP_THRESHOLD`]. Empty when none are crash-looping.
     pub fn crash_looping_required_tasks(&self) -> Vec<&'static str> {
-        let consecutive = self.inner.consecutive_failures.lock().unwrap();
-        let required = self.inner.required.lock().unwrap();
+        let consecutive = lock(&self.inner.consecutive_failures);
+        let required = lock(&self.inner.required);
         required
             .iter()
             .copied()
@@ -249,11 +249,11 @@ impl TaskHealth {
     /// Per-task snapshot for Prometheus exposition. Includes every required
     /// name plus any other name the supervisor has touched.
     pub fn snapshot(&self) -> Vec<TaskSnapshot> {
-        let running = self.inner.running.lock().unwrap();
-        let restarts = self.inner.restarts.lock().unwrap();
-        let consecutive = self.inner.consecutive_failures.lock().unwrap();
-        let required = self.inner.required.lock().unwrap();
-        let disabled = self.inner.disabled.lock().unwrap();
+        let running = lock(&self.inner.running);
+        let restarts = lock(&self.inner.restarts);
+        let consecutive = lock(&self.inner.consecutive_failures);
+        let required = lock(&self.inner.required);
+        let disabled = lock(&self.inner.disabled);
 
         let mut names: Vec<&'static str> = required.clone();
         for name in running
