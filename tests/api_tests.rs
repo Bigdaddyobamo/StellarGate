@@ -885,7 +885,16 @@ async fn test_create_invalid_asset() {
         .json(&json!({ "amount": "10", "asset": "BTC" }))
         .await;
     res.assert_status(StatusCode::BAD_REQUEST);
-    assert_eq!(res.json::<Value>()["code"], "unsupported_asset");
+    let request_id = res
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let body = res.json::<Value>();
+    assert_eq!(body["code"], "unsupported_asset");
+    assert_eq!(body["request_id"], request_id);
     res.assert_contains_header("x-request-id");
 }
 

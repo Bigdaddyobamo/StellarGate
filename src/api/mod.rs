@@ -6,7 +6,7 @@ use axum::{
     extract::{ConnectInfo, MatchedPath, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::IntoResponse,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Json,
 };
@@ -177,22 +177,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .merge(api_v1(&state, merchant_rate_limit).layer(middleware::from_fn(mark_deprecated)))
         .fallback(not_found)
         .layer(PropagateRequestIdLayer::x_request_id())
-        .layer(
-            TraceLayer::new_for_http().make_span_with(|req: &Request<_>| {
-                let request_id = req
-                    .extensions()
-                    .get::<RequestId>()
-                    .and_then(|id| id.header_value().to_str().ok())
-                    .unwrap_or("-");
-                tracing::info_span!(
-                    "http",
-                    %request_id,
-                    method = %req.method(),
-                    uri = %req.uri(),
-                    version = ?req.version()
-                )
-            }),
-        )
+        .layer(TraceLayer::new_for_http())
+        .layer(middleware::from_fn(request_id_context))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(RequestBodyLimitLayer::new(state.config.max_body_bytes))
         .layer(middleware::from_fn_with_state(
