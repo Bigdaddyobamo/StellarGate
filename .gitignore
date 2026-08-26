@@ -1,6 +1,20 @@
 /target
 .env
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 
 # Live deployment secrets — never commit.
 deploy/stellargate.env
+
+# Snapshot-test scratch output (e.g. insta) — never checked in, only the
+# curated snapshot files under tests/ are.
+*.snap.new
+*.pending-snap
+
+# Editor/OS cruft.
+.vscode/
+.idea/
+*.swp
+.DS_Store

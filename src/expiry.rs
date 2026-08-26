@@ -59,6 +59,12 @@ pub async fn run_sweeper(state: Arc<AppState>, mut shutdown: watch::Receiver<boo
     }
 }
 
+// All `.unwrap()`/`.expect()` calls below are test-only (panic-risk audit,
+// issue #424): every site here is fixture setup or an assertion on a value
+// the test itself just produced, so a `None`/`Err` means the test has
+// already failed and turning it into an immediate panic — rather than
+// threading `Result` through `#[tokio::test]` fns — is the correct, idiomatic
+// outcome.
 #[cfg(test)]
 mod tests {
     use super::*;
