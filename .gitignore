@@ -4,3 +4,15 @@
 
 # Live deployment secrets — never commit.
 deploy/stellargate.env
+
+# Test/build artifacts that should never be committed.
+proptest-regressions/
+*.pending-snap
+*.snap.new
+tarpaulin-report.*
+*.profraw
+lcov.info
+*.orig
+*.rej
+*.bak
+.DS_Store
