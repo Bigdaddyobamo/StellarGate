@@ -4,25 +4,14 @@ use tracing::info;
 
 pub type Db = Pool<Sqlite>;
 
-/// `kv_state` key namespace for one-time migration flags (issue #266). Distinct
-/// from the horizon poller's cursor keys and anything else `kv_state` holds.
-const MIGRATION_KEY_PREFIX: &str = "migration:";
-
-/// Whether the one-time migration `name` has already run against this
-/// database. Backed by `kv_state` as a cheap interim guard until a proper
-/// schema-version table exists — a full-table backfill or scan gated behind
-/// this runs at most once per database instead of on every boot.
-async fn migration_applied(pool: &Db, name: &str) -> Result<bool> {
-    Ok(get_state(pool, &format!("{MIGRATION_KEY_PREFIX}{name}"))
-        .await?
-        .as_deref()
-        == Some("done"))
-}
-
-/// Record that the one-time migration `name` has completed, so future calls
-/// to [`migrate`] skip it.
-async fn mark_migration_applied(pool: &Db, name: &str) -> Result<()> {
-    set_state(pool, &format!("{MIGRATION_KEY_PREFIX}{name}"), "done").await
+/// Run `PRAGMA optimize` to update SQLite query planner statistics. Should be
+/// called periodically (e.g., at startup after migration and during graceful
+/// shutdown) to keep query plans aligned with actual table sizes and
+/// distributions. Without this, every index added by the schema is used
+/// according to whatever the planner guesses, not what ANALYZE has measured.
+pub async fn optimize(pool: &Db) -> Result<()> {
+    sqlx::query("PRAGMA optimize").execute(pool).await?;
+    Ok(())
 }
 
 /// Normalize a raw SQLite timestamp to strict RFC 3339 UTC with a Z suffix.
