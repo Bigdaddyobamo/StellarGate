@@ -119,6 +119,10 @@ mod tests {
             horizon_page_limit: 200,
             db_prune_batch_size: 500,
             retention_max_rows_per_cycle: 50_000,
+            horizon_timeout_secs: 10,
+            sqlite_wal_autocheckpoint: 1000,
+            sqlite_journal_size_limit: 67_108_864,
+            sqlite_cache_size: -2000,
         }
     }
 
@@ -271,4 +275,184 @@ mod tests {
             "a second sweep must not re-fire the expiry webhook"
         );
     }
-}
+
+    // ── Additional targeted tests (#435) ─────────────────────────────────────
+
+    /// `sweep_once` on an empty database returns 0 without error.
+    #[tokio::test]
+    async fn sweep_once_with_no_payments_returns_zero() {
+        let state = Arc::new(memory_state(test_config(false)).await);
+        let result = sweep_once(&state).await;
+        assert!(result.is_ok(), "sweep_once must not fail on an empty database");
+        assert_eq!(result.unwrap(), 0, "empty database: nothing to expire");
+    }
+
+    /// A payment that is not yet overdue must not be swept.
+    #[tokio::test]
+    async fn sweep_once_does_not_expire_pending_within_ttl() {
+        let state = Arc::new(memory_state(test_config(false)).await);
+        db::create_payment(
+            &state.pool,
+            db::NewPayment {
+                id: "pay_fresh",
+                merchant_id: "merchant1",
+                destination_address: "GDESTINATION",
+                memo: "FRESHMEMO",
+                amount: "10",
+                asset: "XLM",
+                asset_issuer: None,
+                webhook_url: None,
+                // TTL far in the future.
+                ttl_secs: 9999,
+            },
+        )
+        .await
+        .unwrap();
+
+        let expired_count = sweep_once(&state).await.unwrap();
+        assert_eq!(expired_count, 0, "a pending payment within TTL must not be swept");
+
+        let updated = db::get_payment(&state.pool, "pay_fresh")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.status, "pending", "status must remain pending");
+    }
+
+    /// Multiple overdue intents must all be swept in a single call when the
+    /// batch limit is large enough.
+    #[tokio::test]
+    async fn sweep_once_expires_multiple_overdue_payments() {
+        let state = Arc::new(memory_state(test_config(false)).await);
+        let ids = ["pay_over1", "pay_over2", "pay_over3"];
+        let memos = ["OVER1MEMO", "OVER2MEMO", "OVER3MEMO"];
+        for (id, memo) in ids.iter().zip(memos.iter()) {
+            db::create_payment(
+                &state.pool,
+                db::NewPayment {
+                    id,
+                    merchant_id: "merchant1",
+                    destination_address: "GDESTINATION",
+                    memo,
+                    amount: "5",
+                    asset: "XLM",
+                    asset_issuer: None,
+                    webhook_url: None,
+                    ttl_secs: -1,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let expired_count = sweep_once(&state).await.unwrap();
+        assert_eq!(expired_count, 3, "all 3 overdue payments must be swept");
+
+        for id in &ids {
+            let payment = db::get_payment(&state.pool, id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(payment.status, "expired", "payment {id} must be expired");
+        }
+    }
+
+    /// The batch limit controls how many intents are swept per call. When more
+    /// overdue intents exist than `expiry_batch_size`, only the capped batch is
+    /// processed — the remainder is left for the next sweep.
+    #[tokio::test]
+    async fn sweep_once_respects_batch_limit() {
+        let mut cfg = test_config(false);
+        // Set batch size to 2 with 3 overdue payments.
+        cfg.expiry_batch_size = 2;
+        let state = Arc::new(memory_state(cfg).await);
+        let ids = ["pay_batch1", "pay_batch2", "pay_batch3"];
+        let memos = ["BATCH1MEM", "BATCH2MEM", "BATCH3MEM"];
+        for (id, memo) in ids.iter().zip(memos.iter()) {
+            db::create_payment(
+                &state.pool,
+                db::NewPayment {
+                    id,
+                    merchant_id: "merchant1",
+                    destination_address: "GDESTINATION",
+                    memo,
+                    amount: "5",
+                    asset: "XLM",
+                    asset_issuer: None,
+                    webhook_url: None,
+                    ttl_secs: -1,
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        // First sweep processes at most 2.
+        let first = sweep_once(&state).await.unwrap();
+        assert_eq!(first, 2, "first sweep must respect the batch limit of 2");
+
+        // Second sweep drains the remainder.
+        let second = sweep_once(&state).await.unwrap();
+        assert_eq!(second, 1, "second sweep must pick up the remaining payment");
+
+        // All three are now expired.
+        let third = sweep_once(&state).await.unwrap();
+        assert_eq!(third, 0, "third sweep must find nothing left");
+    }
+
+    /// `sweep_once` without a webhook URL must still update the DB status and
+    /// return the correct count — the webhook dispatch is a no-op, not an error.
+    #[tokio::test]
+    async fn sweep_once_handles_payment_without_webhook() {
+        let state = Arc::new(memory_state(test_config(false)).await);
+        db::create_payment(
+            &state.pool,
+            db::NewPayment {
+                id: "pay_no_hook",
+                merchant_id: "merchant1",
+                destination_address: "GDESTINATION",
+                memo: "NOHOOKMEMO",
+                amount: "10",
+                asset: "XLM",
+                asset_issuer: None,
+                webhook_url: None,
+                ttl_secs: -5,
+            },
+        )
+        .await
+        .unwrap();
+
+        let count = sweep_once(&state).await.unwrap();
+        assert_eq!(count, 1, "sweep must count the expired payment even without a webhook URL");
+
+        let payment = db::get_payment(&state.pool, "pay_no_hook")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(payment.status, "expired");
+    }
+
+    /// `run_sweeper` must return `TaskExit::ShutdownRequested` immediately when
+    /// the shutdown signal fires before the first sleep completes.
+    #[tokio::test]
+    async fn run_sweeper_exits_on_shutdown_signal() {
+        let state = Arc::new(memory_state(test_config(false)).await);
+        let (tx, rx) = tokio::sync::watch::channel(false);
+
+        let handle = tokio::spawn(run_sweeper(state, rx));
+
+        // Give the task time to enter the select! then signal shutdown.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let _ = tx.send(true);
+
+        let exit = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("run_sweeper must exit promptly after shutdown signal")
+            .expect("run_sweeper task must not panic");
+
+        assert!(
+            matches!(exit, TaskExit::ShutdownRequested),
+            "expected ShutdownRequested, got {:?}",
+            exit
+        );
+    }

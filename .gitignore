@@ -1,6 +1,28 @@
 /target
 .env
 *.db
+*.db-shm
+*.db-wal
 
 # Live deployment secrets — never commit.
 deploy/stellargate.env
+
+# Editor / IDE directories
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS-generated files
+.DS_Store
+Thumbs.db
+
+# Compiled test artifacts and coverage output
+/tarpaulin-report.html
+lcov.info
+coverage/
+
+# Generated schema snapshot (produced by tests/schema_snapshot_test.rs).
+# Not needed in the repository for production; regenerate locally with `cargo test`.
+tests/schema_snapshot.sql
