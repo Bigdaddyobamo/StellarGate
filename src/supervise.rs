@@ -181,6 +181,25 @@ where
     })
 }
 
+// ── Panic-risk audit (#432) ───────────────────────────────────────────────────
+//
+// All `.unwrap()` / `.expect()` in this file are confined to the `#[cfg(test)]`
+// module below. Production code in this module does not call either.
+//
+// Test-only usages and why they are safe there:
+//
+// * `tokio::time::timeout(…).await.expect("…")` — test assertion: the timeout
+//   resolving to `Err` is the test *failing*, not a recoverable error.
+// * `handle.await.expect("supervisor task panicked")` — same: a JoinError here
+//   means the test itself is broken.
+// * `exits.lock().unwrap().pop()` — the Mutex is never poisoned inside a test;
+//   a poison would surface as a panic in the test infrastructure, not in
+//   production code.
+// * `.unwrap()` on `tokio::time::timeout` results used as assertions — as above.
+//
+// None of these patterns appear outside `#[cfg(test)]`, so they carry zero
+// production panic risk.
+
 #[cfg(test)]
 mod tests {
     use super::*;

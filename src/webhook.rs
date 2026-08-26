@@ -48,8 +48,17 @@ type HmacSha256 = Hmac<Sha256>;
 /// string and reject the request if `timestamp` is too far from their own clock
 /// (see the README), which is what prevents replay of an old, valid signature.
 pub fn sign(secret: &str, timestamp: i64, body: &[u8]) -> String {
-    let mut mac =
-        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts keys of any length");
+    // `new_from_slice` only returns `Err` when the key length is invalid for
+    // the underlying cipher. HMAC-SHA256 accepts keys of *any* length (the
+    // HMAC spec pads short keys and hashes long ones), so this call is
+    // infallible in practice. The `expect` is retained with an explanatory
+    // message; `unreachable!` would be equally correct but would silence the
+    // diagnostic entirely. Config validation already rejects secrets shorter
+    // than 32 chars, but even a 0-byte key is valid for HMAC.
+    let mut mac = HmacSha256::new_from_slice(secret.as_bytes())
+        // SAFETY: HMAC accepts keys of any non-zero length; this is
+        // unreachable unless the secret is somehow empty after boot validation.
+        .unwrap_or_else(|e| unreachable!("HMAC key error (secret must be non-empty): {e}"));
     mac.update(timestamp.to_string().as_bytes());
     mac.update(b".");
     mac.update(body);
@@ -369,10 +378,16 @@ pub async fn redrive_once(state: &Arc<AppState>) -> usize {
         let state = state.clone();
         let semaphore = semaphore.clone();
         tasks.push(tokio::spawn(async move {
+            // `acquire_owned` returns `Err` only if the semaphore has been
+            // closed. We never call `Semaphore::close()` on this semaphore —
+            // it is created immediately above and lives only for this function
+            // call — so the error branch is structurally unreachable. Using
+            // `unwrap_or_else` + `unreachable!` makes the invariant explicit
+            // without silently swallowing a future regression.
             let _permit = semaphore
                 .acquire_owned()
                 .await
-                .expect("semaphore is never closed");
+                .unwrap_or_else(|_| unreachable!("redrive semaphore was closed unexpectedly"));
             redrive_one(&state, delivery).await;
         }));
     }
@@ -499,6 +514,20 @@ pub async fn run_redrive_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Panic-risk audit (#433) ───────────────────────────────────────────────
+    //
+    // Two `.unwrap()` calls remain in this test module:
+    //
+    // * `serde_json::to_vec(&payload).unwrap()` — test assertion: the only way
+    //   `to_vec` can fail is if the value contains a non-serialisable type (e.g.
+    //   a map with non-string keys). `serde_json::Value` produced by the `json!`
+    //   macro is always serialisable; a failure here is a bug in the test
+    //   fixture, not a recoverable error.
+    // * `String::from_utf8(body).unwrap()` — `serde_json::to_vec` always emits
+    //   valid UTF-8, so this is infallible for any body that `to_vec` produced.
+    //
+    // Neither pattern appears in production code paths.
 
     // ── Inline retry backoff and jitter (issue #318) ─────────────────────────
 

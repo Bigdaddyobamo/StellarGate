@@ -342,6 +342,9 @@ impl RouteLatency {
                 self.buckets[i] += 1;
             }
         }
+        // SAFETY: the `is_empty()` branch above always populates `buckets`
+        // with HTTP_LATENCY_BUCKETS_MS.len() + 1 (>= 1) slots before this
+        // line runs, so `last_mut()` can never return None.
         *self.buckets.last_mut().unwrap() += 1;
     }
 }
@@ -375,6 +378,9 @@ impl HttpMetrics {
 
     /// Record one completed HTTP request.
     pub fn record(&self, method: &str, route: &str, status: u16, elapsed_ms: u64) {
+        // SAFETY: poisoning only occurs if a prior holder panicked while
+        // holding this lock; nothing in the critical sections below can
+        // panic, so `.unwrap()` here is unreachable in practice.
         let mut inner = self.inner.lock().unwrap();
         *inner
             .requests
@@ -389,6 +395,8 @@ impl HttpMetrics {
 
     /// Snapshot of request counts, sorted for deterministic exposition.
     fn requests_snapshot(&self) -> Vec<(String, String, u16, u64)> {
+        // SAFETY: see the justification in `record` above — nothing in this
+        // struct's critical sections panics, so the lock can't be poisoned.
         let inner = self.inner.lock().unwrap();
         let mut rows: Vec<_> = inner
             .requests
@@ -403,6 +411,7 @@ impl HttpMetrics {
 
     /// Snapshot of latency distributions, sorted for deterministic exposition.
     fn latency_snapshot(&self) -> Vec<(String, String, RouteLatency)> {
+        // SAFETY: see the justification in `record` above.
         let inner = self.inner.lock().unwrap();
         let mut rows: Vec<_> = inner
             .latency
@@ -617,6 +626,9 @@ impl TrustlineMetrics {
     /// removed from `ACCEPTED_ASSETS` between checks simply stops being
     /// reported rather than lingering at its last known value.
     pub fn record_check<'a>(&self, checked: impl IntoIterator<Item = &'a str>, missing: &[String]) {
+        // SAFETY: poisoning only occurs if a prior holder panicked while
+        // holding this lock; nothing in this struct's critical sections
+        // panics, so `.unwrap()` here is unreachable in practice.
         let mut map = self.inner.missing.lock().unwrap();
         map.clear();
         for code in checked {
@@ -638,6 +650,7 @@ impl TrustlineMetrics {
     /// `None` — never confirmed either way (not yet checked, or dropped from
     /// `ACCEPTED_ASSETS`).
     pub fn is_missing(&self, code: &str) -> Option<bool> {
+        // SAFETY: see the justification in `record_check` above.
         self.inner.missing.lock().unwrap().get(code).copied()
     }
 
@@ -651,6 +664,7 @@ impl TrustlineMetrics {
 
     /// Snapshot for rendering, sorted by asset code for deterministic output.
     pub fn snapshot(&self) -> Vec<(String, bool)> {
+        // SAFETY: see the justification in `record_check` above.
         let map = self.inner.missing.lock().unwrap();
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
