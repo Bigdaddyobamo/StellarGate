@@ -2,6 +2,11 @@ use anyhow::Result;
 use ipnet::IpNet;
 use std::collections::HashSet;
 
+/// Longest accepted webhook-redrive timing window. A one-day ceiling keeps
+/// operator mistakes bounded and makes the SQL eligibility arithmetic stay
+/// comfortably inside SQLite's signed 64-bit integer range (issue #241).
+const MAX_WEBHOOK_REDRIVE_WINDOW_SECS: i64 = 86_400;
+
 /// How the service detects incoming on-chain payments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ListenerMode {
@@ -88,24 +93,114 @@ pub struct AcceptedAsset {
 }
 
 impl AcceptedAsset {
-    pub(crate) fn parse_list(raw: &str) -> Vec<Self> {
-        raw.split(',')
+    /// Parse a comma-separated `ACCEPTED_ASSETS` string into a validated list
+    /// of assets.
+    ///
+    /// Each entry must be either `CODE` (native XLM only) or `CODE:ISSUER`.
+    /// Validation errors are returned as `Err` so a misconfigured value aborts
+    /// boot with a clear message naming the offending entry, rather than
+    /// propagating silently to a runtime mismatch.
+    ///
+    /// Rules enforced here (at parse time, before strkey validation):
+    /// - The list must not be empty after trimming whitespace and commas.
+    /// - Each code must be 1–12 alphanumeric ASCII characters (Stellar's rule).
+    /// - An entry written as `CODE:` (colon present, issuer absent) is
+    ///   rejected rather than treated as a `Some("")` issuer that then fails
+    ///   strkey validation with a confusing message.
+    /// - Duplicate codes are rejected — two entries sharing a code would let
+    ///   `verify()` accept a payment from either issuer against an intent that
+    ///   stored only the code (issue #222).
+    /// - The issuer is uppercased before being stored, matching what is done
+    ///   for the code. Strkeys are case-sensitive and must be uppercase; a
+    ///   lowercase copy-paste from a lowercased log would otherwise fail the
+    ///   strkey checksum with a confusing message rather than a "bad case" hint.
+    pub(crate) fn parse_list(raw: &str) -> Result<Vec<Self>> {
+        let entries: Vec<&str> = raw
+            .split(',')
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|entry| {
-                if let Some((code, issuer)) = entry.split_once(':') {
-                    AcceptedAsset {
-                        code: code.trim().to_uppercase(),
-                        issuer: Some(issuer.trim().to_string()),
-                    }
-                } else {
-                    AcceptedAsset {
-                        code: entry.trim().to_uppercase(),
-                        issuer: None,
-                    }
+            .collect();
+
+        if entries.is_empty() {
+            return Err(anyhow::anyhow!(
+                "ACCEPTED_ASSETS is empty. Provide at least one asset, e.g. \"XLM\" or \
+                 \"USDC:GISSUER\"."
+            ));
+        }
+
+        let mut assets = Vec::with_capacity(entries.len());
+        let mut seen_codes = HashSet::new();
+
+        for entry in entries {
+            let (code_raw, issuer_opt) = if let Some((c, i)) = entry.split_once(':') {
+                (c.trim(), Some(i.trim()))
+            } else {
+                (entry.trim(), None)
+            };
+
+            // --- empty code ---------------------------------------------------
+            if code_raw.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "ACCEPTED_ASSETS entry {entry:?} has an empty asset code. \
+                     Each entry must start with a non-empty code, e.g. \"XLM\" or \
+                     \"USDC:GISSUER\"."
+                ));
+            }
+
+            // --- Stellar asset-code format: 1–12 alphanumeric ASCII -----------
+            if code_raw.len() > 12
+                || !code_raw
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric())
+            {
+                return Err(anyhow::anyhow!(
+                    "ACCEPTED_ASSETS entry {entry:?}: asset code {code_raw:?} is not valid. \
+                     Stellar asset codes must be 1–12 alphanumeric ASCII characters \
+                     (A–Z, a–z, 0–9)."
+                ));
+            }
+
+            let code = code_raw.to_ascii_uppercase();
+
+            // --- empty issuer after colon -------------------------------------
+            let issuer_normalized = if let Some(issuer) = issuer_opt {
+                if issuer.is_empty() {
+                    return Err(anyhow::anyhow!(
+                        "ACCEPTED_ASSETS entry {entry:?} has a colon but no issuer. \
+                         Either write the asset as a bare code (native XLM only, e.g. \
+                         \"XLM\") or provide the full issuer address (e.g. \
+                         \"USDC:G...\")."
+                    ));
                 }
-            })
-            .collect()
+
+                // --- uppercase the issuer (fix the code/issuer asymmetry) -----
+                // Strkeys are case-sensitive and must be uppercase. The code is
+                // already uppercased above; we do the same for the issuer so that
+                // a lowercase copy-paste from a log does not produce a confusing
+                // strkey-checksum failure — it is silently normalised here and
+                // then validated by validate_addresses() with a legible message
+                // if the address itself is wrong.
+                Some(issuer.to_ascii_uppercase())
+            } else {
+                None
+            };
+
+            // --- duplicate code -----------------------------------------------
+            if !seen_codes.insert(code.clone()) {
+                return Err(anyhow::anyhow!(
+                    "ACCEPTED_ASSETS has duplicate code {code:?}. Stellar asset codes \
+                     are not unique across issuers; pin each code to exactly one issuer \
+                     and remove the duplicate entry."
+                ));
+            }
+
+            assets.push(AcceptedAsset {
+                code,
+                issuer: issuer_normalized,
+            });
+        }
+
+        Ok(assets)
     }
 
     pub fn default_list() -> Vec<Self> {
@@ -201,7 +296,9 @@ pub struct Config {
     pub port: u16,
     pub database_url: String,
     pub network: String,
-    pub horizon_url: String,
+    /// Parsed and validated once at boot so every Horizon request starts from
+    /// a typed URL rather than reparsing or trimming an arbitrary string.
+    pub horizon_url: reqwest::Url,
     pub gateway_public: String,
     /// Assets the gateway will accept, validated on POST /payments.
     /// Duplicate codes are rejected at boot (issue #222). Non-native entries
@@ -405,6 +502,11 @@ pub struct Config {
     /// catching up and during steady-state polling. Directly controls how
     /// long an uninterruptible poll cycle runs. Defaults to 200.
     pub horizon_page_limit: u32,
+    /// Timeout (seconds) for outbound Horizon HTTP requests — applies to
+    /// payment polling, trustline checks, and the readiness probe. Defaults
+    /// to 30 seconds, but operators on a low-latency private Horizon may want
+    /// 5s while those on congested public nodes may want 60s. Must be >0.
+    pub horizon_timeout_secs: u64,
     /// Rows removed (or compacted) per retention `DELETE`/`UPDATE`
     /// statement. Deleting in batches keeps each write lock short — SQLite
     /// has a single writer, so one unbounded statement over a large table
@@ -440,8 +542,10 @@ impl Config {
         let database_url =
             std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite:stellargate.db".to_string());
         let network = std::env::var("STELLAR_NETWORK").unwrap_or_else(|_| "testnet".to_string());
-        let horizon_url = std::env::var("STELLAR_HORIZON_URL")
-            .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string());
+        let horizon_url = Self::parse_horizon_url(
+            &std::env::var("STELLAR_HORIZON_URL")
+                .unwrap_or_else(|_| "https://horizon-testnet.stellar.org".to_string()),
+        )?;
         let gateway_public =
             std::env::var("STELLAR_GATEWAY_PUBLIC").unwrap_or_else(|_| "UNCONFIGURED".to_string());
         let webhook_secret = Self::validate_webhook_secret(std::env::var("WEBHOOK_SECRET"))?;
@@ -515,7 +619,7 @@ impl Config {
                 if raw.is_empty() {
                     AcceptedAsset::default_list()
                 } else {
-                    AcceptedAsset::parse_list(&raw)
+                    AcceptedAsset::parse_list(&raw)?
                 }
             },
             webhook_secret,
@@ -571,6 +675,7 @@ impl Config {
             pagination_max_limit: parse_env("PAGINATION_MAX_LIMIT", 100)?,
             shutdown_grace_secs: parse_env("SHUTDOWN_GRACE_SECS", 30)?,
             horizon_page_limit: parse_env("HORIZON_PAGE_LIMIT", 200)?,
+            horizon_timeout_secs: parse_env("HORIZON_TIMEOUT_SECS", 30)?,
             db_prune_batch_size: parse_env("DB_PRUNE_BATCH_SIZE", 500)?,
             retention_max_rows_per_cycle: parse_env("RETENTION_MAX_ROWS_PER_CYCLE", 50_000)?,
             sqlite_wal_autocheckpoint: parse_env("SQLITE_WAL_AUTOCHECKPOINT", 1000)?,
@@ -589,6 +694,39 @@ impl Config {
     /// Horizon poller stays idle rather than scanning the placeholder account.
     pub fn gateway_configured(&self) -> bool {
         !self.gateway_public.is_empty() && self.gateway_public != "UNCONFIGURED"
+    }
+
+    /// Parse and normalize the Horizon base URL during configuration loading.
+    /// Request-specific paths and queries are appended later with `Url`'s
+    /// segment and query-pair APIs, so a base query or fragment would be
+    /// ambiguous and is rejected here rather than silently overwritten.
+    fn parse_horizon_url(raw: &str) -> Result<reqwest::Url> {
+        let mut url = reqwest::Url::parse(raw).map_err(|e| {
+            anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: {e}. Expected an absolute HTTP(S) URL."
+            )
+        })?;
+
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: scheme must be http or https"
+            ));
+        }
+        if url.cannot_be_a_base() {
+            return Err(anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: URL cannot be used as a base"
+            ));
+        }
+        if url.query().is_some() || url.fragment().is_some() {
+            return Err(anyhow::anyhow!(
+                "invalid STELLAR_HORIZON_URL={raw:?}: base URL must not contain a query or fragment"
+            ));
+        }
+
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("STELLAR_HORIZON_URL cannot be used as a path base"))?
+            .pop_if_empty();
+        Ok(url)
     }
 
     /// Reject configured Stellar addresses — the gateway account and any asset
@@ -797,6 +935,9 @@ impl Config {
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
     ///   → the cap would silently override the starting delay, so backoff
     ///   never actually grows
+    /// - redrive timing values outside their documented one-day bounds → the
+    ///   eligibility expression can overflow or defer a row for an accidental,
+    ///   operationally useless interval
     fn validate_timing(&self) -> Result<()> {
         if self.poll_interval_secs == 0 {
             return Err(anyhow::anyhow!(
@@ -863,6 +1004,50 @@ impl Config {
             ));
         }
 
+        if !(1..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS).contains(&self.webhook_redrive_grace_secs) {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_GRACE_SECS must be between 1 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_grace_secs
+            ));
+        }
+
+        if !(0..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS)
+            .contains(&self.webhook_redrive_backoff_initial_secs)
+        {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS must be between 0 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_backoff_initial_secs
+            ));
+        }
+
+        if !(1..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS).contains(&self.webhook_redrive_backoff_max_secs) {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS must be between 1 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_backoff_max_secs
+            ));
+        }
+
+        if !(0..=MAX_WEBHOOK_REDRIVE_WINDOW_SECS).contains(&self.webhook_redrive_jitter_secs) {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_JITTER_SECS must be between 0 and \
+                 {MAX_WEBHOOK_REDRIVE_WINDOW_SECS} seconds (got {}).",
+                self.webhook_redrive_jitter_secs
+            ));
+        }
+
+        if self.webhook_redrive_backoff_max_secs < self.webhook_redrive_backoff_initial_secs {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS ({}) must be >= WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS ({}). \
+                 With the current settings the cap would override the starting delay and backoff \
+                 would never actually grow.",
+                self.webhook_redrive_backoff_max_secs,
+                self.webhook_redrive_backoff_initial_secs
+            ));
+        }
+
         /* The redrive grace window has to clear the worst case a `dispatch()`
         call can take, or the worker starts a second delivery for a row whose
         first one is still in flight. Making the inline delay exponential
@@ -883,14 +1068,6 @@ impl Config {
                 self.webhook_timeout_secs,
                 self.webhook_retry_delay_ms,
                 self.webhook_retry_max_delay_ms
-            ));
-        }
-
-        if self.webhook_redrive_jitter_secs < 0 {
-            return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_JITTER_SECS must be >= 0 (got {}). \
-                 A negative jitter would pull deliveries forward past their backoff.",
-                self.webhook_redrive_jitter_secs
             ));
         }
 
@@ -915,6 +1092,14 @@ impl Config {
                 "STREAM_IDLE_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would make the stream listener reconnect \
                  continuously instead of tolerating any gap between events."
+            ));
+        }
+
+        if self.horizon_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "HORIZON_TIMEOUT_SECS must be > 0 (got 0). \
+                 A zero timeout would abort every Horizon request immediately, making \
+                 payment detection impossible."
             ));
         }
 
@@ -1148,7 +1333,7 @@ mod tests {
             port: 3000,
             database_url: "sqlite:test.db".into(),
             network: "testnet".into(),
-            horizon_url: "https://horizon-testnet.stellar.org".into(),
+            horizon_url: "https://horizon-testnet.stellar.org".parse().unwrap(),
             gateway_public: "GPUBLIC".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: "webhook-hmac-secret".into(),
@@ -1211,7 +1396,7 @@ mod tests {
 
     #[test]
     fn parse_accepted_assets_from_env_string() {
-        let assets = AcceptedAsset::parse_list("XLM,USDC:GISSUER,EURC:GISSUER2");
+        let assets = AcceptedAsset::parse_list("XLM,USDC:GISSUER,EURC:GISSUER2").unwrap();
         assert_eq!(assets.len(), 3);
         assert_eq!(
             assets[0],
@@ -1236,12 +1421,218 @@ mod tests {
         );
     }
 
+    // ── parse_list validation (issue described in task) ──────────────────────
+
+    /// An empty string after stripping whitespace/commas must be rejected.
+    #[test]
+    fn parse_list_rejects_empty_string() {
+        let err = AcceptedAsset::parse_list("").unwrap_err().to_string();
+        assert!(err.contains("ACCEPTED_ASSETS is empty"), "got: {err}");
+    }
+
+    /// A string that is all commas and spaces is effectively empty.
+    #[test]
+    fn parse_list_rejects_only_commas_and_spaces() {
+        let err = AcceptedAsset::parse_list(" , , ").unwrap_err().to_string();
+        assert!(err.contains("ACCEPTED_ASSETS is empty"), "got: {err}");
+    }
+
+    /// `:GISSUER` → empty code, issuer set. An intent can never name it.
+    #[test]
+    fn parse_list_rejects_empty_code_with_issuer() {
+        let err = AcceptedAsset::parse_list(":GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("empty asset code"),
+            "got: {err}"
+        );
+    }
+
+    /// `USDC:` → colon present but issuer is empty. Should name the entry.
+    #[test]
+    fn parse_list_rejects_code_with_empty_issuer() {
+        let err = AcceptedAsset::parse_list("XLM,USDC:")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("USDC:"), "error must name the entry; got: {err}");
+        assert!(
+            err.contains("colon but no issuer"),
+            "error should explain what is wrong; got: {err}"
+        );
+    }
+
+    /// `VERYLONGASSETCODE` → more than 12 characters; can never match on chain.
+    #[test]
+    fn parse_list_rejects_code_longer_than_12_chars() {
+        let err = AcceptedAsset::parse_list("VERYLONGASSETCODE")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("VERYLONGASSETCODE"),
+            "error must name the offending entry; got: {err}"
+        );
+        assert!(
+            err.contains("1–12 alphanumeric ASCII"),
+            "error should reference the Stellar rule; got: {err}"
+        );
+    }
+
+    /// Non-alphanumeric characters in a code (e.g. hyphens, underscores) are
+    /// not valid Stellar asset codes.
+    #[test]
+    fn parse_list_rejects_code_with_non_alphanumeric_chars() {
+        let err = AcceptedAsset::parse_list("USD-C:GISSUER")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("USD-C"),
+            "error must name the offending entry; got: {err}"
+        );
+        assert!(
+            err.contains("1–12 alphanumeric ASCII"),
+            "error should reference the Stellar rule; got: {err}"
+        );
+    }
+
+    /// `USDC:G…A,USDC:G…B` → duplicate code, different issuers. Silent
+    /// cross-issuer settlement without this check.
+    #[test]
+    fn parse_list_rejects_duplicate_codes() {
+        let err = AcceptedAsset::parse_list(
+            "USDC:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5,\
+             USDC:GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZEP8LST4EQXRM5UT3AWMG",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate code"), "got: {err}");
+        assert!(err.contains("USDC"), "got: {err}");
+    }
+
+    /// Duplicate check must be case-insensitive: `usdc` and `USDC` are the
+    /// same code once uppercased.
+    #[test]
+    fn parse_list_rejects_duplicate_codes_case_insensitive() {
+        let err = AcceptedAsset::parse_list(
+            "usdc:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5,\
+             USDC:GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGZEP8LST4EQXRM5UT3AWMG",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate code"), "got: {err}");
+        assert!(err.contains("USDC"), "got: {err}");
+    }
+
+    /// `usdc:g…` → code uppercased, issuer uppercased (fixing the asymmetry).
+    /// A lowercase strkey always fails checksum validation, but rather than
+    /// producing a confusing checksum error, parse_list normalises the case and
+    /// lets validate_addresses() produce a clear message if the address itself
+    /// is wrong.
+    #[test]
+    fn parse_list_uppercases_lowercase_issuer() {
+        // Use a lowercase version of a real strkey.
+        let assets = AcceptedAsset::parse_list(
+            "USDC:gbbd47if6lwk7p7mdevscwr7dpuwv3ny3dtqevfl4nat4aqh3zllfla5",
+        )
+        .unwrap();
+        // The code is already upper, and the issuer must be uppercased to match.
+        assert_eq!(assets[0].code, "USDC");
+        assert_eq!(
+            assets[0].issuer.as_deref(),
+            Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+        );
+    }
+
+    /// Mixed-case issuer (partially lowercase) should also be uppercased.
+    #[test]
+    fn parse_list_uppercases_mixed_case_issuer() {
+        let assets = AcceptedAsset::parse_list(
+            "USDC:Gbbd47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5",
+        )
+        .unwrap();
+        assert_eq!(
+            assets[0].issuer.as_deref(),
+            Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+        );
+    }
+
+    /// Lowercase code + lowercase issuer: both are uppercased.
+    #[test]
+    fn parse_list_uppercases_both_code_and_issuer() {
+        let assets = AcceptedAsset::parse_list(
+            "usdc:gbbd47if6lwk7p7mdevscwr7dpuwv3ny3dtqevfl4nat4aqh3zllfla5",
+        )
+        .unwrap();
+        assert_eq!(assets[0].code, "USDC");
+        assert_eq!(
+            assets[0].issuer.as_deref(),
+            Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+        );
+    }
+
+    /// Exactly 12 characters is the boundary — must be accepted.
+    #[test]
+    fn parse_list_accepts_12_char_code() {
+        let assets =
+            AcceptedAsset::parse_list("ABCDEFGHIJKL:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+                .unwrap();
+        assert_eq!(assets[0].code, "ABCDEFGHIJKL");
+    }
+
+    /// Exactly 1 character is the lower boundary — must be accepted.
+    #[test]
+    fn parse_list_accepts_single_char_code() {
+        let assets = AcceptedAsset::parse_list("X:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+            .unwrap();
+        assert_eq!(assets[0].code, "X");
+    }
+
+    /// Lowercase code letters are uppercased (existing behaviour preserved).
+    #[test]
+    fn parse_list_uppercases_asset_code() {
+        let assets = AcceptedAsset::parse_list("xlm").unwrap();
+        assert_eq!(assets[0].code, "XLM");
+    }
+
+    /// Numeric characters are valid in Stellar asset codes.
+    #[test]
+    fn parse_list_accepts_alphanumeric_code() {
+        let assets = AcceptedAsset::parse_list("USDC1:GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5")
+            .unwrap();
+        assert_eq!(assets[0].code, "USDC1");
+    }
+
+    /// 13-character code — exactly one too long.
+    #[test]
+    fn parse_list_rejects_13_char_code() {
+        let err = AcceptedAsset::parse_list("ABCDEFGHIJKLM:GISSUER")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("1–12 alphanumeric ASCII"),
+            "got: {err}"
+        );
+    }
+
+    /// An entry where only the issuer is provided via `from_env` using an
+    /// empty-ish ACCEPTED_ASSETS value is rejected at parse time, not later.
+    #[test]
+    fn parse_list_error_names_offending_entry() {
+        let entry = "BAD ENTRY";
+        let err = AcceptedAsset::parse_list(entry).unwrap_err().to_string();
+        // The space makes it non-alphanumeric — the error should echo it
+        assert!(
+            err.contains("BAD"),
+            "error must reference the offending entry; got: {err}"
+        );
+    }
+
     fn sample_config() -> Config {
         Config {
             port: 3000,
             database_url: "sqlite::memory:".into(),
             network: "testnet".into(),
-            horizon_url: "https://horizon-testnet.stellar.org".into(),
+            horizon_url: "https://horizon-testnet.stellar.org".parse().unwrap(),
             gateway_public: "UNCONFIGURED".into(),
             accepted_assets: AcceptedAsset::default_list(),
             webhook_secret: String::new(),
@@ -1647,6 +2038,52 @@ mod tests {
     }
 
     #[test]
+    fn invalid_horizon_url_fails_during_configuration() {
+        for invalid in [
+            "not a url",
+            "ftp://horizon.example",
+            "https://horizon.example?tenant=wrong",
+            "https://horizon.example/#fragment",
+        ] {
+            run_with_env(
+                &[
+                    ("STELLAR_NETWORK", Some("testnet")),
+                    ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                    ("STELLAR_HORIZON_URL", Some(invalid)),
+                ],
+                || {
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(
+                        err.contains("STELLAR_HORIZON_URL"),
+                        "startup error must identify the invalid variable; got: {err}"
+                    );
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn horizon_url_is_parsed_and_normalized_during_configuration() {
+        run_with_env(
+            &[
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                (
+                    "STELLAR_HORIZON_URL",
+                    Some("https://horizon.example/custom/base/"),
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert_eq!(
+                    cfg.horizon_url.as_str(),
+                    "https://horizon.example/custom/base"
+                );
+            },
+        );
+    }
+
+    #[test]
     fn startup_fails_when_accepted_assets_omits_a_non_native_issuer() {
         run_with_env(
             &[
@@ -1896,6 +2333,64 @@ mod tests {
     }
 
     #[test]
+    fn timing_rejects_negative_redrive_backoff_initial() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = -1;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_rejects_zero_redrive_backoff_max() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_backoff_initial_secs = 0;
+        cfg.webhook_redrive_backoff_max_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_rejects_redrive_values_above_one_day() {
+        for field in ["grace", "initial", "max", "jitter"] {
+            let mut cfg = timing_config();
+            match field {
+                "grace" => cfg.webhook_redrive_grace_secs = 86_401,
+                "initial" => {
+                    cfg.webhook_redrive_backoff_initial_secs = 86_401;
+                    cfg.webhook_redrive_backoff_max_secs = 86_401;
+                }
+                "max" => cfg.webhook_redrive_backoff_max_secs = 86_401,
+                "jitter" => cfg.webhook_redrive_jitter_secs = 86_401,
+                _ => unreachable!(),
+            }
+            let err = cfg.validate_timing().unwrap_err().to_string();
+            assert!(err.contains("WEBHOOK_REDRIVE"), "{field}: got {err}");
+        }
+    }
+
+    #[test]
+    fn timing_accepts_redrive_boundaries() {
+        let mut cfg = timing_config();
+        cfg.webhook_redrive_grace_secs = 86_400;
+        cfg.webhook_redrive_backoff_initial_secs = 86_400;
+        cfg.webhook_redrive_backoff_max_secs = 86_400;
+        cfg.webhook_redrive_jitter_secs = 86_400;
+        assert!(cfg.validate_timing().is_ok());
+
+        cfg.webhook_redrive_backoff_initial_secs = 0;
+        assert!(
+            cfg.validate_timing().is_ok(),
+            "zero initial must continue to disable exponential growth"
+        );
+    }
+
+    #[test]
     fn timing_allows_backoff_max_equal_to_initial() {
         let mut cfg = timing_config();
         cfg.webhook_redrive_backoff_initial_secs = 30;
@@ -1907,8 +2402,29 @@ mod tests {
     fn timing_allows_zero_backoff_initial_to_disable_growth() {
         let mut cfg = timing_config();
         cfg.webhook_redrive_backoff_initial_secs = 0;
-        cfg.webhook_redrive_backoff_max_secs = 0;
+        cfg.webhook_redrive_backoff_max_secs = 900;
         assert!(cfg.validate_timing().is_ok());
+    }
+
+    #[test]
+    fn startup_rejects_out_of_range_redrive_timing() {
+        for (name, value) in [
+            ("WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS", "-1"),
+            ("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS", "86401"),
+            ("WEBHOOK_REDRIVE_GRACE_SECS", "86401"),
+            ("WEBHOOK_REDRIVE_JITTER_SECS", "86401"),
+        ] {
+            run_with_env(
+                &[
+                    ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                    (name, Some(value)),
+                ],
+                || {
+                    let err = Config::from_env().unwrap_err().to_string();
+                    assert!(err.contains(name), "{name}: got {err}");
+                },
+            );
+        }
     }
 
     #[test]

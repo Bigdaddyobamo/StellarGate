@@ -24,16 +24,21 @@ use tracing_subscriber::EnvFilter;
 
 const USER_AGENT: &str = concat!("StellarGate/", env!("CARGO_PKG_VERSION"));
 
-/// Timeout for general outbound HTTP (Horizon). Webhook delivery uses its own
-/// configurable per-attempt timeout instead.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[tokio::main]
 async fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
+
+    // `docker healthcheck` invokes the running binary itself (`stellargate
+    // healthcheck [path]`) rather than shelling out to curl, so the runtime
+    // image doesn't need a general-purpose HTTP client (issue #400).
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("healthcheck") {
+        return run_healthcheck(args.next()).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
-    dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
 
@@ -62,7 +67,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(AppState {
         pool,
-        http: http_client(HTTP_TIMEOUT)?,
+        http: http_client(Duration::from_secs(cfg.horizon_timeout_secs))?,
         webhook_http: http_client(Duration::from_secs(cfg.webhook_timeout_secs))?,
         webhook_metrics: WebhookMetrics::new(),
         auth_metrics: AuthMetrics::new(),
@@ -75,7 +80,7 @@ async fn main() -> Result<()> {
     });
 
     if state.config.gateway_configured() {
-        report_trustlines(&state).await;
+        horizon::verify_gateway_account(&state).await?;
     }
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -223,27 +228,32 @@ async fn open_pool(cfg: &Config) -> Result<db::Db> {
         .await?)
 }
 
+/// `stellargate healthcheck [path]`: probe this same container's own HTTP
+/// server and exit 0/1, so `HEALTHCHECK` in the Dockerfile doesn't need
+/// `curl` (or any other general-purpose HTTP client) in the runtime image.
+/// Reads `PORT` directly rather than going through `Config::from_env`, since
+/// a probe shouldn't fail on unrelated config validation.
+async fn run_healthcheck(path: Option<String>) -> Result<()> {
+    let port: u16 = std::env::var("PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(3000);
+    let path = path.unwrap_or_else(|| "health".to_string());
+    let url = format!("http://127.0.0.1:{port}/{}", path.trim_start_matches('/'));
+
+    let healthy = reqwest::get(&url)
+        .await
+        .map(|resp| resp.status().is_success())
+        .unwrap_or(false);
+
+    std::process::exit(if healthy { 0 } else { 1 });
+}
+
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
         .timeout(timeout)
         .user_agent(USER_AGENT)
         .build()?)
-}
-
-/// Report whether every accepted asset has a trustline on the gateway account.
-/// Advisory only: a missing trustline doesn't block boot, it just means
-/// payments in that asset will bounce until the trustline is added.
-async fn report_trustlines(state: &Arc<AppState>) {
-    match horizon::check_trustlines(state).await {
-        Ok(missing) if missing.is_empty() => {
-            info!("gateway trustlines verified for all accepted assets")
-        }
-        Ok(missing) => info!(
-            ?missing,
-            "accepted assets with no trustline on the gateway account"
-        ),
-        Err(e) => warn!(error = %e, "could not verify gateway trustlines at startup"),
-    }
 }
 
 /// Await a supervisor during shutdown. Panics are caught inside the
