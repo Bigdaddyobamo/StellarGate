@@ -8,13 +8,14 @@
 # Live deployment secrets — never commit.
 deploy/stellargate.env
 
-# Snapshot-test scratch output (e.g. insta) — never checked in, only the
-# curated snapshot files under tests/ are.
-*.snap.new
+# Test/build artifacts that should never be committed.
+proptest-regressions/
 *.pending-snap
-
-# Editor/OS cruft.
-.vscode/
-.idea/
-*.swp
+*.snap.new
+tarpaulin-report.*
+*.profraw
+lcov.info
+*.orig
+*.rej
+*.bak
 .DS_Store
