@@ -1463,11 +1463,14 @@ async fn ready(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (StatusCode::OK, Json(json!({ "status": "ok" }))).into_response()
 }
 
-/// Probe Horizon with a hard 3-second timeout.
-/// Returns Ok(()) when reachable (any non-5xx response), or an error string.
+/// Probe Horizon with a 3-second timeout (or the configured horizon timeout,
+/// whichever is shorter). Returns Ok(()) when reachable (any non-5xx response),
+/// or an error string.
 async fn check_horizon_ready(state: &Arc<AppState>) -> Result<(), String> {
+    let url = state.config.horizon_url.trim_end_matches('/').to_string();
+    let timeout_millis = std::cmp::min(3_000, state.config.horizon_timeout_secs * 1_000);
     let result = tokio::time::timeout(
-        Duration::from_millis(3_000),
+        Duration::from_millis(timeout_millis),
         state
             .http
             .get(state.config.horizon_url.clone())

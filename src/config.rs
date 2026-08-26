@@ -502,6 +502,11 @@ pub struct Config {
     /// catching up and during steady-state polling. Directly controls how
     /// long an uninterruptible poll cycle runs. Defaults to 200.
     pub horizon_page_limit: u32,
+    /// Timeout (seconds) for outbound Horizon HTTP requests — applies to
+    /// payment polling, trustline checks, and the readiness probe. Defaults
+    /// to 30 seconds, but operators on a low-latency private Horizon may want
+    /// 5s while those on congested public nodes may want 60s. Must be >0.
+    pub horizon_timeout_secs: u64,
     /// Rows removed (or compacted) per retention `DELETE`/`UPDATE`
     /// statement. Deleting in batches keeps each write lock short — SQLite
     /// has a single writer, so one unbounded statement over a large table
@@ -653,6 +658,7 @@ impl Config {
             pagination_max_limit: parse_env("PAGINATION_MAX_LIMIT", 100)?,
             shutdown_grace_secs: parse_env("SHUTDOWN_GRACE_SECS", 30)?,
             horizon_page_limit: parse_env("HORIZON_PAGE_LIMIT", 200)?,
+            horizon_timeout_secs: parse_env("HORIZON_TIMEOUT_SECS", 30)?,
             db_prune_batch_size: parse_env("DB_PRUNE_BATCH_SIZE", 500)?,
             retention_max_rows_per_cycle: parse_env("RETENTION_MAX_ROWS_PER_CYCLE", 50_000)?,
         };
@@ -1033,6 +1039,24 @@ impl Config {
                 "STREAM_IDLE_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would make the stream listener reconnect \
                  continuously instead of tolerating any gap between events."
+            ));
+        }
+
+        if self.horizon_timeout_secs == 0 {
+            return Err(anyhow::anyhow!(
+                "HORIZON_TIMEOUT_SECS must be > 0 (got 0). \
+                 A zero timeout would abort every Horizon request immediately, making \
+                 payment detection impossible."
+            ));
+        }
+
+        if self.webhook_redrive_backoff_max_secs < self.webhook_redrive_backoff_initial_secs {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_REDRIVE_BACKOFF_MAX_SECS ({}) must be >= WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS ({}). \
+                 With the current settings the cap would override the starting delay and backoff \
+                 would never actually grow.",
+                self.webhook_redrive_backoff_max_secs,
+                self.webhook_redrive_backoff_initial_secs
             ));
         }
 

@@ -24,10 +24,6 @@ use tracing_subscriber::EnvFilter;
 
 const USER_AGENT: &str = concat!("StellarGate/", env!("CARGO_PKG_VERSION"));
 
-/// Timeout for general outbound HTTP (Horizon). Webhook delivery uses its own
-/// configurable per-attempt timeout instead.
-const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
-
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
@@ -70,7 +66,7 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(AppState {
         pool,
-        http: http_client(HTTP_TIMEOUT)?,
+        http: http_client(Duration::from_secs(cfg.horizon_timeout_secs))?,
         webhook_http: http_client(Duration::from_secs(cfg.webhook_timeout_secs))?,
         webhook_metrics: WebhookMetrics::new(),
         auth_metrics: AuthMetrics::new(),
