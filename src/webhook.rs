@@ -35,6 +35,29 @@ use uuid::Uuid;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Redact a webhook URL for logging: keep scheme and host so a target is
+/// still identifiable, but drop the path and query string entirely.
+///
+/// Webhook URLs commonly embed capability tokens in the path or query string
+/// (e.g. `https://hooks.example.com/t/SecretToken`). Logging the full URL
+/// copies that credential into every log sink and aggregator (issue #240).
+///
+/// ```text
+/// https://hooks.example.com/t/Secret?sig=abc  →  https://hooks.example.com/…
+/// https://example.com/                         →  https://example.com
+/// <unparseable input>                          →  <unparseable>
+/// ```
+pub fn redact_url(raw: &str) -> String {
+    match reqwest::Url::parse(raw) {
+        Ok(u) => {
+            let host = u.host_str().unwrap_or("?");
+            let suffix = if u.path() == "/" { "" } else { "/\u{2026}" };
+            format!("{}://{}{}", u.scheme(), host, suffix)
+        }
+        Err(_) => "<unparseable>".into(),
+    }
+}
+
 /// Compute the hex-encoded HMAC-SHA256 signature for a webhook, binding it to
 /// `timestamp` by signing the Stripe-style payload `"{timestamp}.{body}"`.
 ///
@@ -197,7 +220,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
     let client = match safe_client(state, &url).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(payment_id = %payment.id, %url, error = %e, "webhook blocked by SSRF guard");
+            warn!(payment_id = %payment.id, url = %redact_url(&url), error = %e, "webhook blocked by SSRF guard");
             /* This is a terminal failure and must be counted like one. It was
             not, so an entire class of permanent failure — a target that
             resolves into a blocked range — was invisible to
@@ -238,7 +261,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
 
         match result {
             Ok(resp) if resp.status().is_success() => {
-                info!(payment_id = %payment.id, %url, attempt, "webhook delivered");
+                info!(payment_id = %payment.id, url = %redact_url(&url), attempt, "webhook delivered");
                 state.webhook_metrics.record_delivered();
                 state
                     .webhook_metrics
@@ -265,7 +288,7 @@ pub async fn dispatch(state: &AppState, payment: &db::Payment, event: &str, delt
         }
     }
 
-    warn!(payment_id = %payment.id, %url, "webhook delivery exhausted all retries");
+    warn!(payment_id = %payment.id, url = %redact_url(&url), "webhook delivery exhausted all retries");
     state.webhook_metrics.record_failed();
     state
         .webhook_metrics
@@ -411,7 +434,7 @@ async fn redrive_one(state: &Arc<AppState>, delivery: db::WebhookDelivery) {
     let client = match safe_client(state, &delivery.url).await {
         Ok(c) => c,
         Err(e) => {
-            warn!(delivery_id = %delivery.id, url = %delivery.url, error = %e, "redrive blocked by SSRF guard");
+            warn!(delivery_id = %delivery.id, url = %redact_url(&delivery.url), error = %e, "redrive blocked by SSRF guard");
             // Terminal, so counted — same gap as the inline path above.
             state.webhook_metrics.record_failed();
             let _ = db::update_webhook_delivery(
@@ -529,7 +552,60 @@ mod tests {
     //
     // Neither pattern appears in production code paths.
 
-    // ── Inline retry backoff and jitter (issue #318) ─────────────────────────
+    // ── redact_url (issue #240) ───────────────────────────────────────────────
+
+    /// The path and query string — the most common location for capability
+    /// tokens in signed-URL webhook endpoints — must not appear in the
+    /// redacted form.
+    #[test]
+    fn redact_url_strips_path_and_query() {
+        let raw = "https://hooks.example.com/t/AbCdEfSecretToken?sig=abc123&ts=1700000000";
+        let redacted = redact_url(raw);
+        assert!(
+            !redacted.contains("AbCdEfSecretToken"),
+            "path secret must not appear in redacted URL: {redacted}"
+        );
+        assert!(
+            !redacted.contains("sig=abc123"),
+            "query secret must not appear in redacted URL: {redacted}"
+        );
+        assert!(
+            redacted.contains("hooks.example.com"),
+            "host must be preserved for debugging: {redacted}"
+        );
+        assert!(
+            redacted.starts_with("https://"),
+            "scheme must be preserved: {redacted}"
+        );
+    }
+
+    #[test]
+    fn redact_url_root_path_produces_no_ellipsis() {
+        // A URL with no path beyond "/" is identified by scheme+host alone —
+        // adding "/…" would imply a path was omitted when there isn't one.
+        let redacted = redact_url("https://example.com/");
+        assert_eq!(redacted, "https://example.com");
+    }
+
+    #[test]
+    fn redact_url_non_root_path_appends_ellipsis() {
+        let redacted = redact_url("https://example.com/webhooks/stellar");
+        assert_eq!(redacted, "https://example.com/\u{2026}");
+        assert!(!redacted.contains("stellar"), "path must be dropped");
+    }
+
+    #[test]
+    fn redact_url_unparseable_returns_placeholder() {
+        assert_eq!(redact_url("not a url at all"), "<unparseable>");
+        assert_eq!(redact_url(""), "<unparseable>");
+    }
+
+    #[test]
+    fn redact_url_preserves_http_scheme() {
+        let redacted = redact_url("http://dev.example.com/hook/secret");
+        assert!(redacted.starts_with("http://"), "http scheme must be kept");
+        assert!(!redacted.contains("secret"), "path secret must be stripped");
+    }
 
     const BASE: Duration = Duration::from_millis(1_000);
     const MAX: Duration = Duration::from_millis(30_000);
