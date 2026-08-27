@@ -1150,6 +1150,19 @@ pub async fn redeliver_webhooks_bulk(
     })))
 }
 
+/// Query parameters accepted by `POST /payments/:id/webhooks/:delivery_id/redeliver`.
+/// `deny_unknown_fields` so a typo'd param is rejected rather than silently
+/// ignored — the same strictness applied to every other query string in the API.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedeliverQuery {
+    /// Pass `?force=true` to redeliver a webhook that was already successfully
+    /// delivered. Without it, a delivery whose status is `"delivered"` is
+    /// refused with `409 already_delivered` so that an accidental double-click
+    /// on the dashboard does not silently send a duplicate event (issue #236).
+    pub force: Option<bool>,
+}
+
 /// One delivery as the API exposes it. The stored `payload` is deliberately
 /// omitted — it is the signed event body, it can be large, and a listing is for
 /// triage rather than replay.
@@ -1174,6 +1187,7 @@ pub async fn redeliver_webhook(
     Path((payment_id, delivery_id)): Path<(String, String)>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
+    QueryParams(query): QueryParams<RedeliverQuery>,
 ) -> Result<StatusCode, AppError> {
     // Verify payment exists and belongs to the caller. A payment owned by
     // another merchant reports the same 404 as a missing one.
@@ -1205,6 +1219,22 @@ pub async fn redeliver_webhook(
             StatusCode::NOT_FOUND,
             "delivery_not_found",
             "delivery not found",
+        ));
+    }
+
+    /* Guard against silent duplicate events on an already-successful delivery
+    (issue #236). An accidental double-click on the dashboard redeliver button,
+    or an API client that does not check status before calling this endpoint,
+    would otherwise send a second copy of the event — and overwrite the
+    audit row if the second attempt failed, permanently losing the evidence
+    that the original delivery succeeded. Require explicit opt-in via
+    `?force=true` so callers cannot hit this path accidentally. */
+    if delivery.status == "delivered" && !query.force.unwrap_or(false) {
+        return Err(AppError::new(
+            StatusCode::CONFLICT,
+            "already_delivered",
+            "this webhook was already successfully delivered; \
+             pass ?force=true to redeliver anyway",
         ));
     }
 

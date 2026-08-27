@@ -713,6 +713,7 @@ later would silently change the behaviour of requests that appeared to work.
 | `invalid_label` | `400` | Key label exceeds 100 characters |
 | `delivery_not_found` | `404` | No such delivery for that payment |
 | `webhook_target_blocked` | `400` | Redelivery target rejected by the SSRF guard |
+| `already_delivered` | `409` | Delivery was already successfully delivered; pass `?force=true` to redeliver anyway |
 | `webhook_delivery_failed` | `502` | Receiver returned a non-success response |
 | `rate_limit_exceeded` | `429` | Per-IP bucket limit exceeded |
 | `idempotency_conflict` | `409` | Concurrent creates raced on one idempotency key; retry |
