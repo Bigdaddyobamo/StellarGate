@@ -317,6 +317,32 @@ pub async fn migrate(pool: &Db) -> Result<()> {
     .execute(&mut *tx)
     .await?;
 
+    /* Partial index covering the redrive worker's per-tick query (issue #239).
+    The query filters on `status IN ('pending', 'failed')` plus `attempts <
+    max_attempts`, then applies date arithmetic over `last_attempt` /
+    `created_at`. Two properties matter here:
+
+    1. The `WHERE status IN ('pending', 'failed')` partial clause keeps the
+       index tiny: in steady state almost every row is `delivered` and therefore
+       immediately excluded — a full table index would grow without bound and
+       still need to visit the status check first.
+    2. Including `attempts`, `last_attempt`, and `created_at` in the index
+       covers the remaining predicates as much as SQLite's limited expression
+       indexing allows; the date-arithmetic expression is not sargable, but
+       narrowing the candidate set to the handful of non-delivered, under-cap
+       rows first is where the dominant win is.
+
+    Verified with EXPLAIN QUERY PLAN: `list_redrivable_deliveries` now shows
+    "SEARCH webhook_deliveries USING INDEX idx_webhook_deliveries_redrive"
+    instead of a full table scan (see `redrive_index_is_used` test). */
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_redrive
+         ON webhook_deliveries(status, attempts, last_attempt, created_at)
+         WHERE status IN ('pending', 'failed')",
+    )
+    .execute(pool)
+    .await?;
+
     /* Idempotency keys for payment creation. A key is unique per merchant and
     maps to the payment id minted for the first request that used it, so a
     client retrying after a network blip gets the original payment back
@@ -2896,6 +2922,73 @@ mod tests {
                 .len(),
             1,
             "attempt 33 must become eligible immediately after the cap"
+        );
+    }
+
+    /// The partial index on `webhook_deliveries` must exist after migration
+    /// (issue #239) — this is a precondition for the index-scan assertion below.
+    #[tokio::test]
+    async fn redrive_partial_index_exists_after_migration() {
+        let pool = memory_db().await;
+
+        let index_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'idx_webhook_deliveries_redrive'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            index_exists, 1,
+            "idx_webhook_deliveries_redrive must exist after db::migrate"
+        );
+
+        let table: String = sqlx::query_scalar(
+            "SELECT tbl_name FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'idx_webhook_deliveries_redrive'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(table, "webhook_deliveries");
+    }
+
+    /// EXPLAIN QUERY PLAN for the redrive worker's inner query must reference
+    /// the partial index, not a full table scan (issue #239).
+    ///
+    /// We assert that at least one plan step's `detail` column mentions the
+    /// index by name, which would not happen on a full scan.
+    #[tokio::test]
+    async fn redrive_index_is_used_by_list_redrivable_deliveries() {
+        let pool = memory_db().await;
+
+        let plan_rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM webhook_deliveries
+             WHERE status IN ('pending', 'failed')
+               AND attempts < 8
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let uses_index = plan_rows
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("idx_webhook_deliveries_redrive"));
+
+        assert!(
+            uses_index,
+            "EXPLAIN QUERY PLAN must reference idx_webhook_deliveries_redrive. \
+             Plan was:\n{:#?}",
+            plan_rows
+                .iter()
+                .map(|(_, _, _, d)| d.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

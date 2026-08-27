@@ -86,6 +86,12 @@ For context when triaging reports, StellarGate already implements:
   address (not a fresh DNS lookup) to mitigate DNS rebinding.
 - Admin-gated merchant provisioning (`X-Admin-Secret`), disabled entirely
   when `ADMIN_PROVISIONING_SECRET` is unset.
+- **`webhook_url` is treated as a secret.** Webhook endpoint URLs commonly
+  embed capability tokens in the path or query string (e.g.
+  `https://hooks.example.com/t/SecretToken`). StellarGate never logs the
+  full URL; log statements redact it to scheme and host only
+  (`https://hooks.example.com/…`) so the credential is not copied into log
+  sinks, aggregators, or support tickets (issue #240).
 
 If you find a way around any of the above, that's exactly what this policy
 is for — please report it privately.
