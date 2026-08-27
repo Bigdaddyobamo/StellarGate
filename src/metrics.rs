@@ -592,10 +592,16 @@ pub struct TrustlineMetrics {
 }
 
 struct TrustlineMetricsInner {
-    /// Asset code -> confirmed missing (`true`) or confirmed present
-    /// (`false`). Only ever written by a successful check; a code absent from
-    /// the map has simply never been confirmed either way.
+    /// Asset code -> confirmed missing/unauthorized (`true`) or confirmed
+    /// usable (`false`). Only ever written by a successful check; a code
+    /// absent from the map has simply never been confirmed either way.
     missing: Mutex<HashMap<String, bool>>,
+    /// Asset code -> confirmed unauthorized (trustline exists but `is_authorized`
+    /// is false). Only ever written by a successful check.
+    unauthorized: Mutex<HashMap<String, bool>>,
+    /// Asset code -> remaining headroom in stroops (limit - balance).
+    /// Present only when both `limit` and `balance` were parseable.
+    headroom_stroops: Mutex<HashMap<String, i64>>,
     /// Checks that could not reach Horizon or got a non-2xx response.
     check_failures: AtomicU64,
     /// Unix timestamp of the last check that got a confirmed answer from
@@ -607,6 +613,8 @@ impl Default for TrustlineMetricsInner {
     fn default() -> Self {
         Self {
             missing: Mutex::new(HashMap::new()),
+            unauthorized: Mutex::new(HashMap::new()),
+            headroom_stroops: Mutex::new(HashMap::new()),
             check_failures: AtomicU64::new(0),
             last_success_unix: AtomicI64::new(0),
         }
@@ -620,21 +628,55 @@ impl TrustlineMetrics {
         }
     }
 
-    /// Record a successful check: `checked` is every non-native accepted
-    /// asset the check evaluated, `missing` the subset with no trustline.
+    /// Record a successful check.
+    ///
+    /// - `checked` — every non-native accepted asset the check evaluated.
+    /// - `missing` — the subset with no usable trustline (absent or
+    ///   unauthorized).
+    /// - `unauthorized` — the subset where a trustline exists but
+    ///   `is_authorized` is `false`.
+    /// - `headroom` — per-asset remaining capacity in stroops (`limit -
+    ///   balance`), for assets where both values were parseable.
+    ///
     /// Replaces the prior state for exactly the assets checked, so an asset
     /// removed from `ACCEPTED_ASSETS` between checks simply stops being
     /// reported rather than lingering at its last known value.
-    pub fn record_check<'a>(&self, checked: impl IntoIterator<Item = &'a str>, missing: &[String]) {
+    pub fn record_check<'a>(
+        &self,
+        checked: impl IntoIterator<Item = &'a str>,
+        missing: &[String],
+        unauthorized: &[String],
+        headroom: &[(&str, i64)],
+    ) {
         // SAFETY: poisoning only occurs if a prior holder panicked while
         // holding this lock; nothing in this struct's critical sections
         // panics, so `.unwrap()` here is unreachable in practice.
+        let checked_codes: Vec<&str> = checked.into_iter().collect();
+
         let mut map = self.inner.missing.lock().unwrap();
         map.clear();
-        for code in checked {
+        for &code in &checked_codes {
             map.insert(code.to_string(), missing.iter().any(|m| m == code));
         }
         drop(map);
+
+        let mut unauth_map = self.inner.unauthorized.lock().unwrap();
+        unauth_map.clear();
+        for &code in &checked_codes {
+            unauth_map.insert(
+                code.to_string(),
+                unauthorized.iter().any(|u| u == code),
+            );
+        }
+        drop(unauth_map);
+
+        let mut hr_map = self.inner.headroom_stroops.lock().unwrap();
+        hr_map.clear();
+        for (code, stroops) in headroom {
+            hr_map.insert((*code).to_string(), *stroops);
+        }
+        drop(hr_map);
+
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs() as i64)
@@ -646,9 +688,9 @@ impl TrustlineMetrics {
         self.inner.check_failures.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// `Some(true)` — confirmed missing. `Some(false)` — confirmed present.
-    /// `None` — never confirmed either way (not yet checked, or dropped from
-    /// `ACCEPTED_ASSETS`).
+    /// `Some(true)` — confirmed missing/unusable. `Some(false)` — confirmed
+    /// usable. `None` — never confirmed either way (not yet checked, or
+    /// dropped from `ACCEPTED_ASSETS`).
     pub fn is_missing(&self, code: &str) -> Option<bool> {
         // SAFETY: see the justification in `record_check` above.
         self.inner.missing.lock().unwrap().get(code).copied()
@@ -662,10 +704,27 @@ impl TrustlineMetrics {
         self.inner.last_success_unix.load(Ordering::Relaxed)
     }
 
-    /// Snapshot for rendering, sorted by asset code for deterministic output.
+    /// Snapshot of missing/usable state, sorted by asset code for
+    /// deterministic output.
     pub fn snapshot(&self) -> Vec<(String, bool)> {
         // SAFETY: see the justification in `record_check` above.
         let map = self.inner.missing.lock().unwrap();
+        let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Snapshot of unauthorized state, sorted by asset code.
+    pub fn snapshot_unauthorized(&self) -> Vec<(String, bool)> {
+        let map = self.inner.unauthorized.lock().unwrap();
+        let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    /// Snapshot of headroom (limit - balance) in stroops, sorted by asset code.
+    pub fn snapshot_headroom(&self) -> Vec<(String, i64)> {
+        let map = self.inner.headroom_stroops.lock().unwrap();
         let mut out: Vec<_> = map.iter().map(|(k, v)| (k.clone(), *v)).collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         out
@@ -1049,13 +1108,41 @@ pub fn render(
 
     // stellargate_missing_trustlines — gauge vec by asset
     out.push_str(
-        "# HELP stellargate_missing_trustlines Whether the gateway account is currently confirmed to have no trustline for an accepted asset (1) or confirmed to have one (0). An asset is absent from this metric until the first successful trustline check evaluates it.\n",
+        "# HELP stellargate_missing_trustlines Whether the gateway account is currently confirmed to have no usable trustline for an accepted asset (1) or confirmed to have one (0). A trustline is unusable when absent or when is_authorized=false. An asset is absent from this metric until the first successful trustline check evaluates it.\n",
     );
     out.push_str("# TYPE stellargate_missing_trustlines gauge\n");
     for (asset, missing) in trustlines.snapshot() {
         out.push_str(&format!(
             "stellargate_missing_trustlines{{asset=\"{asset}\"}} {}\n",
             if missing { 1 } else { 0 }
+        ));
+    }
+
+    // stellargate_trustline_unauthorized — gauge vec by asset
+    // Distinguishes a trustline that is present but unauthorized from a
+    // missing trustline entirely; both surface as stellargate_missing_trustlines=1,
+    // but only the former shows here.
+    out.push_str(
+        "# HELP stellargate_trustline_unauthorized Whether the gateway account's trustline for this asset is present but unauthorized (is_authorized=false). 1 means the issuer has not granted (or has revoked) authorization; payments in this asset will be rejected on-chain.\n",
+    );
+    out.push_str("# TYPE stellargate_trustline_unauthorized gauge\n");
+    for (asset, unauth) in trustlines.snapshot_unauthorized() {
+        out.push_str(&format!(
+            "stellargate_trustline_unauthorized{{asset=\"{asset}\"}} {}\n",
+            if unauth { 1 } else { 0 }
+        ));
+    }
+
+    // stellargate_trustline_headroom_stroops — gauge vec by asset
+    // Remaining capacity (limit - balance) so an approaching ceiling is
+    // visible before payments start bouncing.
+    out.push_str(
+        "# HELP stellargate_trustline_headroom_stroops Remaining trustline capacity in stroops (limit - balance). A payment that would push balance past limit fails on-chain. Alert when this approaches the typical payment size.\n",
+    );
+    out.push_str("# TYPE stellargate_trustline_headroom_stroops gauge\n");
+    for (asset, headroom) in trustlines.snapshot_headroom() {
+        out.push_str(&format!(
+            "stellargate_trustline_headroom_stroops{{asset=\"{asset}\"}} {headroom}\n"
         ));
     }
 
