@@ -1351,4 +1351,307 @@ mod tests {
         assert!(rendered.contains("stellargate_db_file_size_bytes{file=\"wal\"} 128"));
         assert!(!rendered.contains("stellargate_db_file_size_bytes{file=\"shm\"}"));
     }
+
+    // ── #440 new tests ────────────────────────────────────────────────────
+
+    // WebhookMetrics ─────────────────────────────────────────────────────
+
+    #[test]
+    fn webhook_counters_increment_independently() {
+        let wm = WebhookMetrics::new();
+        wm.record_delivered();
+        wm.record_delivered();
+        wm.record_delivered();
+        wm.record_failed();
+        wm.record_failed();
+        wm.record_retry();
+
+        assert_eq!(wm.delivered(), 3);
+        assert_eq!(wm.failed(), 2);
+        assert_eq!(wm.retried(), 1);
+    }
+
+    #[test]
+    fn webhook_latency_histogram_buckets_are_cumulative_75ms() {
+        let wm = WebhookMetrics::new();
+        wm.record_latency_ms(75);
+
+        // LATENCY_BUCKETS_MS = [10, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000]
+        // 75 <= 100 (index 2), so buckets 2..=8 (all from le=100 up) and +Inf increment.
+        // le=50 (index 1) should be 0; le=100 (index 2) should be 1.
+        assert_eq!(wm.latency_bucket(1), 0, "le=50 bucket should be 0 for 75ms");
+        assert_eq!(wm.latency_bucket(2), 1, "le=100 bucket should be 1 for 75ms");
+        // +Inf bucket is always at index LATENCY_BUCKETS_MS.len() = 9
+        assert_eq!(
+            wm.latency_bucket(LATENCY_BUCKETS_MS.len()),
+            1,
+            "+Inf bucket should be 1"
+        );
+        assert_eq!(wm.latency_sum_ms(), 75);
+        assert_eq!(wm.latency_count(), 1);
+    }
+
+    #[test]
+    fn webhook_latency_histogram_exact_boundary_100ms() {
+        let wm = WebhookMetrics::new();
+        wm.record_latency_ms(100);
+
+        // 100 <= 100 (index 2) — increments le=100.
+        // 100 > 50 — le=50 (index 1) stays 0.
+        assert_eq!(wm.latency_bucket(1), 0, "le=50 bucket should be 0 for 100ms");
+        assert_eq!(
+            wm.latency_bucket(2),
+            1,
+            "le=100 bucket should be 1 for exactly 100ms"
+        );
+        assert_eq!(
+            wm.latency_bucket(LATENCY_BUCKETS_MS.len()),
+            1,
+            "+Inf bucket should be 1"
+        );
+    }
+
+    #[test]
+    fn webhook_latency_record_zero_ms() {
+        let wm = WebhookMetrics::new();
+        wm.record_latency_ms(0);
+
+        // 0 <= 10 (index 0, smallest bucket) — increments le=10 and +Inf.
+        assert_eq!(wm.latency_bucket(0), 1, "le=10 bucket should be 1 for 0ms");
+        assert_eq!(
+            wm.latency_bucket(LATENCY_BUCKETS_MS.len()),
+            1,
+            "+Inf bucket should be 1"
+        );
+    }
+
+    #[test]
+    fn webhook_latency_large_value_only_inf_bucket() {
+        let wm = WebhookMetrics::new();
+        wm.record_latency_ms(99_999);
+
+        // 99_999 exceeds all named buckets (max is 10_000).
+        // All named buckets (indices 0..8) should be 0.
+        for i in 0..LATENCY_BUCKETS_MS.len() {
+            assert_eq!(
+                wm.latency_bucket(i),
+                0,
+                "named bucket {i} (le={}) should be 0 for 99_999ms",
+                LATENCY_BUCKETS_MS[i]
+            );
+        }
+        assert_eq!(
+            wm.latency_bucket(LATENCY_BUCKETS_MS.len()),
+            1,
+            "+Inf bucket should be 1 for 99_999ms"
+        );
+    }
+
+    // AuthMetrics ────────────────────────────────────────────────────────
+
+    #[test]
+    fn auth_counters_are_independent() {
+        let am = AuthMetrics::new();
+        am.record_success();
+        am.record_success();
+        am.record_success();
+        am.record_failure_missing_key();
+        am.record_failure_missing_key();
+        am.record_failure_invalid_key();
+        am.record_failure_internal_error();
+        am.record_failure_internal_error();
+        am.record_failure_internal_error();
+        am.record_failure_internal_error();
+
+        assert_eq!(am.success(), 3);
+        assert_eq!(am.failure_missing_key(), 2);
+        assert_eq!(am.failure_invalid_key(), 1);
+        assert_eq!(am.failure_internal_error(), 4);
+    }
+
+    // HorizonMetrics ─────────────────────────────────────────────────────
+
+    #[test]
+    fn horizon_all_five_counters_are_independent() {
+        let hm = HorizonMetrics::new();
+        hm.record_success();
+        hm.record_success();
+        hm.record_rate_limited();
+        hm.record_rate_limited();
+        hm.record_rate_limited();
+        hm.record_error();
+        hm.record_repeated_cursor_4xx();
+        hm.record_repeated_cursor_4xx();
+        hm.record_repeated_cursor_4xx();
+        hm.record_repeated_cursor_4xx();
+        hm.record_stream_reconnect();
+
+        assert_eq!(hm.success(), 2);
+        assert_eq!(hm.rate_limited(), 3);
+        assert_eq!(hm.error(), 1);
+        assert_eq!(hm.repeated_cursor_4xx(), 4);
+        assert_eq!(hm.stream_reconnects(), 1);
+    }
+
+    #[test]
+    fn horizon_cursor_age_stores_and_overwrites() {
+        let hm = HorizonMetrics::new();
+        hm.record_cursor_age_secs(100);
+        assert_eq!(hm.cursor_age_secs(), 100);
+        hm.record_cursor_age_secs(5);
+        assert_eq!(hm.cursor_age_secs(), 5, "store should overwrite, not add");
+    }
+
+    // TrustlineMetrics ───────────────────────────────────────────────────
+
+    #[test]
+    fn trustline_record_check_marks_assets_correctly() {
+        let tm = TrustlineMetrics::new();
+        tm.record_check(["USDC", "BTC"], &["USDC".to_string()]);
+
+        assert_eq!(tm.is_missing("USDC"), Some(true), "USDC should be missing");
+        assert_eq!(tm.is_missing("BTC"), Some(false), "BTC should be present");
+        assert_eq!(tm.is_missing("ETH"), None, "ETH was never checked");
+    }
+
+    #[test]
+    fn trustline_record_check_replaces_prior_state() {
+        let tm = TrustlineMetrics::new();
+        // First check: USDC is missing.
+        tm.record_check(["USDC"], &["USDC".to_string()]);
+        assert_eq!(tm.is_missing("USDC"), Some(true));
+        // Second check: USDC now has a trustline.
+        tm.record_check(["USDC"], &[]);
+        assert_eq!(
+            tm.is_missing("USDC"),
+            Some(false),
+            "second check should mark USDC as present"
+        );
+    }
+
+    #[test]
+    fn trustline_record_check_clears_dropped_assets() {
+        let tm = TrustlineMetrics::new();
+        // First check evaluates both USDC and BTC.
+        tm.record_check(["USDC", "BTC"], &[]);
+        assert_eq!(tm.is_missing("BTC"), Some(false));
+        // Second check only evaluates USDC; BTC is dropped.
+        tm.record_check(["USDC"], &[]);
+        assert_eq!(
+            tm.is_missing("BTC"),
+            None,
+            "BTC dropped from checked set should become None"
+        );
+    }
+
+    #[test]
+    fn trustline_record_check_failure_increments_and_does_not_update_last_success() {
+        let tm = TrustlineMetrics::new();
+        tm.record_check_failure();
+        tm.record_check_failure();
+        tm.record_check_failure();
+
+        assert_eq!(tm.check_failures(), 3);
+        assert_eq!(
+            tm.last_success_unix(),
+            0,
+            "failures must not update last_success_unix"
+        );
+    }
+
+    #[test]
+    fn trustline_snapshot_is_sorted_by_asset_code() {
+        let tm = TrustlineMetrics::new();
+        tm.record_check(["USDC", "BTC", "ETH"], &[]);
+
+        let snap = tm.snapshot();
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap[0].0, "BTC");
+        assert_eq!(snap[1].0, "ETH");
+        assert_eq!(snap[2].0, "USDC");
+    }
+
+    #[test]
+    fn trustline_last_success_unix_is_set_after_record_check() {
+        let tm = TrustlineMetrics::new();
+        assert_eq!(tm.last_success_unix(), 0, "should start at 0");
+        tm.record_check(["USDC"], &[]);
+        assert!(
+            tm.last_success_unix() > 0,
+            "last_success_unix should be set after record_check"
+        );
+    }
+
+    // render() — trustline output ─────────────────────────────────────────
+
+    #[test]
+    fn render_includes_missing_trustlines_as_1() {
+        let trustlines = TrustlineMetrics::new();
+        trustlines.record_check(["USDC"], &["USDC".to_string()]);
+
+        let rendered = render(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
+            &trustlines,
+        );
+
+        assert!(
+            rendered.contains("stellargate_missing_trustlines{asset=\"USDC\"} 1"),
+            "missing trustline must render as 1:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_includes_present_trustlines_as_0() {
+        let trustlines = TrustlineMetrics::new();
+        trustlines.record_check(["USDC"], &[]);
+
+        let rendered = render(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
+            &trustlines,
+        );
+
+        assert!(
+            rendered.contains("stellargate_missing_trustlines{asset=\"USDC\"} 0"),
+            "present trustline must render as 0:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn render_includes_check_failures_and_last_success() {
+        let trustlines = TrustlineMetrics::new();
+        trustlines.record_check_failure();
+
+        let rendered = render(
+            &WebhookMetrics::new(),
+            &AuthMetrics::new(),
+            &crate::TaskHealth::new(),
+            &HorizonMetrics::new(),
+            &HttpMetrics::new(),
+            &PaymentMetrics::new(),
+            &empty_db_snapshot(),
+            &trustlines,
+        );
+
+        assert!(
+            rendered.contains("stellargate_trustline_check_failures_total 1"),
+            "check_failures counter must be rendered:\n{rendered}"
+        );
+        // last_success_unix should be 0 (no successful check yet).
+        assert!(
+            rendered.contains("stellargate_trustline_check_last_success_timestamp_seconds 0"),
+            "last_success_unix must be 0 when no check has succeeded:\n{rendered}"
+        );
+    }
 }

@@ -19,3 +19,15 @@ lcov.info
 *.rej
 *.bak
 .DS_Store
+
+# Test schema snapshot — generated file, not hand-edited source
+tests/schema_snapshot.sql
+
+# IDE and editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS artifacts
+Thumbs.db
