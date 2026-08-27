@@ -170,6 +170,24 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .await?;
     }
 
+    /* Back-fill `event_type` for legacy rows whose column is NULL but whose
+    stored payload carries an `event` field (issue #237). This makes the
+    FALLBACK_EVENT path in `WebhookDelivery::event` genuinely unreachable for
+    rows this gateway wrote — the fallback is only needed for payloads that
+    could not be parsed at all (corruption, manual edits), which should never
+    happen for rows we inserted ourselves.
+    The JSON path expression `json_extract(payload, '$.event')` returns NULL
+    when the field is absent, keeping those rows NULL (they remain for the
+    fallback). This is a no-op for rows that already have event_type set. */
+    sqlx::query(
+        "UPDATE webhook_deliveries
+            SET event_type = json_extract(payload, '$.event')
+          WHERE event_type IS NULL
+            AND json_extract(payload, '$.event') IS NOT NULL",
+    )
+    .execute(&mut *tx)
+    .await?;
+
     /* `acknowledged_at` records that somebody has seen a terminal failure and
     acted on it — set by the bulk requeue/acknowledge endpoint. It exists so
     retention can distinguish "this failure was dealt with" from "nobody has
@@ -986,24 +1004,33 @@ pub struct WebhookDelivery {
     pub created_at: String,
 }
 
-/// Event name used when a legacy row has no `event_type` and its payload can't
-/// be parsed. Every payload this gateway has ever written carries an `event`
-/// field, so this is a last resort rather than an expected path.
-const FALLBACK_EVENT: &str = "payment.completed";
+/// Event name used when a legacy row has no `event_type` and its stored payload
+/// cannot be parsed. This sentinel is intentionally non-actionable: a receiver
+/// that routes on `payment.completed` (the old fallback) could fulfil an order
+/// because a payload failed to parse — which is precisely the risk #237 closes.
+/// Receivers must treat `payment.unknown` as an opaque signal to look the
+/// payment up via `GET /v1/payments/:id` rather than acting on the event name
+/// directly.
+const FALLBACK_EVENT: &str = "payment.unknown";
 
 impl WebhookDelivery {
     /// The event name to report for this delivery, falling back to the `event`
     /// field of the stored payload for rows written before `event_type`
-    /// existed. Used to reproduce the original `X-StellarGate-Event` header on
-    /// redelivery so the header can never contradict the body.
+    /// existed (and for which the migration backfill could not extract the
+    /// field — e.g. corrupted or externally written rows). If neither source
+    /// yields a value, returns [`FALLBACK_EVENT`] (`"payment.unknown"`), which
+    /// is intentionally non-actionable: a caller receiving that value must
+    /// fetch the full record via `GET /v1/payments/:id` rather than acting on
+    /// the event name directly (issue #237).
     pub fn event(&self) -> String {
         if let Some(event) = &self.event_type {
             return event.clone();
         }
-        // Every payload this gateway has ever written carries an `event` field,
-        // so this fallback is only reached for payloads written by a future
-        // schema change or external tooling. FALLBACK_EVENT is a safe last
-        // resort rather than a panic.
+        // Reach here only for rows whose payload could not be used by the
+        // migration backfill (or rows written after the column existed but
+        // somehow NULL — not possible through normal code paths). The backfill
+        // already tried json_extract; we try a full parse here as a last resort
+        // before falling back to the sentinel.
         serde_json::from_str::<serde_json::Value>(&self.payload)
             .ok()
             .and_then(|v| v.get("event")?.as_str().map(str::to_string))
