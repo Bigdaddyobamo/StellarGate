@@ -801,6 +801,26 @@ pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Paymen
     Ok(row.as_ref().map(row_to_payment))
 }
 
+/// Like [`find_pending_by_memo`] but matches any status — used to detect
+/// payments arriving after an intent has already been settled or expired.
+/// Such payments must still be recorded and reported to the merchant (issue
+/// #232), even though the intent's terminal status must not change.
+pub async fn find_by_memo_any_status(pool: &Db, memo: &str) -> Result<Option<Payment>> {
+    let row = sqlx::query(
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
+                webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
+         FROM payments
+         WHERE memo = ?
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(memo)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.as_ref().map(row_to_payment))
+}
+
 /// Transition a payment to a new status, returning `true` when the row was
 /// actually updated.
 ///
