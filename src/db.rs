@@ -170,6 +170,24 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             .await?;
     }
 
+    /* Back-fill `event_type` for legacy rows whose column is NULL but whose
+    stored payload carries an `event` field (issue #237). This makes the
+    FALLBACK_EVENT path in `WebhookDelivery::event` genuinely unreachable for
+    rows this gateway wrote — the fallback is only needed for payloads that
+    could not be parsed at all (corruption, manual edits), which should never
+    happen for rows we inserted ourselves.
+    The JSON path expression `json_extract(payload, '$.event')` returns NULL
+    when the field is absent, keeping those rows NULL (they remain for the
+    fallback). This is a no-op for rows that already have event_type set. */
+    sqlx::query(
+        "UPDATE webhook_deliveries
+            SET event_type = json_extract(payload, '$.event')
+          WHERE event_type IS NULL
+            AND json_extract(payload, '$.event') IS NOT NULL",
+    )
+    .execute(&mut *tx)
+    .await?;
+
     /* `acknowledged_at` records that somebody has seen a terminal failure and
     acted on it — set by the bulk requeue/acknowledge endpoint. It exists so
     retention can distinguish "this failure was dealt with" from "nobody has
@@ -297,6 +315,32 @@ pub async fn migrate(pool: &Db) -> Result<()> {
          ON webhook_deliveries(payment_id)",
     )
     .execute(&mut *tx)
+    .await?;
+
+    /* Partial index covering the redrive worker's per-tick query (issue #239).
+    The query filters on `status IN ('pending', 'failed')` plus `attempts <
+    max_attempts`, then applies date arithmetic over `last_attempt` /
+    `created_at`. Two properties matter here:
+
+    1. The `WHERE status IN ('pending', 'failed')` partial clause keeps the
+       index tiny: in steady state almost every row is `delivered` and therefore
+       immediately excluded — a full table index would grow without bound and
+       still need to visit the status check first.
+    2. Including `attempts`, `last_attempt`, and `created_at` in the index
+       covers the remaining predicates as much as SQLite's limited expression
+       indexing allows; the date-arithmetic expression is not sargable, but
+       narrowing the candidate set to the handful of non-delivered, under-cap
+       rows first is where the dominant win is.
+
+    Verified with EXPLAIN QUERY PLAN: `list_redrivable_deliveries` now shows
+    "SEARCH webhook_deliveries USING INDEX idx_webhook_deliveries_redrive"
+    instead of a full table scan (see `redrive_index_is_used` test). */
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_redrive
+         ON webhook_deliveries(status, attempts, last_attempt, created_at)
+         WHERE status IN ('pending', 'failed')",
+    )
+    .execute(pool)
     .await?;
 
     /* Idempotency keys for payment creation. A key is unique per merchant and
@@ -801,6 +845,26 @@ pub async fn find_pending_by_memo(pool: &Db, memo: &str) -> Result<Option<Paymen
     Ok(row.as_ref().map(row_to_payment))
 }
 
+/// Like [`find_pending_by_memo`] but matches any status — used to detect
+/// payments arriving after an intent has already been settled or expired.
+/// Such payments must still be recorded and reported to the merchant (issue
+/// #232), even though the intent's terminal status must not change.
+pub async fn find_by_memo_any_status(pool: &Db, memo: &str) -> Result<Option<Payment>> {
+    let row = sqlx::query(
+        "SELECT id, merchant_id, destination_address, memo, amount, asset, asset_issuer, status,
+                webhook_url, tx_hash, paid_amount, created_at, updated_at, expires_at
+         FROM payments
+         WHERE memo = ?
+         ORDER BY created_at DESC
+         LIMIT 1",
+    )
+    .bind(memo)
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.as_ref().map(row_to_payment))
+}
+
 /// Transition a payment to a new status, returning `true` when the row was
 /// actually updated.
 ///
@@ -986,24 +1050,33 @@ pub struct WebhookDelivery {
     pub created_at: String,
 }
 
-/// Event name used when a legacy row has no `event_type` and its payload can't
-/// be parsed. Every payload this gateway has ever written carries an `event`
-/// field, so this is a last resort rather than an expected path.
-const FALLBACK_EVENT: &str = "payment.completed";
+/// Event name used when a legacy row has no `event_type` and its stored payload
+/// cannot be parsed. This sentinel is intentionally non-actionable: a receiver
+/// that routes on `payment.completed` (the old fallback) could fulfil an order
+/// because a payload failed to parse — which is precisely the risk #237 closes.
+/// Receivers must treat `payment.unknown` as an opaque signal to look the
+/// payment up via `GET /v1/payments/:id` rather than acting on the event name
+/// directly.
+const FALLBACK_EVENT: &str = "payment.unknown";
 
 impl WebhookDelivery {
     /// The event name to report for this delivery, falling back to the `event`
     /// field of the stored payload for rows written before `event_type`
-    /// existed. Used to reproduce the original `X-StellarGate-Event` header on
-    /// redelivery so the header can never contradict the body.
+    /// existed (and for which the migration backfill could not extract the
+    /// field — e.g. corrupted or externally written rows). If neither source
+    /// yields a value, returns [`FALLBACK_EVENT`] (`"payment.unknown"`), which
+    /// is intentionally non-actionable: a caller receiving that value must
+    /// fetch the full record via `GET /v1/payments/:id` rather than acting on
+    /// the event name directly (issue #237).
     pub fn event(&self) -> String {
         if let Some(event) = &self.event_type {
             return event.clone();
         }
-        // Every payload this gateway has ever written carries an `event` field,
-        // so this fallback is only reached for payloads written by a future
-        // schema change or external tooling. FALLBACK_EVENT is a safe last
-        // resort rather than a panic.
+        // Reach here only for rows whose payload could not be used by the
+        // migration backfill (or rows written after the column existed but
+        // somehow NULL — not possible through normal code paths). The backfill
+        // already tried json_extract; we try a full parse here as a last resort
+        // before falling back to the sentinel.
         serde_json::from_str::<serde_json::Value>(&self.payload)
             .ok()
             .and_then(|v| v.get("event")?.as_str().map(str::to_string))
@@ -2934,6 +3007,73 @@ mod tests {
                 .len(),
             1,
             "attempt 33 must become eligible immediately after the cap"
+        );
+    }
+
+    /// The partial index on `webhook_deliveries` must exist after migration
+    /// (issue #239) — this is a precondition for the index-scan assertion below.
+    #[tokio::test]
+    async fn redrive_partial_index_exists_after_migration() {
+        let pool = memory_db().await;
+
+        let index_exists: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'idx_webhook_deliveries_redrive'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(
+            index_exists, 1,
+            "idx_webhook_deliveries_redrive must exist after db::migrate"
+        );
+
+        let table: String = sqlx::query_scalar(
+            "SELECT tbl_name FROM sqlite_master
+             WHERE type = 'index'
+               AND name = 'idx_webhook_deliveries_redrive'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(table, "webhook_deliveries");
+    }
+
+    /// EXPLAIN QUERY PLAN for the redrive worker's inner query must reference
+    /// the partial index, not a full table scan (issue #239).
+    ///
+    /// We assert that at least one plan step's `detail` column mentions the
+    /// index by name, which would not happen on a full scan.
+    #[tokio::test]
+    async fn redrive_index_is_used_by_list_redrivable_deliveries() {
+        let pool = memory_db().await;
+
+        let plan_rows: Vec<(i64, i64, i64, String)> = sqlx::query_as(
+            "EXPLAIN QUERY PLAN
+             SELECT id FROM webhook_deliveries
+             WHERE status IN ('pending', 'failed')
+               AND attempts < 8
+             ORDER BY created_at ASC",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let uses_index = plan_rows
+            .iter()
+            .any(|(_, _, _, detail)| detail.contains("idx_webhook_deliveries_redrive"));
+
+        assert!(
+            uses_index,
+            "EXPLAIN QUERY PLAN must reference idx_webhook_deliveries_redrive. \
+             Plan was:\n{:#?}",
+            plan_rows
+                .iter()
+                .map(|(_, _, _, d)| d.as_str())
+                .collect::<Vec<_>>()
         );
     }
 

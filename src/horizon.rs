@@ -14,10 +14,12 @@
 //! | Paid **less** than requested | `underpaid` | `payment.underpaid` | `delta` = shortfall; intent stays watchable |
 //! | Top-up brings total to exactly expected | `completed` | `payment.completed` | — |
 //! | Top-up brings total above expected | `completed` | `payment.overpaid` | `delta` = cumulative excess |
+//! | Payment after intent is `completed` or `expired` | unchanged | `payment.unexpected` | `delta` = the unexpected amount; merchant must refund |
 //!
-//! Once an intent reaches `completed`, it is removed from the watchlist.
-//! Any subsequent on-chain payment to the same address and memo is silently
-//! ignored — it will not trigger an additional webhook.
+//! Once an intent reaches `completed` or `expired`, its status is never
+//! changed. A subsequent on-chain payment to the same address and memo fires a
+//! `payment.unexpected` webhook carrying the amount so the merchant can arrange
+//! a refund — the gateway is the only component that can see such a payment.
 //!
 //! Multiple follow-up (top-up) payments are supported per underpaid intent.
 //! Every processed transaction is recorded in the `processed_transactions`
@@ -178,6 +180,15 @@ struct AccountResponse {
 }
 
 /// One balance / trustline line on a Stellar account.
+///
+/// `is_authorized` can be `false` even when the balance line exists if the
+/// asset's issuer uses `AUTH_REQUIRED` and has not yet granted (or has since
+/// revoked) authorization. An unauthorized trustline cannot receive payments —
+/// a deposit attempt bounces on-chain just like a missing trustline would.
+///
+/// `limit` is the maximum number of units this account will accept for the
+/// asset (in the same decimal format as `balance`). A payment that would push
+/// `balance` past `limit` also fails on-chain.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountBalance {
     #[serde(default)]
@@ -188,6 +199,23 @@ pub struct AccountBalance {
     pub asset_issuer: Option<String>,
     #[serde(default)]
     pub balance: Option<String>,
+    /// Whether the account is authorized to hold this asset.
+    /// Always `true` for native XLM. `false` means the issuer has not
+    /// granted (or has revoked) authorization; the trustline is present
+    /// but unusable for incoming payments.
+    #[serde(default = "default_true")]
+    pub is_authorized: bool,
+    /// Maximum units the account will accept for this asset.
+    /// `"922337203685.4775807"` is the Stellar maximum (i64::MAX stroops).
+    #[serde(default)]
+    pub limit: Option<String>,
+}
+
+/// Default value for `is_authorized` when the field is absent in the JSON
+/// (e.g. native XLM, which Horizon omits it for). Native XLM is always
+/// implicitly authorized, so this default must be `true` rather than `false`.
+fn default_true() -> bool {
+    true
 }
 
 /// The outcome of matching a Horizon payment against a pending intent.
@@ -501,12 +529,17 @@ pub async fn fetch_recent_payments(
     Ok(page.embedded.records)
 }
 
-/// Return the accepted assets the gateway account holds **no** trustline for.
+/// Return the accepted assets the gateway account holds **no usable** trustline
+/// for.
 ///
-/// Native XLM never needs a trustline, so it is always considered held. An
-/// issued asset (`CODE:ISSUER`) is held only if the account has a balance line
-/// with the matching `asset_code` and `asset_issuer`. Pure, so it is
-/// unit-tested without any network.
+/// A trustline is considered missing (i.e. the asset cannot be received) when
+/// any of the following is true:
+/// - No balance line exists for the asset at all.
+/// - The balance line exists but `is_authorized` is `false` (the issuer uses
+///   `AUTH_REQUIRED` and has revoked or not yet granted authorization).
+///
+/// Native XLM never needs a trustline, so it is always considered held and
+/// authorized. Pure, so it is unit-tested without any network.
 pub fn missing_trustlines<'a>(
     accepted_assets: &'a [crate::config::AcceptedAsset],
     balances: &[AccountBalance],
@@ -516,10 +549,50 @@ pub fn missing_trustlines<'a>(
         .filter(|asset| match asset.issuer.as_deref() {
             // Native asset — no trustline required.
             None => false,
-            Some(issuer) => !balances.iter().any(|b| {
+            Some(issuer) => {
+                match balances.iter().find(|b| {
+                    b.asset_code.as_deref() == Some(asset.code.as_str())
+                        && b.asset_issuer.as_deref() == Some(issuer)
+                }) {
+                    // Balance line absent — missing trustline.
+                    None => true,
+                    // Balance line present but not authorized — unusable.
+                    Some(b) => !b.is_authorized,
+                }
+            }
+        })
+        .collect()
+}
+
+/// Parse a Stellar decimal amount string (e.g. `"1000.5000000"`) into stroops.
+/// Returns `None` when `s` is `None` or unparseable.
+fn parse_stroops_opt(s: Option<&str>) -> Option<i64> {
+    money::parse_stroops(s?)
+}
+
+/// Return the remaining headroom (in stroops) for each accepted non-native
+/// asset that has a trustline on the gateway account: `limit - balance`.
+///
+/// A payment that would push the balance past `limit` fails on-chain, so a
+/// headroom approaching zero is an actionable signal. Returns only assets where
+/// both `limit` and `balance` are parseable; assets with missing or
+/// unparseable values are skipped (not treated as zero headroom).
+pub fn trustline_headroom<'a>(
+    accepted_assets: &'a [crate::config::AcceptedAsset],
+    balances: &[AccountBalance],
+) -> Vec<(&'a crate::config::AcceptedAsset, i64)> {
+    accepted_assets
+        .iter()
+        .filter_map(|asset| {
+            let issuer = asset.issuer.as_deref()?;
+            let b = balances.iter().find(|b| {
                 b.asset_code.as_deref() == Some(asset.code.as_str())
                     && b.asset_issuer.as_deref() == Some(issuer)
-            }),
+            })?;
+            let limit = parse_stroops_opt(b.limit.as_deref())?;
+            let balance = parse_stroops_opt(b.balance.as_deref())?;
+            let headroom = limit.saturating_sub(balance);
+            Some((asset, headroom))
         })
         .collect()
 }
@@ -576,34 +649,12 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
         }
     };
 
-    if resp.status() == reqwest::StatusCode::NOT_FOUND {
-        state.task_health.set_gateway_account_exists(false);
-        let msg = format!(
-            "STELLAR_GATEWAY_PUBLIC ({}) does not exist on the ledger. It cannot receive payments.",
-            state.config.gateway_public
-        );
-        if state.config.require_gateway_account {
-            return Err(anyhow::anyhow!(msg));
-        } else {
-            tracing::error!("{}", msg);
-            return Ok(());
-        }
-    }
-
-    let resp = resp.error_for_status().map_err(|e| {
-        anyhow::anyhow!(
-            "HTTP status client error ({}): could not verify gateway trustlines",
-            e.status()
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "unknown".into())
-        )
-    })?;
-
-    state.task_health.set_gateway_account_exists(true);
-    let account: AccountResponse = resp.json().await?;
-
     // Log the native XLM balance.
-    if let Some(native_balance) = account.balances.iter().find(|b| b.asset_type.as_deref() == Some("native")) {
+    if let Some(native_balance) = account
+        .balances
+        .iter()
+        .find(|b| b.asset_type.as_deref() == Some("native"))
+    {
         if let Some(amt) = &native_balance.balance {
             info!(
                 balance = %amt,
@@ -613,34 +664,93 @@ pub async fn check_trustlines(state: &Arc<AppState>) -> anyhow::Result<Vec<Strin
         }
     }
 
+    // Collect assets that are missing a trustline entirely OR have one but are
+    // unauthorized. Both prevent incoming payments from settling.
     let missing = missing_trustlines(&state.config.accepted_assets, &account.balances);
+
+    // Among the missing set, distinguish unauthorized trustlines (present but
+    // unusable) from absent ones. Different root causes, different remedies.
+    let unauthorized_codes: Vec<String> = state
+        .config
+        .accepted_assets
+        .iter()
+        .filter_map(|asset| {
+            let issuer = asset.issuer.as_deref()?;
+            // Only flag if the balance line actually exists but is not authorized.
+            let b = account.balances.iter().find(|b| {
+                b.asset_code.as_deref() == Some(asset.code.as_str())
+                    && b.asset_issuer.as_deref() == Some(issuer)
+            })?;
+            if b.is_authorized {
+                None
+            } else {
+                Some(asset.code.clone())
+            }
+        })
+        .collect();
+
     if missing.is_empty() {
         info!("gateway trustlines verified for all accepted assets");
     } else {
         let missing_codes: Vec<_> = missing.iter().map(|a| a.code.clone()).collect();
         info!(
             missing = ?missing_codes,
-            "accepted assets with no trustline on the gateway account"
+            "accepted assets with no usable trustline on the gateway account"
         );
         for asset in &missing {
+            if unauthorized_codes.iter().any(|c| c == &asset.code) {
+                warn!(
+                    asset = %asset.code,
+                    issuer = %asset.issuer.as_deref().unwrap_or(""),
+                    "gateway account trustline exists but is not authorized; \
+                     intents in this asset will be unpayable until the issuer \
+                     grants authorization"
+                );
+            } else {
+                warn!(
+                    asset = %asset.code,
+                    issuer = %asset.issuer.as_deref().unwrap_or(""),
+                    "gateway account has no trustline for an accepted asset; intents in \
+                     this asset will be unpayable until a trustline is established"
+                );
+            }
+        }
+    }
+
+    // Compute headroom (limit - balance in stroops) for alerting on capacity.
+    let headroom = trustline_headroom(&state.config.accepted_assets, &account.balances);
+    for (asset, stroops) in &headroom {
+        // Warn when headroom is below ~10 XLM-equivalent (10_000_000 stroops)
+        // in absolute terms — an early signal that a large inbound payment could
+        // be rejected. The threshold is informational; the metric itself is the
+        // authoritative, alertable signal.
+        if *stroops < 10_000_000 {
             warn!(
                 asset = %asset.code,
-                issuer = %asset.issuer.as_deref().unwrap_or(""),
-                "gateway account has no trustline for an accepted asset; intents in \
-                 this asset will be unpayable until a trustline is established"
+                headroom_stroops = %stroops,
+                "trustline headroom is critically low; a large payment may be \
+                 rejected on-chain before the gateway receives it"
             );
         }
     }
+
     let missing_codes: Vec<String> = missing.iter().map(|a| a.code.clone()).collect();
+    let headroom_refs: Vec<(&str, i64)> = headroom
+        .iter()
+        .map(|(a, s)| (a.code.as_str(), *s))
+        .collect();
     let checked_codes = state
         .config
         .accepted_assets
         .iter()
         .filter(|a| a.issuer.is_some())
         .map(|a| a.code.as_str());
-    state
-        .trustline_metrics
-        .record_check(checked_codes, &missing_codes);
+    state.trustline_metrics.record_check(
+        checked_codes,
+        &missing_codes,
+        &unauthorized_codes,
+        &headroom_refs,
+    );
     Ok(missing_codes)
 }
 
@@ -913,6 +1023,11 @@ pub async fn poll_once(state: &Arc<AppState>) -> anyhow::Result<usize> {
 /// Look up the pending intent matching this Horizon payment by memo, verify it,
 /// and settle it if it matches. Returns `true` when an intent was settled.
 ///
+/// When the memo matches a terminal (completed/expired) intent, the transaction
+/// is recorded and a `payment.unexpected` webhook is fired — the merchant needs
+/// to know so they can refund the funds. The intent's terminal status is never
+/// mutated (issue #232).
+///
 /// This is intentionally `pub` so integration tests can drive concurrent
 /// reconciliations to verify the single-settlement guarantee (issue #155).
 pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> anyhow::Result<bool> {
@@ -921,11 +1036,33 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
         None => return Ok(false),
     };
 
-    let payment = match db::find_pending_by_memo(&state.pool, memo).await? {
-        Some(p) => p,
-        None => return Ok(false),
-    };
+    // Fast path: find a still-active (pending/underpaid) intent.
+    if let Some(payment) = db::find_pending_by_memo(&state.pool, memo).await? {
+        return reconcile_active_payment(state, hp, payment).await;
+    }
 
+    // Slow path: the memo matched no active intent. Check whether it matches a
+    // terminal one — a customer who pays after completion/expiry has lost real
+    // funds that the gateway is the only component that can see (issue #232).
+    if let Some(payment) = db::find_by_memo_any_status(&state.pool, memo).await? {
+        // Only act on terminal intents (completed/expired). An underpaid intent
+        // that somehow slipped through the active check (extremely unlikely) is
+        // simply left alone.
+        if payment.status == "completed" || payment.status == "expired" {
+            reconcile_post_terminal_payment(state, hp, &payment).await?;
+        }
+    }
+
+    Ok(false)
+}
+
+/// Handle a Horizon payment that matches an **active** (pending/underpaid)
+/// intent — the normal settlement path.
+async fn reconcile_active_payment(
+    state: &Arc<AppState>,
+    hp: &HorizonPayment,
+    payment: db::Payment,
+) -> anyhow::Result<bool> {
     let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
 
     /* Gate on a real, matching, on-chain payment before recording anything, so
@@ -987,6 +1124,52 @@ pub async fn reconcile_payment(state: &Arc<AppState>, hp: &HorizonPayment) -> an
     Ok(did_settle)
 }
 
+/// Handle a Horizon payment that matches a **terminal** (completed/expired)
+/// intent (issue #232).
+///
+/// The intent's status is NOT changed — the terminal state is authoritative.
+/// The transaction is recorded in `processed_transactions` to avoid reprocessing
+/// it on subsequent poll cycles, and a `payment.unexpected` webhook is fired so
+/// the merchant knows funds arrived and can arrange a refund.
+async fn reconcile_post_terminal_payment(
+    state: &Arc<AppState>,
+    hp: &HorizonPayment,
+    payment: &db::Payment,
+) -> anyhow::Result<()> {
+    let hp_hash = hp.transaction_hash.as_deref().unwrap_or("");
+
+    /* Verify asset and amount match the intent before treating this as a
+    meaningful post-terminal payment. An unrelated transaction to the same
+    address with a colliding memo should not fire a webhook. */
+    let matched = match matches_intent(payment, hp) {
+        Some(m) => m,
+        None => return Ok(()),
+    };
+
+    /* Record idempotently so a re-seen transaction fires no duplicate webhook.
+    If this hash is already present the payment was already handled; skip. */
+    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, matched.new_stroops).await? {
+        return Ok(());
+    }
+
+    let amount_str = money::stroops_to_string(matched.new_stroops);
+    warn!(
+        payment_id = %payment.id,
+        prior_status = %payment.status,
+        tx_hash = %hp_hash,
+        amount = %amount_str,
+        "unexpected payment received for a terminal intent; \
+         merchant must arrange a refund"
+    );
+
+    /* Fire the webhook so the merchant can act. The intent copy passed to
+    dispatch carries the original terminal status — it is not mutated. The
+    `delta` field carries the unexpected amount so the merchant knows exactly
+    how much to refund. */
+    webhook::dispatch(state, payment, "payment.unexpected", Some(&amount_str)).await;
+    Ok(())
+}
+
 /// Persist a terminal or intermediate status for `payment` and fire its webhook.
 /// Returns `true` when the row was actually updated (i.e. a settlement was
 /// committed); returns `false` when the status guard rejected the update because
@@ -1036,14 +1219,11 @@ async fn settle(
     settled.status = status.to_string();
     settled.tx_hash = Some(tx_hash.to_string());
     settled.paid_amount = Some(paid_amount.to_string());
-    /* Webhook delivery is handled asynchronously by the webhook subsystem
-    (recording here is non-blocking from reconciliation's point of view).
-
-    Design note: dispatch() still delivers inline so the common case settles and
-    notifies in one pass with no added latency. The redrive worker is a safety net
-    on top of that for the crash case, not a replacement for it — rewriting dispatch
-    to be record-only would be a bigger, riskier change than issue #156 asked for
-    and would break the existing synchronous-delivery test coverage. */
+    /* Delivered inline, deliberately: the common case settles and notifies in
+    one pass with no added latency. This does mean a slow receiver stalls this
+    poll cycle for the duration of all inline retry attempts — the redrive
+    worker is the safety net for the crash case, not a replacement for inline
+    delivery. See issue #76 for the separate task of decoupling dispatch. */
     webhook::dispatch(state, &settled, event, delta).await;
     true
 }
@@ -1929,6 +2109,9 @@ mod tests {
             asset_type: Some("native".into()),
             asset_code: None,
             asset_issuer: None,
+            balance: Some("100.0000000".into()),
+            is_authorized: true,
+            limit: None,
         }
     }
 
@@ -1937,6 +2120,16 @@ mod tests {
             asset_type: Some("credit_alphanum4".into()),
             asset_code: Some(code.into()),
             asset_issuer: Some(issuer.into()),
+            balance: Some("0.0000000".into()),
+            is_authorized: true,
+            limit: Some("922337203685.4775807".into()),
+        }
+    }
+
+    fn unauthorized_balance(code: &str, issuer: &str) -> AccountBalance {
+        AccountBalance {
+            is_authorized: false,
+            ..issued_balance(code, issuer)
         }
     }
 
@@ -1963,6 +2156,43 @@ mod tests {
         let missing = missing_trustlines(&assets, &balances);
         assert_eq!(missing.len(), 1);
         assert_eq!(missing[0].code, "USDC");
+    }
+
+    #[test]
+    fn missing_trustlines_flags_unauthorized_trustline() {
+        // Trustline exists but is_authorized=false — treated as missing.
+        let assets = test_assets();
+        let balances = [native_balance(), unauthorized_balance("USDC", "GUSDC")];
+        let missing = missing_trustlines(&assets, &balances);
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].code, "USDC");
+    }
+
+    #[test]
+    fn missing_trustlines_authorized_trustline_not_flagged() {
+        // is_authorized=true (the default): not flagged as missing.
+        let assets = test_assets();
+        let balances = [native_balance(), issued_balance("USDC", "GUSDC")];
+        assert!(missing_trustlines(&assets, &balances).is_empty());
+    }
+
+    #[test]
+    fn trustline_headroom_computes_limit_minus_balance() {
+        let assets = test_assets();
+        // 1000 limit, 300 balance → 700 XLM headroom = 7_000_000_000 stroops
+        let b = AccountBalance {
+            asset_type: Some("credit_alphanum4".into()),
+            asset_code: Some("USDC".into()),
+            asset_issuer: Some("GUSDC".into()),
+            balance: Some("300.0000000".into()),
+            is_authorized: true,
+            limit: Some("1000.0000000".into()),
+        };
+        let headroom = trustline_headroom(&assets, &[b]);
+        assert_eq!(headroom.len(), 1);
+        assert_eq!(headroom[0].0.code, "USDC");
+        // 700 * 10_000_000 stroops = 7_000_000_000
+        assert_eq!(headroom[0].1, 7_000_000_000);
     }
 
     #[test]

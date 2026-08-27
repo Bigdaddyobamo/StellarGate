@@ -905,7 +905,7 @@ async fn test_create_invalid_asset() {
 #[tokio::test]
 async fn test_create_rejects_asset_with_confirmed_missing_trustline() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC"], &["USDC".to_string()]);
+    trustlines.record_check(["USDC"], &["USDC".to_string()], &[], &[]);
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
 
@@ -922,7 +922,7 @@ async fn test_create_rejects_asset_with_confirmed_missing_trustline() {
 #[tokio::test]
 async fn test_create_accepts_asset_with_confirmed_present_trustline() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC"], &[]);
+    trustlines.record_check(["USDC"], &[], &[], &[]);
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
 
@@ -955,7 +955,7 @@ async fn test_create_accepts_asset_never_checked_for_a_trustline() {
 #[tokio::test]
 async fn test_create_never_rejects_native_xlm_for_a_missing_trustline() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC"], &["USDC".to_string()]);
+    trustlines.record_check(["USDC"], &["USDC".to_string()], &[], &[]);
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
     let key = provision_merchant(&server).await;
 
@@ -973,7 +973,7 @@ async fn test_create_never_rejects_native_xlm_for_a_missing_trustline() {
 #[tokio::test]
 async fn test_metrics_expose_trustline_state() {
     let trustlines = stellargate::metrics::TrustlineMetrics::new();
-    trustlines.record_check(["USDC", "EURC"], &["USDC".to_string()]);
+    trustlines.record_check(["USDC", "EURC"], &["USDC".to_string()], &[], &[]);
     trustlines.record_check_failure();
     let (server, _pool) = server_with_config_and_trustlines(make_config(), trustlines).await;
 

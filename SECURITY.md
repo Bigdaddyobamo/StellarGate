@@ -89,15 +89,12 @@ For context when triaging reports, StellarGate already implements:
   `STELLAR_NETWORK=public` (issue #246).
 - Admin-gated merchant provisioning (`X-Admin-Secret`), disabled entirely
   when `ADMIN_PROVISIONING_SECRET` is unset.
-- **Constant-time secret comparison for `X-Admin-Secret`.** The admin secret
-  gate hashes both the supplied value and the configured secret with SHA-256
-  before comparing, so the comparison operates on fixed-length byte arrays
-  rather than variable-length strings. This removes the byte-by-byte
-  short-circuit behaviour of plain string equality, which would otherwise
-  expose a prefix-match oracle to an attacker with enough request budget
-  (issue #244). All shared secrets (`WEBHOOK_SECRET`,
-  `ADMIN_PROVISIONING_SECRET`) must be at least 32 characters and are
-  rejected at boot if they match known placeholder values.
+- **`webhook_url` is treated as a secret.** Webhook endpoint URLs commonly
+  embed capability tokens in the path or query string (e.g.
+  `https://hooks.example.com/t/SecretToken`). StellarGate never logs the
+  full URL; log statements redact it to scheme and host only
+  (`https://hooks.example.com/…`) so the credential is not copied into log
+  sinks, aggregators, or support tickets (issue #240).
 
 If you find a way around any of the above, that's exactly what this policy
 is for — please report it privately.

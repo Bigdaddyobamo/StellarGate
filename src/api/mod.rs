@@ -1114,8 +1114,21 @@ pub fn rate_limited_bucket(req: &Request) -> Option<&'static str> {
             _ if path.starts_with("/payments/") && path.ends_with("/redeliver") => {
                 Some("redeliver")
             }
+            // Key issuance: POST /merchants/:id/keys — credential lifecycle
+            // belongs in the "merchants" write bucket, not the default read
+            // bucket that gives it 5× the quota (issue #243).
+            _ if path.starts_with("/merchants/") => Some("merchants"),
             _ => Some("default"),
         };
+    }
+    // DELETE is a write/destructive operation. Key revocation
+    // (DELETE /merchants/:id/keys/:key_id) must be treated as a write like
+    // POST /merchants, not as cheap read-only traffic (issue #243).
+    if req.method() == axum::http::Method::DELETE
+        && path.starts_with("/merchants/")
+        && path.contains("/keys/")
+    {
+        return Some("merchants");
     }
     // All other non-POST requests (GET, etc.) fall into the default bucket so
     // that payment enumeration and webhook listing are covered by a baseline
@@ -1889,6 +1902,21 @@ mod tests {
                 Method::POST,
                 "/v1/payments/x/webhooks/y/redeliver",
                 Some("redeliver"),
+            ),
+            // Key issuance: POST to /merchants/:id/keys must be in the
+            // write "merchants" bucket, not the 5× read default (issue #243).
+            (Method::POST, "/merchants/abc/keys", Some("merchants")),
+            (Method::POST, "/v1/merchants/abc/keys", Some("merchants")),
+            // Key revocation: DELETE is a destructive write, same bucket (issue #243).
+            (
+                Method::DELETE,
+                "/merchants/abc/keys/key-id",
+                Some("merchants"),
+            ),
+            (
+                Method::DELETE,
+                "/v1/merchants/abc/keys/key-id",
+                Some("merchants"),
             ),
             (Method::GET, "/health", None),
             (Method::GET, "/v1/health", None),

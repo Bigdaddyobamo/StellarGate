@@ -322,3 +322,94 @@ async fn run_trustline_checker_refreshes_state_on_its_interval() {
         "the periodic checker must have run at least once on its own"
     );
 }
+
+/// An unauthorized trustline (is_authorized=false) is reported as missing,
+/// because it cannot receive payments — just like a totally absent one (issue #230).
+#[tokio::test]
+async fn check_trustlines_surfaces_unauthorized_trustline_as_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{GATEWAY}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "balances": [
+                { "balance": "100.0", "asset_type": "native" },
+                {
+                    "balance": "0.0",
+                    "asset_type": "credit_alphanum4",
+                    "asset_code": "USDC",
+                    "asset_issuer": USDC_ISSUER,
+                    "is_authorized": false,
+                    "limit": "922337203685.4775807"
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let state = make_state(server.uri()).await;
+    let missing = horizon::check_trustlines(&state).await.unwrap();
+    assert_eq!(missing, vec!["USDC".to_string()]);
+    assert_eq!(state.trustline_metrics.is_missing("USDC"), Some(true));
+}
+
+/// An authorized trustline (is_authorized=true, or field absent which
+/// defaults to true) is considered usable (issue #230).
+#[tokio::test]
+async fn check_trustlines_authorized_trustline_is_not_reported_missing() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{GATEWAY}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "balances": [
+                { "balance": "100.0", "asset_type": "native" },
+                {
+                    "balance": "0.0",
+                    "asset_type": "credit_alphanum4",
+                    "asset_code": "USDC",
+                    "asset_issuer": USDC_ISSUER,
+                    "is_authorized": true,
+                    "limit": "922337203685.4775807"
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let state = make_state(server.uri()).await;
+    let missing = horizon::check_trustlines(&state).await.unwrap();
+    assert!(missing.is_empty());
+    assert_eq!(state.trustline_metrics.is_missing("USDC"), Some(false));
+}
+
+/// Headroom (limit - balance) is exposed in TrustlineMetrics after a
+/// successful check (issue #230).
+#[tokio::test]
+async fn check_trustlines_records_headroom() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path(format!("/accounts/{GATEWAY}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "balances": [
+                { "balance": "100.0", "asset_type": "native" },
+                {
+                    "balance": "300.0000000",
+                    "asset_type": "credit_alphanum4",
+                    "asset_code": "USDC",
+                    "asset_issuer": USDC_ISSUER,
+                    "is_authorized": true,
+                    "limit": "1000.0000000"
+                }
+            ]
+        })))
+        .mount(&server)
+        .await;
+
+    let state = make_state(server.uri()).await;
+    horizon::check_trustlines(&state).await.unwrap();
+
+    let headroom = state.trustline_metrics.snapshot_headroom();
+    assert_eq!(headroom.len(), 1);
+    assert_eq!(headroom[0].0, "USDC");
+    // 700 XLM * 10_000_000 stroops/XLM = 7_000_000_000 stroops
+    assert_eq!(headroom[0].1, 7_000_000_000i64);
+}
