@@ -233,6 +233,27 @@ impl HorizonPayment {
     fn is_successful(&self) -> bool {
         self.transaction.as_ref().and_then(|t| t.successful) == Some(true)
     }
+
+    /// The index of this operation within its transaction, derived from the
+    /// Horizon paging token.
+    ///
+    /// Horizon encodes the paging token as a large integer that embeds the
+    /// ledger sequence, transaction index, and operation index. Each payment
+    /// operation in a multi-op transaction gets its own unique paging token,
+    /// so the token itself is a stable, unique-per-operation identifier.  We
+    /// store it as-is as the `operation_index` column so that two operations
+    /// sharing the same `tx_hash` always get distinct ledger rows (issue #613).
+    ///
+    /// If the paging token is absent (e.g. a synthetic record constructed in
+    /// tests without one) we default to `0`, which is the correct value for
+    /// any single-operation transaction and for records written before this
+    /// field existed (issue #616).
+    pub fn operation_index(&self) -> i64 {
+        self.paging_token
+            .as_deref()
+            .and_then(|t| t.parse::<i64>().ok())
+            .unwrap_or(0)
+    }
 }
 
 /// Seconds elapsed between an RFC 3339 timestamp and now. Used to observe
@@ -1083,13 +1104,18 @@ async fn reconcile_active_payment(
     on an earlier poll cycle, redelivered over the stream, or racing a
     concurrent reconciler — the insert is a no-op and we must not settle again.
     This makes re-processing any past transaction a no-op regardless of the
-    order records arrive in (issue #119). */
+    order records arrive in (issue #119).
+
+    `operation_index` is included so that two payment operations sharing the
+    same `tx_hash` (e.g. a multi-op transaction) each get their own ledger
+    row and are credited independently (issue #613). */
     let new_stroops = hp
         .amount
         .as_deref()
         .and_then(money::parse_stroops)
         .unwrap_or(0);
-    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, new_stroops).await? {
+    let op_index = hp.operation_index();
+    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, op_index, new_stroops).await? {
         return Ok(false);
     }
 
@@ -1160,8 +1186,11 @@ async fn reconcile_post_terminal_payment(
     };
 
     /* Record idempotently so a re-seen transaction fires no duplicate webhook.
-    If this hash is already present the payment was already handled; skip. */
-    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, matched.new_stroops).await? {
+    If this hash+operation_index is already present the payment was already
+    handled; skip. operation_index distinguishes multiple ops within one
+    transaction so each fires its own unexpected-payment webhook (issue #613). */
+    let op_index = hp.operation_index();
+    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, op_index, matched.new_stroops).await? {
         return Ok(());
     }
 
