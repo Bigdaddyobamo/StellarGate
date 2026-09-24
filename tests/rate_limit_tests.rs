@@ -82,7 +82,7 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    (TestServer::new(router).unwrap(), pool)
+    (TestServer::new(router), pool)
 }
 
 async fn provision_merchant(server: &TestServer) -> String {

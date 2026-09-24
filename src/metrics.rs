@@ -1319,9 +1319,9 @@ mod tests {
     #[test]
     fn http_metrics_labels_are_bounded_by_route_not_raw_path() {
         let http = HttpMetrics::new();
-        http.record("GET", "/v1/payments/:id", 200, 5);
-        http.record("GET", "/v1/payments/:id", 200, 15);
-        http.record("GET", "/v1/payments/:id", 404, 3);
+        http.record("GET", "/v1/payments/{id}", 200, 5);
+        http.record("GET", "/v1/payments/{id}", 200, 15);
+        http.record("GET", "/v1/payments/{id}", 404, 3);
 
         let rendered = render_all(
             &WebhookMetrics::new(),
@@ -1335,25 +1335,25 @@ mod tests {
 
         assert!(
             rendered.contains(
-                "stellargate_http_requests_total{method=\"GET\",route=\"/v1/payments/:id\",status=\"200\"} 2"
+                "stellargate_http_requests_total{method=\"GET\",route=\"/v1/payments/{id}\",status=\"200\"} 2"
             ),
             "got:\n{rendered}"
         );
         assert!(
             rendered.contains(
-                "stellargate_http_requests_total{method=\"GET\",route=\"/v1/payments/:id\",status=\"404\"} 1"
+                "stellargate_http_requests_total{method=\"GET\",route=\"/v1/payments/{id}\",status=\"404\"} 1"
             ),
             "got:\n{rendered}"
         );
         assert!(
             rendered.contains(
-                "stellargate_http_request_duration_seconds_count{method=\"GET\",route=\"/v1/payments/:id\"} 3"
+                "stellargate_http_request_duration_seconds_count{method=\"GET\",route=\"/v1/payments/{id}\"} 3"
             ),
             "the latency histogram must aggregate over the same bounded route \
              label as the counter:\n{rendered}"
         );
         assert!(
-            rendered.contains("stellargate_http_request_duration_seconds_sum{method=\"GET\",route=\"/v1/payments/:id\"} 0.023"),
+            rendered.contains("stellargate_http_request_duration_seconds_sum{method=\"GET\",route=\"/v1/payments/{id}\"} 0.023"),
             "sum must be in seconds, not milliseconds:\n{rendered}"
         );
     }

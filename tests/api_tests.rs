@@ -91,7 +91,7 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    let server = TestServer::new(router).unwrap();
+    let server = TestServer::new(router);
     (server, pool)
 }
 
@@ -126,7 +126,7 @@ async fn server_with_config_and_trustlines(
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    let server = TestServer::new(router).unwrap();
+    let server = TestServer::new(router);
     (server, pool)
 }
 

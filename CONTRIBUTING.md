@@ -106,7 +106,7 @@ allow.
 
 ## Toolchain & CI Policy
 
-Blocking CI jobs (like formatting and clippy) are strictly tied to our pinned MSRV (1.88) as defined in `rust-toolchain.toml`. This ensures that your local `cargo clippy` and `cargo fmt` results perfectly match CI. An advisory lint job runs on the latest stable toolchain to catch upcoming lints, but it is set to `continue-on-error: true` and will not block your pull request.
+Blocking CI jobs (like formatting and clippy) are strictly tied to our pinned MSRV (1.94) as defined in `rust-toolchain.toml`. This ensures that your local `cargo clippy` and `cargo fmt` results perfectly match CI. An advisory lint job runs on the latest stable toolchain to catch upcoming lints, but it is set to `continue-on-error: true` and will not block your pull request.
 
 ## Commit Messages
 
