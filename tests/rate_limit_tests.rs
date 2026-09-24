@@ -94,6 +94,52 @@ async fn provision_merchant(server: &TestServer) -> String {
     res.json::<Value>()["api_key"].as_str().unwrap().to_string()
 }
 
+fn header(res: &axum_test::TestResponse, name: &str) -> u64 {
+    res.headers()
+        .get(name)
+        .unwrap_or_else(|| panic!("response is missing the {name} header"))
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn rate_limit_headers_track_quota_before_and_after_exhaustion() {
+    let (server, _pool) = server_with_config(make_config(2)).await;
+    let _key = provision_merchant(&server).await;
+    let auth = "******";
+    let body = json!({ "amount": "1", "asset": "XLM" });
+
+    let first = server
+        .post("/v1/payments")
+        .add_header("Authorization", auth)
+        .json(&body)
+        .await;
+    first.assert_status(StatusCode::CREATED);
+    assert_eq!(header(&first, "x-ratelimit-limit"), 2);
+    assert_eq!(header(&first, "x-ratelimit-remaining"), 1);
+
+    let second = server
+        .post("/v1/payments")
+        .add_header("Authorization", auth)
+        .json(&body)
+        .await;
+    second.assert_status(StatusCode::CREATED);
+    assert_eq!(header(&second, "x-ratelimit-limit"), 2);
+    assert_eq!(header(&second, "x-ratelimit-remaining"), 0);
+
+    let throttled = server
+        .post("/v1/payments")
+        .add_header("Authorization", auth)
+        .json(&body)
+        .await;
+    throttled.assert_status(StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(header(&throttled, "x-ratelimit-limit"), 2);
+    assert_eq!(header(&throttled, "x-ratelimit-remaining"), 0);
+    assert!(header(&throttled, "x-ratelimit-reset") >= header(&throttled, "retry-after"));
+}
+
 #[tokio::test]
 async fn test_rate_limit_exceeded_returns_429() {
     let (server, _pool) = server_with_config(make_config(1)).await;

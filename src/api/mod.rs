@@ -2,13 +2,14 @@ use crate::api::payments::{AppError, JsonBody};
 use crate::{db, AppState};
 use axum::{
     extract::{ConnectInfo, Extension, Path, Request, State},
-    http::{header, HeaderMap, HeaderValue, StatusCode},
+    http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode},
     middleware::{self, Next},
     response::IntoResponse,
     routing::{get, post},
     Json,
 };
-use governor::clock::Clock;
+use governor::clock::{Clock, DefaultClock};
+use governor::middleware::StateInformationMiddleware;
 use ipnet::IpNet;
 use moka::sync::Cache;
 use serde_json::{json, Value};
@@ -61,12 +62,16 @@ struct RateLimitState {
     ///   so limiter state for quiet IPs is automatically reclaimed.
     /// - moka uses internal sharding, eliminating the single global lock that
     ///   the old `Mutex` imposed.
-    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter>>,
+    limiters: Cache<String, Arc<governor::DefaultDirectRateLimiter<StateInformationMiddleware>>>,
     /// CIDR blocks trusted to supply `X-Forwarded-For` / `X-Real-IP`, copied
     /// from `Config` at startup so the middleware can attribute each request
     /// to the real client (issue #330).
     trusted_proxies: Vec<IpNet>,
 }
+
+const X_RATELIMIT_LIMIT: HeaderName = HeaderName::from_static("x-ratelimit-limit");
+const X_RATELIMIT_REMAINING: HeaderName = HeaderName::from_static("x-ratelimit-remaining");
+const X_RATELIMIT_RESET: HeaderName = HeaderName::from_static("x-ratelimit-reset");
 
 impl RateLimitState {
     fn new(requests_per_sec: u32, trusted_proxies: Vec<IpNet>) -> Self {
@@ -142,7 +147,7 @@ async fn merchant_redeliver_limit_middleware(
     });
 
     if let Err(not_until) = limiter.check() {
-        let wait = not_until.wait_time_from(governor::clock::QuantaClock::default().now());
+        let wait = not_until.wait_time_from(DefaultClock::default().now());
         let retry_after = retry_after_secs(wait);
         return (
             StatusCode::TOO_MANY_REQUESTS,
@@ -228,7 +233,6 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         through referrers. Applied outermost so they also cover responses the
         inner layers generate (rate-limit 429s, timeout 408s, and the router's
         404/405 fallbacks).
-
         `nosniff` and `referrer-policy` override any inner value because a
         stricter setting elsewhere is never correct (payment ids travel in
         URLs). `cache-control` is `if_not_present` so a handler that
@@ -758,31 +762,41 @@ async fn rate_limit_middleware(
         guard, so nothing borrowed from the cache is held across the `.await`
         below. */
         let limiter = rate_limit.limiters.get_with(key, || {
-            Arc::new(governor::RateLimiter::direct(governor::Quota::per_second(
-                NonZeroU32::new(effective_rps)
-                    .expect("effective_rps is clamped to at least 1"),
-            )))
+            Arc::new(
+                governor::RateLimiter::direct(governor::Quota::per_second(
+                    NonZeroU32::new(effective_rps).expect("effective_rps is clamped to at least 1"),
+                ))
+                .with_middleware::<StateInformationMiddleware>(),
+            )
         });
 
-        if let Err(not_until) = limiter.check() {
-            use governor::clock::Clock as _;
-            let wait = not_until.wait_time_from(governor::clock::QuantaClock::default().now());
-            let retry_after = retry_after_secs(wait);
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                [
-                    (
-                        header::RETRY_AFTER,
-                        HeaderValue::from_str(&retry_after.to_string())
-                            .unwrap_or_else(|_| HeaderValue::from_static("1")),
-                    ),
-                ],
-                Json(json!({
-                    "error": "rate limit exceeded",
-                    "code": "rate_limit_exceeded"
-                })),
-            )
-                .into_response();
+        match limiter.check() {
+            Ok(snapshot) => {
+                let remaining = snapshot.remaining_burst_capacity();
+                let reset = reset_secs(snapshot.quota(), remaining, Duration::ZERO);
+                let mut response = next.run(req).await;
+                set_rate_limit_headers(response.headers_mut(), effective_rps, remaining, reset);
+                return response;
+            }
+            Err(not_until) => {
+                let wait = not_until.wait_time_from(DefaultClock::default().now());
+                let retry_after = retry_after_secs(wait);
+                let reset = reset_secs(not_until.quota(), 0, wait);
+                let mut response = (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({
+                        "error": "rate limit exceeded",
+                        "code": "rate_limit_exceeded"
+                    })),
+                )
+                    .into_response();
+                let headers = response.headers_mut();
+                if let Ok(value) = HeaderValue::from_str(&retry_after.to_string()) {
+                    headers.insert(header::RETRY_AFTER, value);
+                }
+                set_rate_limit_headers(headers, effective_rps, 0, reset);
+                return response;
+            }
         }
     }
 
@@ -822,6 +836,18 @@ pub(crate) fn reset_secs(quota: governor::Quota, remaining: u32, next_wait: Dura
     // path, so it replaces one interval rather than adding to the total.
     let total = refill.max(next_wait);
     total.as_secs_f64().ceil() as u64
+}
+
+fn set_rate_limit_headers(headers: &mut HeaderMap, limit: u32, remaining: u32, reset: u64) {
+    for (name, value) in [
+        (X_RATELIMIT_LIMIT, limit as u64),
+        (X_RATELIMIT_REMAINING, remaining as u64),
+        (X_RATELIMIT_RESET, reset),
+    ] {
+        if let Ok(value) = HeaderValue::from_str(&value.to_string()) {
+            headers.insert(name, value);
+        }
+    }
 }
 
 /// Identifies which rate-limit bucket a request falls into, or `None` for
@@ -1066,6 +1092,10 @@ fn build_cors(cfg: &crate::config::Config) -> CorsLayer {
             HeaderName::from_static("x-request-id"),
             HeaderName::from_static("deprecation"),
             HeaderName::from_static("link"),
+            header::RETRY_AFTER,
+            X_RATELIMIT_LIMIT,
+            X_RATELIMIT_REMAINING,
+            X_RATELIMIT_RESET,
         ])
 }
 
@@ -1744,7 +1774,10 @@ mod tests {
     async fn full_router_builds_and_matches_path_params() {
         let server = TestServer::new(router(header_test_state("testnet").await)).unwrap();
 
-        for path in ["/v1/payments/some-id/webhooks", "/payments/some-id/webhooks"] {
+        for path in [
+            "/v1/payments/some-id/webhooks",
+            "/payments/some-id/webhooks",
+        ] {
             server
                 .get(path)
                 .await
