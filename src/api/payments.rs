@@ -1,9 +1,6 @@
 use crate::{api::AuthenticatedMerchant, db, money, AppState};
 use axum::{
-    extract::{
-        ConnectInfo, Extension, FromRequest, FromRequestParts, OptionalFromRequest, Path, Query,
-        Request, State,
-    },
+    extract::{ConnectInfo, Extension, FromRequest, FromRequestParts, Path, Query, Request, State},
     http::{request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     Json,

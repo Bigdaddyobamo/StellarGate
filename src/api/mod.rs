@@ -1725,4 +1725,22 @@ mod tests {
         res.assert_status_ok();
         assert!(res.text().contains("stellargate_auth_attempts_total"));
     }
+
+    /// Builds the full production router (issue #629). axum 0.8 panics at
+    /// router build time on the old `/:param` capture syntax, so a bad path
+    /// fails here in CI rather than at startup. Also checks that a
+    /// parameterised route actually matches on both the `/v1` and legacy
+    /// mounts: an unauthenticated request reaching the auth middleware gets
+    /// 401, whereas an unmatched path would fall through to the 404 fallback.
+    #[tokio::test]
+    async fn full_router_builds_and_matches_path_params() {
+        let server = TestServer::new(router(header_test_state("testnet").await)).unwrap();
+
+        for path in ["/v1/payments/some-id/webhooks", "/payments/some-id/webhooks"] {
+            server
+                .get(path)
+                .await
+                .assert_status(StatusCode::UNAUTHORIZED);
+        }
+    }
 }

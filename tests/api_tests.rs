@@ -1776,6 +1776,54 @@ async fn test_cannot_revoke_the_last_active_key() {
         .assert_status_ok();
 }
 
+/// Two concurrent revocations of a merchant's only two keys must never leave it
+/// with zero active keys (TOCTOU race on the last-key guard, issue #618).
+#[tokio::test]
+async fn test_concurrent_revocations_never_remove_the_last_active_key() {
+    let (server, pool) = test_server_with_pool().await;
+    let res = server
+        .post("/merchants")
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .await;
+    let body: Value = res.json();
+    let merchant_id = body["merchant_id"].as_str().unwrap().to_string();
+    let key_a = body["key_id"].as_str().unwrap().to_string();
+
+    let res = server
+        .post(&format!("/merchants/{merchant_id}/keys"))
+        .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+        .json(&json!({ "label": "second" }))
+        .await;
+    res.assert_status(StatusCode::CREATED);
+    let key_b = res.json::<Value>()["key_id"].as_str().unwrap().to_string();
+
+    let revoke = |key_id: String| {
+        let path = format!("/merchants/{merchant_id}/keys/{key_id}");
+        let server = &server;
+        async move {
+            server
+                .delete(&path)
+                .add_header("X-Admin-Secret", TEST_ADMIN_SECRET)
+                .await
+                .status_code()
+        }
+    };
+    let (a, b) = tokio::join!(revoke(key_a), revoke(key_b));
+
+    assert_eq!(
+        [a, b].iter().filter(|s| **s == StatusCode::OK).count(),
+        1,
+        "exactly one revoke may succeed; got {a} and {b}"
+    );
+    assert_eq!(
+        db::count_active_api_keys(&pool, &merchant_id)
+            .await
+            .unwrap(),
+        1,
+        "the merchant must keep at least one active key"
+    );
+}
+
 /// Listing keys must never expose a usable credential.
 #[tokio::test]
 async fn test_listing_keys_never_returns_the_secret() {

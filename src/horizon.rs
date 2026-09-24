@@ -233,6 +233,27 @@ impl HorizonPayment {
     fn is_successful(&self) -> bool {
         self.transaction.as_ref().and_then(|t| t.successful) == Some(true)
     }
+
+    /// The index of this operation within its transaction, derived from the
+    /// Horizon paging token.
+    ///
+    /// Horizon encodes the paging token as a large integer that embeds the
+    /// ledger sequence, transaction index, and operation index. Each payment
+    /// operation in a multi-op transaction gets its own unique paging token,
+    /// so the token itself is a stable, unique-per-operation identifier.  We
+    /// store it as-is as the `operation_index` column so that two operations
+    /// sharing the same `tx_hash` always get distinct ledger rows (issue #613).
+    ///
+    /// If the paging token is absent (e.g. a synthetic record constructed in
+    /// tests without one) we default to `0`, which is the correct value for
+    /// any single-operation transaction and for records written before this
+    /// field existed (issue #616).
+    pub fn operation_index(&self) -> i64 {
+        self.paging_token
+            .as_deref()
+            .and_then(|t| t.parse::<i64>().ok())
+            .unwrap_or(0)
+    }
 }
 
 /// Seconds elapsed between an RFC 3339 timestamp and now. Used to observe
@@ -250,8 +271,8 @@ fn elapsed_secs(ts: &str) -> Option<i64> {
 /// on that intent (no `accepted_assets` allow-list lookup, since a terminal
 /// intent's priced asset/issuer is fixed regardless of today's configuration).
 #[derive(Debug, Clone, Copy)]
-struct IntentMatch {
-    new_stroops: i64,
+pub struct IntentMatch {
+    pub new_stroops: i64,
 }
 
 /// Return the parsed amount when a Horizon payment belongs to this intent.
@@ -260,7 +281,7 @@ struct IntentMatch {
 /// ledger. Mirrors the match checks in [`verify`], but against a (typically
 /// terminal) intent's own recorded `asset`/`asset_issuer` rather than the
 /// current `accepted_assets` allow-list.
-fn matches_intent(payment: &db::Payment, hp: &HorizonPayment) -> Option<IntentMatch> {
+pub fn matches_intent(payment: &db::Payment, hp: &HorizonPayment) -> Option<IntentMatch> {
     if hp.kind != "payment" {
         return None;
     }
@@ -356,7 +377,20 @@ pub fn verify(
     let raw_amount = hp.amount.as_deref()?;
     let new_paid = money::parse_stroops(raw_amount)?;
     let expected = money::parse_stroops(&payment.amount)?;
-    let total_paid = already_paid_stroops + new_paid;
+    /* `already_paid_stroops` is an unbounded running sum across every
+    processed transaction for this intent, so plain `+` could overflow — a
+    panic with overflow-checks on, or a silent wrap to a small/negative total
+    in release that would corrupt the verdict (issue #625). Reject the payment
+    instead, consistent with the checked arithmetic in `money::parse_stroops`. */
+    let Some(total_paid) = already_paid_stroops.checked_add(new_paid) else {
+        warn!(
+            payment_id = %payment.id,
+            already_paid_stroops,
+            new_paid,
+            "cumulative paid amount would overflow i64 — rejecting payment"
+        );
+        return None;
+    };
     let tx_hash = hp.transaction_hash.clone().unwrap_or_default();
     let paid_amount = money::stroops_to_string(total_paid);
 
@@ -499,6 +533,46 @@ pub async fn fetch_recent_payments(
         .into());
     }
 
+    let page: PaymentsPage = resp.json().await?;
+    Ok(page.embedded.records)
+}
+
+/// Fetch every payment operation of one transaction (`/transactions/{hash}/payments`),
+/// with the transaction joined so memo and success are available. Used by the
+/// under-credit audit to sum all operations of a multi-operation transaction.
+pub async fn fetch_transaction_payments(
+    client: &reqwest::Client,
+    horizon_url: &str,
+    tx_hash: &str,
+) -> anyhow::Result<Vec<HorizonPayment>> {
+    let mut url = reqwest::Url::parse(horizon_url)
+        .map_err(|e| anyhow::anyhow!("invalid Horizon URL {horizon_url:?}: {e}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Horizon URL cannot be used as a path base"))?;
+        segments.pop_if_empty();
+        segments.extend(["transactions", tx_hash, "payments"]);
+    }
+    url.query_pairs_mut()
+        .append_pair("join", "transactions")
+        .append_pair("limit", "200");
+    let resp = client
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let retry_after = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(HorizonHttpError {
+            status,
+            retry_after,
+            body,
+        }
+        .into());
+    }
     let page: PaymentsPage = resp.json().await?;
     Ok(page.embedded.records)
 }
@@ -1083,13 +1157,18 @@ async fn reconcile_active_payment(
     on an earlier poll cycle, redelivered over the stream, or racing a
     concurrent reconciler — the insert is a no-op and we must not settle again.
     This makes re-processing any past transaction a no-op regardless of the
-    order records arrive in (issue #119). */
+    order records arrive in (issue #119).
+
+    `operation_index` is included so that two payment operations sharing the
+    same `tx_hash` (e.g. a multi-op transaction) each get their own ledger
+    row and are credited independently (issue #613). */
     let new_stroops = hp
         .amount
         .as_deref()
         .and_then(money::parse_stroops)
         .unwrap_or(0);
-    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, new_stroops).await? {
+    let op_index = hp.operation_index();
+    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, op_index, new_stroops).await? {
         return Ok(false);
     }
 
@@ -1160,8 +1239,11 @@ async fn reconcile_post_terminal_payment(
     };
 
     /* Record idempotently so a re-seen transaction fires no duplicate webhook.
-    If this hash is already present the payment was already handled; skip. */
-    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, matched.new_stroops).await? {
+    If this hash+operation_index is already present the payment was already
+    handled; skip. operation_index distinguishes multiple ops within one
+    transaction so each fires its own unexpected-payment webhook (issue #613). */
+    let op_index = hp.operation_index();
+    if !db::record_processed_tx(&state.pool, &payment.id, hp_hash, op_index, matched.new_stroops).await? {
         return Ok(());
     }
 
@@ -1715,6 +1797,44 @@ mod tests {
                 paid_amount: "6".into(),
             })
         );
+    }
+
+    /// Regression test for issue #626: repeated top-ups near the
+    /// per-transaction maximum drive the running total towards `i64::MAX`.
+    /// The payment that would push it past must be rejected (`None`) rather
+    /// than panicking or wrapping to a small/negative total.
+    #[test]
+    fn near_overflow_cumulative_total_is_rejected_not_wrapped() {
+        let p = pending("XLM", "10");
+        // Close to the largest amount `parse_stroops` accepts per transaction.
+        let hp = native_payment("900000000000", "MEMO1234", "GGATEWAY");
+        let per_tx = money::parse_stroops("900000000000").unwrap();
+
+        let mut already_paid: i64 = 0;
+        let mut accepted = 0;
+        loop {
+            match verify(&p, &hp, &test_assets(), already_paid) {
+                Some(Verdict::Overpaid { paid_amount, .. }) => {
+                    let total = money::parse_stroops(&paid_amount)
+                        .expect("accumulated total must stay a valid positive amount");
+                    assert_eq!(total, already_paid + per_tx);
+                    already_paid = total;
+                    accepted += 1;
+                    assert!(accepted < 100, "overflow was never detected");
+                }
+                None => break,
+                other => panic!("unexpected verdict: {other:?}"),
+            }
+        }
+
+        assert!(accepted >= 1);
+        assert!(already_paid > i64::MAX - per_tx);
+        assert_eq!(already_paid.checked_add(per_tx), None);
+
+        // Already at the edge: one more payment is still rejected, and so is
+        // one arriving on top of an exactly-`i64::MAX` running total.
+        assert_eq!(verify(&p, &hp, &test_assets(), already_paid), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), i64::MAX), None);
     }
 
     #[test]
