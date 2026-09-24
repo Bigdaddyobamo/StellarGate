@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`reqwest` 0.12 → 0.13 (issue #645).** The `rustls-tls` feature is now
+  `rustls`, which uses the `aws-lc-rs` crypto provider and verifies server
+  certificates against the **operating system's trust store**
+  (`rustls-platform-verifier`) instead of the Mozilla roots bundled into the
+  binary (`webpki-roots`). The Docker runtime image already installs
+  `ca-certificates`. A bare-metal or custom-image deployment must have a
+  system CA bundle, or outbound Horizon and webhook requests fail TLS
+  verification. Building now needs a C compiler for `aws-lc-sys` (already
+  present in `rust:*-bookworm`).
+
 ### Fixed
 
 - **`GET /metrics` is no longer reachable anonymously.** It was registered on

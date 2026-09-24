@@ -31,7 +31,7 @@ serde_json = "1"
 # TLS backend is enabled.
 sqlx = { version = "0.9", features = ["sqlite", "runtime-tokio", "migrate"] }
 uuid = { version = "1", features = ["v4"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
 futures-util = "0.3"
 hmac = "0.13"
 sha2 = "0.11"
