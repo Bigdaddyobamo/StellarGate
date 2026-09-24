@@ -18,7 +18,7 @@
 // bodies or URL path parameters.
 //
 // The `route` label specifically uses the matched axum route pattern
-// (e.g. "/v1/payments/:id") and never the raw request URI, so payment IDs,
+// (e.g. "/v1/payments/{id}") and never the raw request URI, so payment IDs,
 // merchant IDs, or delivery IDs never appear in metric label values regardless
 // of how many unique identifiers flow through the service.
 
@@ -374,7 +374,7 @@ impl RouteLatency {
 }
 
 /// HTTP request counters and a latency histogram, labelled by the matched
-/// route pattern (e.g. `/v1/payments/:id`) and method — never the raw URI or
+/// route pattern (e.g. `/v1/payments/{id}`) and method — never the raw URI or
 /// a path parameter — so cardinality stays bounded by the fixed route table
 /// regardless of how many distinct payment or merchant ids are requested.
 ///
@@ -402,7 +402,7 @@ impl HttpMetrics {
 
     /// Record one completed HTTP request.
     ///
-    /// `route` MUST be the matched axum route template (e.g. `/v1/payments/:id`),
+    /// `route` MUST be the matched axum route template (e.g. `/v1/payments/{id}`),
     /// never the raw request URI. This is enforced by convention: the HTTP
     /// metrics middleware extracts the route from axum's `MatchedPath` extension,
     /// which only contains the template. Raw URIs contain path parameters

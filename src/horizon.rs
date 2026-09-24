@@ -356,7 +356,20 @@ pub fn verify(
     let raw_amount = hp.amount.as_deref()?;
     let new_paid = money::parse_stroops(raw_amount)?;
     let expected = money::parse_stroops(&payment.amount)?;
-    let total_paid = already_paid_stroops + new_paid;
+    /* `already_paid_stroops` is an unbounded running sum across every
+    processed transaction for this intent, so plain `+` could overflow — a
+    panic with overflow-checks on, or a silent wrap to a small/negative total
+    in release that would corrupt the verdict (issue #625). Reject the payment
+    instead, consistent with the checked arithmetic in `money::parse_stroops`. */
+    let Some(total_paid) = already_paid_stroops.checked_add(new_paid) else {
+        warn!(
+            payment_id = %payment.id,
+            already_paid_stroops,
+            new_paid,
+            "cumulative paid amount would overflow i64 — rejecting payment"
+        );
+        return None;
+    };
     let tx_hash = hp.transaction_hash.clone().unwrap_or_default();
     let paid_amount = money::stroops_to_string(total_paid);
 
@@ -1715,6 +1728,44 @@ mod tests {
                 paid_amount: "6".into(),
             })
         );
+    }
+
+    /// Regression test for issue #626: repeated top-ups near the
+    /// per-transaction maximum drive the running total towards `i64::MAX`.
+    /// The payment that would push it past must be rejected (`None`) rather
+    /// than panicking or wrapping to a small/negative total.
+    #[test]
+    fn near_overflow_cumulative_total_is_rejected_not_wrapped() {
+        let p = pending("XLM", "10");
+        // Close to the largest amount `parse_stroops` accepts per transaction.
+        let hp = native_payment("900000000000", "MEMO1234", "GGATEWAY");
+        let per_tx = money::parse_stroops("900000000000").unwrap();
+
+        let mut already_paid: i64 = 0;
+        let mut accepted = 0;
+        loop {
+            match verify(&p, &hp, &test_assets(), already_paid) {
+                Some(Verdict::Overpaid { paid_amount, .. }) => {
+                    let total = money::parse_stroops(&paid_amount)
+                        .expect("accumulated total must stay a valid positive amount");
+                    assert_eq!(total, already_paid + per_tx);
+                    already_paid = total;
+                    accepted += 1;
+                    assert!(accepted < 100, "overflow was never detected");
+                }
+                None => break,
+                other => panic!("unexpected verdict: {other:?}"),
+            }
+        }
+
+        assert!(accepted >= 1);
+        assert!(already_paid > i64::MAX - per_tx);
+        assert_eq!(already_paid.checked_add(per_tx), None);
+
+        // Already at the edge: one more payment is still rejected, and so is
+        // one arriving on top of an exactly-`i64::MAX` running total.
+        assert_eq!(verify(&p, &hp, &test_assets(), already_paid), None);
+        assert_eq!(verify(&p, &hp, &test_assets(), i64::MAX), None);
     }
 
     #[test]

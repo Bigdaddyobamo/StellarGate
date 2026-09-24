@@ -277,8 +277,8 @@ fn api_v1(
     minting or revoking a credential is an operator action. */
     let merchants = axum::Router::new()
         .route("/", post(provision_merchant))
-        .route("/:id/keys", post(issue_api_key).get(list_api_keys))
-        .route("/:id/keys/:key_id", axum::routing::delete(revoke_api_key))
+        .route("/{id}/keys", post(issue_api_key).get(list_api_keys))
+        .route("/{id}/keys/{key_id}", axum::routing::delete(revoke_api_key))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_admin_secret,
@@ -290,7 +290,7 @@ fn api_v1(
     `payments::get_by_id`. */
     let payments_authed = axum::Router::new()
         .route("/", post(payments::create).get(payments::list))
-        .route("/:id/webhooks", get(payments::list_webhooks))
+        .route("/{id}/webhooks", get(payments::list_webhooks))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth_middleware,
@@ -305,7 +305,7 @@ fn api_v1(
     then the merchant limiter (runs second, reads it). */
     let redeliver = axum::Router::new()
         .route(
-            "/:id/webhooks/:delivery_id/redeliver",
+            "/{id}/webhooks/{delivery_id}/redeliver",
             post(payments::redeliver_webhook),
         )
         .route_layer(middleware::from_fn_with_state(
@@ -322,7 +322,7 @@ fn api_v1(
         axum::Router::new()
             .merge(payments_authed)
             .merge(redeliver)
-            .route("/:id", get(payments::get_by_id)),
+            .route("/{id}", get(payments::get_by_id)),
     )
 }
 
@@ -1724,5 +1724,23 @@ mod tests {
             .await;
         res.assert_status_ok();
         assert!(res.text().contains("stellargate_auth_attempts_total"));
+    }
+
+    /// Builds the full production router (issue #629). axum 0.8 panics at
+    /// router build time on the old `/:param` capture syntax, so a bad path
+    /// fails here in CI rather than at startup. Also checks that a
+    /// parameterised route actually matches on both the `/v1` and legacy
+    /// mounts: an unauthenticated request reaching the auth middleware gets
+    /// 401, whereas an unmatched path would fall through to the 404 fallback.
+    #[tokio::test]
+    async fn full_router_builds_and_matches_path_params() {
+        let server = TestServer::new(router(header_test_state("testnet").await)).unwrap();
+
+        for path in ["/v1/payments/some-id/webhooks", "/payments/some-id/webhooks"] {
+            server
+                .get(path)
+                .await
+                .assert_status(StatusCode::UNAUTHORIZED);
+        }
     }
 }
