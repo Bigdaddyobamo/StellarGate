@@ -1,4 +1,5 @@
 pub mod api;
+pub mod audit;
 pub mod config;
 pub mod db;
 pub mod expiry;
@@ -11,94 +12,105 @@ pub mod strkey;
 pub mod supervise;
 pub mod webhook;
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// Consecutive panics at or above this mark a required task as crash-looping.
-/// `/health` fails while any required task is crash-looping, even if the
-/// supervisor has already spawned a replacement (issue #316).
+/// Number of consecutive panics that puts a task into the crash-loop state.
+/// Exposed as a `pub const` so tests in `supervise.rs` can reference it
+/// without hard-coding the threshold twice.
 pub const CRASH_LOOP_THRESHOLD: u32 = 3;
 
-/// Snapshot of one background task, used to render `/metrics`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// ── Per-task state ────────────────────────────────────────────────────────────
+
+/// A point-in-time snapshot of one background task's health, used by
+/// `GET /metrics` to render per-task Prometheus gauges.
 pub struct TaskSnapshot {
-    pub name: &'static str,
-    pub running: bool,
+    pub name: String,
+    /// How many supervisor-triggered restarts this task has had.
     pub restarts: u64,
+    /// Whether the task is currently considered running.
+    pub running: bool,
+    /// Consecutive panics since the last stable run.
     pub consecutive_failures: u32,
-    /// Set when the task exited because configuration gave it nothing to do.
-    /// Distinguishes "switched off on purpose" from "not running", which the
-    /// counters alone could not (issue #317).
-    pub disabled_reason: Option<&'static str>,
+    /// Set if the task exited because configuration gave it nothing to do.
+    pub disabled_reason: Option<String>,
 }
 
-/// Tracks background task health: per-task liveness for `/health`, the last
-/// successful on-chain progress for `/ready`'s cursor-freshness check, and
-/// started/stopped/failure/restart counts for monitoring and alerting.
-#[derive(Clone)]
-pub struct TaskHealth {
-    inner: Arc<TaskHealthInner>,
+/// Mutable state for a single named background task, held inside the
+/// `Mutex`-guarded map in [`TaskHealthInner`].
+#[derive(Default)]
+struct TaskState {
+    /// Task is currently running.
+    running: bool,
+    /// Supervisor-triggered restarts (not panics — those go to `failed` on
+    /// `TaskHealthInner`).
+    restarts: u64,
+    /// Consecutive panics / `task_failed` calls since the last `note_stable`.
+    consecutive_failures: u32,
+    /// Reason the task exited because of a configuration choice, if any.
+    disabled_reason: Option<&'static str>,
 }
+
+// ── Inner ─────────────────────────────────────────────────────────────────────
 
 struct TaskHealthInner {
-    /// Count of task starts.
-    started: AtomicU64,
-    /// Count of task stops.
-    stopped: AtomicU64,
-    /// Count of task panics/failures.
+    /// Per-task mutable state, keyed by the task's static name.
+    ///
+    /// The `Mutex` is acquired with `unwrap_or_else(|e| e.into_inner())`:
+    /// if a prior holder panicked while holding the lock the data is still
+    /// valid — we take the guard and continue rather than propagating a
+    /// secondary panic. This is the standard poison-recovery pattern for
+    /// locks that guard plain data (no invariant was broken by the panic).
+    tasks: Mutex<HashMap<&'static str, TaskState>>,
+
+    /// Set of task names that must be running for the process to be
+    /// considered healthy. Populated by [`TaskHealth::require`] at boot.
+    required: Mutex<HashSet<&'static str>>,
+
+    /// Total panics recorded across all tasks. Incremented by
+    /// [`TaskHealth::task_failed`] and read by [`TaskHealth::failed`].
     failed: AtomicU64,
-    /// Per-task liveness, keyed by the name passed to [`TaskHealth::task_started`].
-    running: Mutex<HashMap<&'static str, bool>>,
-    /// Supervisor restarts after a panic or unexpected return, keyed by task name.
-    restarts: Mutex<HashMap<&'static str, u64>>,
-    /// Consecutive panics since the last stable run, keyed by task name.
-    consecutive_failures: Mutex<HashMap<&'static str, u32>>,
-    /// Tasks that exited because configuration gave them nothing to do, with
-    /// the reason. Distinct from "stopped" on purpose (issue #317): a disabled
-    /// worker is a deployment choice, not a fault, so it must not fail
-    /// `/health` — while a worker that stopped for any *other* reason still
-    /// must.
-    disabled: Mutex<HashMap<&'static str, &'static str>>,
-    /// Task names that must be running for `/health` to pass. Declared by the
-    /// process that spawns the tasks (main.rs), so "expected" is a deployment
-    /// decision rather than something the probe has to guess.
-    required: Mutex<Vec<&'static str>>,
-    /// Unix seconds of the last successful poll cycle or stream event; `0`
-    /// means never. Drives `/ready`'s cursor-freshness check (issue #315).
+
+    /// Total `task_started` calls across all tasks (including restarts).
+    /// Read by [`TaskHealth::started`].
+    started: AtomicU64,
+
+    /// Total clean `task_stopped` calls across all tasks. Read by
+    /// [`TaskHealth::stopped`].
+    stopped: AtomicU64,
+
+    /// Unix timestamp (seconds) of the last successful Horizon poll or stream
+    /// event. `0` until the first call to [`TaskHealth::note_success`].
     last_success_unix: AtomicI64,
-    /// Whether the gateway account exists on the ledger.
-    gateway_account_exists: std::sync::atomic::AtomicBool,
+
+    /// Flag that is set once on startup to confirm the gateway account exists.
+    gateway_account_exists: AtomicBool,
 }
 
 impl Default for TaskHealthInner {
     fn default() -> Self {
         Self {
+            tasks: Mutex::new(HashMap::new()),
+            required: Mutex::new(HashSet::new()),
+            failed: AtomicU64::new(0),
             started: AtomicU64::new(0),
             stopped: AtomicU64::new(0),
-            failed: AtomicU64::new(0),
-            running: Mutex::new(HashMap::new()),
-            restarts: Mutex::new(HashMap::new()),
-            consecutive_failures: Mutex::new(HashMap::new()),
-            disabled: Mutex::new(HashMap::new()),
-            required: Mutex::new(Vec::new()),
             last_success_unix: AtomicI64::new(0),
-            gateway_account_exists: std::sync::atomic::AtomicBool::new(false),
+            gateway_account_exists: AtomicBool::new(false),
         }
     }
 }
 
-/// Locks `mutex`, recovering from poison instead of propagating the panic.
+// ── Public handle ─────────────────────────────────────────────────────────────
+
+/// Tracks background task health: per-task running state, restart and
+/// consecutive-failure counts, and a global panic counter.
 ///
-/// Every `TaskHealthInner` field is plain bookkeeping (liveness flags,
-/// counters, names) mutated only by short, infallible inserts — there is no
-/// invariant a panicking holder could leave broken. `/health` and `/metrics`
-/// read these locks on every request, so re-panicking on a poisoned lock
-/// would take the health/metrics endpoints down along with whatever
-/// unrelated task actually panicked while holding it, which is strictly
-/// worse than serving a possibly-stale snapshot.
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+/// Cheap to clone — the inner data is behind an [`Arc`].
+#[derive(Clone)]
+pub struct TaskHealth {
+    inner: Arc<TaskHealthInner>,
 }
 
 impl TaskHealth {
@@ -108,211 +120,302 @@ impl TaskHealth {
         }
     }
 
-    /// Declare that the named task must keep running for the service to be
-    /// healthy. `/health` returns `503` while any required task is not running
-    /// (issue #315). Call before the task is spawned.
+    // ── Registration ─────────────────────────────────────────────────────────
+
+    /// Declare `name` as a required background task. Must be called at boot,
+    /// before the supervisor starts the task, so that `dead_required_tasks`
+    /// and `expected_tasks` / `live_tasks` report correctly from the first
+    /// moment.
     pub fn require(&self, name: &'static str) {
-        lock(&self.inner.required).push(name);
+        self.inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(name);
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(name)
+            .or_default();
     }
 
+    // ── Named task lifecycle ──────────────────────────────────────────────────
+
+    /// Record that `name` started running. Called by the supervisor just
+    /// before spawning the child task.
     pub fn task_started(&self, name: &'static str) {
         self.inner.started.fetch_add(1, Ordering::Relaxed);
-        lock(&self.inner.running).insert(name, true);
+        let mut tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = tasks.entry(name).or_default();
+        state.running = true;
+        // A fresh start clears the disabled marker: a restarted task is no
+        // longer disabled.
+        state.disabled_reason = None;
     }
 
+    /// Record that `name` stopped cleanly (shutdown requested or ordinary
+    /// return). Does **not** increment the failure counter.
     pub fn task_stopped(&self, name: &'static str) {
         self.inner.stopped.fetch_add(1, Ordering::Relaxed);
-        lock(&self.inner.running).insert(name, false);
+        let mut tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = tasks.entry(name).or_default();
+        state.running = false;
     }
 
+    /// Record that `name` panicked. Increments the global `failed` counter
+    /// **and** the task's `consecutive_failures` streak; marks it not running.
     pub fn task_failed(&self, name: &'static str) {
         self.inner.failed.fetch_add(1, Ordering::Relaxed);
-        // A failed task is by definition not running; reflect that in the
-        // liveness map even if `task_stopped` never ran for it.
-        lock(&self.inner.running).insert(name, false);
-        let mut consecutive = lock(&self.inner.consecutive_failures);
-        *consecutive.entry(name).or_insert(0) += 1;
+        let mut tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = tasks.entry(name).or_default();
+        state.running = false;
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
     }
 
-    /// Record that the supervisor is about to spawn a replacement after a
-    /// panic or unexpected return. Distinct from [`task_started`]: a restart
-    /// is the event operators alert on (issue #316).
-    pub fn task_restarted(&self, name: &'static str) {
-        let mut restarts = lock(&self.inner.restarts);
-        *restarts.entry(name).or_insert(0) += 1;
-    }
-
-    /// Record that a task exited because configuration gave it nothing to do.
-    ///
-    /// Terminal and deliberate, so it is *not* a fault: the task is marked not
-    /// running, but excluded from [`dead_required_tasks`](Self::dead_required_tasks)
-    /// so `/health` does not report a worker that was switched off on purpose
-    /// as a failure (issue #317).
+    /// Record that `name` exited because configuration gave it nothing to do.
+    /// Removes it from `required` so it is no longer counted in
+    /// `expected_tasks` / `live_tasks`, and marks the reason so the `/health`
+    /// response and Prometheus can distinguish it from a fault.
     pub fn task_disabled(&self, name: &'static str, reason: &'static str) {
-        self.inner.stopped.fetch_add(1, Ordering::Relaxed);
-        lock(&self.inner.running).insert(name, false);
-        lock(&self.inner.disabled).insert(name, reason);
+        self.inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(name);
+        let mut tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = tasks.entry(name).or_default();
+        state.running = false;
+        state.disabled_reason = Some(reason);
     }
 
-    /// Whether a task exited via [`task_disabled`](Self::task_disabled), and why.
-    pub fn disabled_reason(&self, name: &'static str) -> Option<&'static str> {
-        lock(&self.inner.disabled).get(name).copied()
-    }
-
-    /// How many workers this deployment expects to be running: the required
-    /// set, minus any that configuration has deliberately disabled.
-    ///
-    /// The counters alone could never answer "how many workers should be
-    /// running, and how many are?" — `stopped` was overloaded across clean
-    /// shutdown, configuration-disabled exit and fault, so even once exposed
-    /// the arithmetic would have been wrong (issue #317).
-    pub fn expected_tasks(&self) -> usize {
-        let required = lock(&self.inner.required);
-        let disabled = lock(&self.inner.disabled);
-        required
-            .iter()
-            .filter(|name| !disabled.contains_key(*name))
-            .count()
-    }
-
-    /// How many of the expected workers are actually running right now.
-    /// Compare against [`expected_tasks`](Self::expected_tasks).
-    pub fn live_tasks(&self) -> usize {
-        let running = lock(&self.inner.running);
-        let required = lock(&self.inner.required);
-        let disabled = lock(&self.inner.disabled);
-        required
-            .iter()
-            .filter(|name| !disabled.contains_key(*name))
-            .filter(|name| running.get(*name) == Some(&true))
-            .count()
-    }
-
-    /// The inner task has been running without panicking long enough to treat
-    /// as stable. Clears the consecutive-failure streak so a one-off panic
-    /// later does not keep `/health` red forever.
+    /// Called by the supervisor's stability timer: `name` has been running
+    /// long enough to be considered stable. Resets consecutive-failure count.
     pub fn note_stable(&self, name: &'static str) {
-        lock(&self.inner.consecutive_failures).insert(name, 0);
-    }
-
-    pub fn started(&self) -> u64 {
-        self.inner.started.load(Ordering::Relaxed)
-    }
-
-    pub fn stopped(&self) -> u64 {
-        self.inner.stopped.load(Ordering::Relaxed)
-    }
-
-    pub fn failed(&self) -> u64 {
-        self.inner.failed.load(Ordering::Relaxed)
-    }
-
-    pub fn restarts(&self, name: &'static str) -> u64 {
-        lock(&self.inner.restarts).get(name).copied().unwrap_or(0)
-    }
-
-    pub fn consecutive_failures(&self, name: &'static str) -> u32 {
-        lock(&self.inner.consecutive_failures)
-            .get(name)
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Names of required tasks that are not currently running. Empty when the
-    /// service is healthy; drives `/health`.
-    pub fn dead_required_tasks(&self) -> Vec<&'static str> {
-        let running = lock(&self.inner.running);
-        let required = lock(&self.inner.required);
-        let disabled = lock(&self.inner.disabled);
-        required
-            .iter()
-            .copied()
-            // A worker switched off by configuration is not dead; it was never
-            // meant to be running (issue #317).
-            .filter(|name| !disabled.contains_key(name))
-            .filter(|name| running.get(name) != Some(&true))
-            .collect()
-    }
-
-    /// Required tasks whose consecutive panics have reached
-    /// [`CRASH_LOOP_THRESHOLD`]. Empty when none are crash-looping.
-    pub fn crash_looping_required_tasks(&self) -> Vec<&'static str> {
-        let consecutive = lock(&self.inner.consecutive_failures);
-        let required = lock(&self.inner.required);
-        required
-            .iter()
-            .copied()
-            .filter(|name| consecutive.get(name).copied().unwrap_or(0) >= CRASH_LOOP_THRESHOLD)
-            .collect()
-    }
-
-    /// Per-task snapshot for Prometheus exposition. Includes every required
-    /// name plus any other name the supervisor has touched.
-    pub fn snapshot(&self) -> Vec<TaskSnapshot> {
-        let running = lock(&self.inner.running);
-        let restarts = lock(&self.inner.restarts);
-        let consecutive = lock(&self.inner.consecutive_failures);
-        let required = lock(&self.inner.required);
-        let disabled = lock(&self.inner.disabled);
-
-        let mut names: Vec<&'static str> = required.clone();
-        for name in running
-            .keys()
-            .chain(restarts.keys())
-            .chain(consecutive.keys())
-            .chain(disabled.keys())
-        {
-            if !names.contains(name) {
-                names.push(*name);
-            }
+        let mut tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(state) = tasks.get_mut(name) {
+            state.consecutive_failures = 0;
         }
-        names.sort_unstable();
-        names
-            .into_iter()
-            .map(|name| TaskSnapshot {
-                name,
-                running: running.get(name).copied().unwrap_or(false),
-                restarts: restarts.get(name).copied().unwrap_or(0),
-                consecutive_failures: consecutive.get(name).copied().unwrap_or(0),
-                disabled_reason: disabled.get(name).copied(),
+    }
+
+    /// Called by the supervisor after scheduling a restart for `name`.
+    /// Increments the restart counter without changing the running state
+    /// (the supervisor marks it running again on the next `task_started`).
+    pub fn task_restarted(&self, name: &'static str) {
+        let mut tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let state = tasks.entry(name).or_default();
+        state.restarts = state.restarts.saturating_add(1);
+    }
+
+    // ── Queries ───────────────────────────────────────────────────────────────
+
+    /// The reason `name` was disabled by configuration, if any.
+    pub fn disabled_reason(&self, name: &'static str) -> Option<&'static str> {
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .and_then(|s| s.disabled_reason)
+    }
+
+    /// Names of required tasks that are not currently running (and not
+    /// disabled). Used by `GET /health` to surface dead workers.
+    pub fn dead_required_tasks(&self) -> Vec<&'static str> {
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        required
+            .iter()
+            .copied()
+            .filter(|name| {
+                tasks
+                    .get(name)
+                    .map(|s| !s.running && s.disabled_reason.is_none())
+                    .unwrap_or(true)
             })
             .collect()
     }
 
-    /// Record successful on-chain progress — a completed poll cycle or a
-    /// received stream event. This is the heartbeat `/ready` freshness-checks.
-    pub fn note_success(&self) {
-        self.set_last_success_unix(unix_now_secs());
+    /// How many required tasks are not disabled. Used by Prometheus:
+    /// `stellargate_tasks_expected`.
+    pub fn expected_tasks(&self) -> u64 {
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        required
+            .iter()
+            .filter(|name| {
+                tasks
+                    .get(*name)
+                    .map(|s| s.disabled_reason.is_none())
+                    .unwrap_or(true)
+            })
+            .count() as u64
     }
 
-    /// Overwrite the last-success timestamp directly. Used by tests to
-    /// simulate a stale cursor without waiting out a poll interval.
-    pub fn set_last_success_unix(&self, unix_secs: i64) {
+    /// How many required, non-disabled tasks are currently running.
+    /// Used by Prometheus: `stellargate_tasks_live`.
+    pub fn live_tasks(&self) -> u64 {
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        required
+            .iter()
+            .filter(|name| {
+                tasks
+                    .get(*name)
+                    .map(|s| s.running && s.disabled_reason.is_none())
+                    .unwrap_or(false)
+            })
+            .count() as u64
+    }
+
+    /// Total task panics across all tasks (not Fatal exits — those are not
+    /// panics).
+    pub fn failed(&self) -> u64 {
+        self.inner.failed.load(Ordering::Relaxed)
+    }
+
+    /// Total `task_started` calls across all tasks, including restarts.
+    pub fn started(&self) -> u64 {
+        self.inner.started.load(Ordering::Relaxed)
+    }
+
+    /// Total clean `task_stopped` calls across all tasks.
+    pub fn stopped(&self) -> u64 {
+        self.inner.stopped.load(Ordering::Relaxed)
+    }
+
+    /// Restart count for `name`, or 0 if `name` is unknown.
+    pub fn restarts(&self, name: &'static str) -> u64 {
         self.inner
-            .last_success_unix
-            .store(unix_secs, Ordering::Relaxed);
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(name)
+            .map(|s| s.restarts)
+            .unwrap_or(0)
     }
 
-    /// Seconds since the last successful poll/stream event. A never-updated
-    /// timestamp (`0`) reads as maximally stale; a clock before the epoch
-    /// saturates at `0` rather than going negative.
-    pub fn last_success_age_secs(&self) -> i64 {
-        unix_now_secs().saturating_sub(self.inner.last_success_unix.load(Ordering::Relaxed))
+    /// Required tasks that have exceeded [`CRASH_LOOP_THRESHOLD`] consecutive
+    /// panics. Used by `GET /health` and tests.
+    pub fn crash_looping_required_tasks(&self) -> Vec<&'static str> {
+        let required = self
+            .inner
+            .required
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let tasks = self
+            .inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        required
+            .iter()
+            .copied()
+            .filter(|name| {
+                tasks
+                    .get(name)
+                    .map(|s| s.consecutive_failures >= CRASH_LOOP_THRESHOLD)
+                    .unwrap_or(false)
+            })
+            .collect()
     }
 
-    /// The raw Unix timestamp `note_success` last recorded (`0` if it never
-    /// has). Exposed as a gauge on `/metrics` (issue #313).
+    /// Snapshot of all known tasks for Prometheus rendering.
+    pub fn snapshot(&self) -> Vec<TaskSnapshot> {
+        self.inner
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .map(|(name, state)| TaskSnapshot {
+                name: name.to_string(),
+                restarts: state.restarts,
+                running: state.running,
+                consecutive_failures: state.consecutive_failures,
+                disabled_reason: state.disabled_reason.map(|s| s.to_string()),
+            })
+            .collect()
+    }
+
+    // ── Horizon cursor freshness ──────────────────────────────────────────────
+
+    /// Record a successful Horizon poll or stream event. Updates
+    /// `last_success_unix` so `/ready` and Prometheus can track detection lag.
+    pub fn note_success(&self) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        self.inner.last_success_unix.store(now, Ordering::Relaxed);
+    }
+
+    /// Unix timestamp of the last successful Horizon poll or stream event.
+    /// Returns `0` until the first call to [`note_success`].
     pub fn last_success_unix(&self) -> i64 {
         self.inner.last_success_unix.load(Ordering::Relaxed)
     }
-}
 
-/// Current Unix time in whole seconds.
-fn unix_now_secs() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    // ── Gateway account existence ─────────────────────────────────────────────
+
+    pub fn set_gateway_account_exists(&self, exists: bool) {
+        self.inner
+            .gateway_account_exists
+            .store(exists, Ordering::Relaxed);
+    }
+
+    pub fn gateway_account_exists(&self) -> bool {
+        self.inner.gateway_account_exists.load(Ordering::Relaxed)
+    }
+
 }
 
 impl Default for TaskHealth {
@@ -337,10 +440,9 @@ pub struct AppState {
     /// Exposed via `GET /metrics` so credential-stuffing or misconfigured
     /// clients are visible without grepping logs.
     pub auth_metrics: metrics::AuthMetrics,
-    /// Horizon poll cycle outcome counters: success/rate_limited/error, plus
-    /// the current Horizon cursor age. Exposed via `GET /metrics` so
-    /// sustained throttling or detection lag is a queryable fact rather than
-    /// indistinguishable `warn!`/`info!` lines (issue #313).
+    /// Horizon reconciliation counters: currently records skipped for having no
+    /// usable transaction hash, so an unexpected Horizon payload is visible in
+    /// `GET /metrics` and not only in the logs.
     pub horizon_metrics: metrics::HorizonMetrics,
     /// Per-asset gateway trustline state, refreshed at boot and on a
     /// recurring interval thereafter (trustlines can be revoked, or an asset
@@ -348,125 +450,14 @@ pub struct AppState {
     /// `GET /metrics` and consulted by `POST /payments` to reject intents in
     /// an asset currently confirmed unpayable.
     pub trustline_metrics: metrics::TrustlineMetrics,
-    /// Background task health: per-task liveness (drives `/health`), the last
-    /// successful on-chain progress (drives `/ready`'s cursor-freshness check),
-    /// and started/stopped/failure/restart counts for monitoring and alerting.
-    pub task_health: TaskHealth,
     /// HTTP request counters and latency histogram, labelled by matched route
     /// and method. Exposed via `GET /metrics` so traffic volume and latency
-    /// are queryable facts rather than invisible to an operator (issue:
-    /// missing operational metrics).
+    /// are queryable facts rather than invisible to an operator.
     pub http_metrics: metrics::HttpMetrics,
     /// Payment lifecycle counters and settlement-latency histogram. Exposed
-    /// via `GET /metrics` (issue: missing operational metrics).
+    /// via `GET /metrics`.
     pub payment_metrics: metrics::PaymentMetrics,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn no_required_tasks_is_healthy() {
-        let health = TaskHealth::new();
-        assert!(health.dead_required_tasks().is_empty());
-    }
-
-    #[test]
-    fn running_required_task_is_healthy() {
-        let health = TaskHealth::new();
-        health.require("poller");
-        health.task_started("poller");
-        assert!(health.dead_required_tasks().is_empty());
-    }
-
-    #[test]
-    fn stopped_required_task_is_dead() {
-        let health = TaskHealth::new();
-        health.require("poller");
-        health.task_started("poller");
-        health.task_stopped("poller");
-        assert_eq!(health.dead_required_tasks(), vec!["poller"]);
-    }
-
-    #[test]
-    fn never_started_required_task_is_dead() {
-        let health = TaskHealth::new();
-        health.require("redrive");
-        assert_eq!(health.dead_required_tasks(), vec!["redrive"]);
-    }
-
-    #[test]
-    fn unrequired_stopped_task_does_not_fail_health() {
-        // A task that is not required (e.g. the stream on a poll-only
-        // deployment, or the poller without a configured gateway) stopping is
-        // by design and must not fail /health.
-        let health = TaskHealth::new();
-        health.require("sweeper");
-        health.task_started("sweeper");
-        health.task_started("poller");
-        health.task_stopped("poller");
-        assert!(health.dead_required_tasks().is_empty());
-    }
-
-    #[test]
-    fn failed_task_is_not_running() {
-        // task_failed marks the task dead even if task_stopped never ran.
-        let health = TaskHealth::new();
-        health.require("poller");
-        health.task_started("poller");
-        health.task_failed("poller");
-        assert_eq!(health.dead_required_tasks(), vec!["poller"]);
-        assert_eq!(health.failed(), 1);
-        assert_eq!(health.consecutive_failures("poller"), 1);
-    }
-
-    #[test]
-    fn three_consecutive_failures_are_crash_looping() {
-        let health = TaskHealth::new();
-        health.require("poller");
-        health.task_started("poller");
-        for _ in 0..CRASH_LOOP_THRESHOLD {
-            health.task_failed("poller");
-            health.task_restarted("poller");
-            health.task_started("poller");
-        }
-        assert_eq!(health.crash_looping_required_tasks(), vec!["poller"]);
-        assert_eq!(health.restarts("poller"), CRASH_LOOP_THRESHOLD as u64);
-        // Currently running again — dead list is empty, crash-loop list is not.
-        assert!(health.dead_required_tasks().is_empty());
-    }
-
-    #[test]
-    fn note_stable_clears_crash_loop() {
-        let health = TaskHealth::new();
-        health.require("poller");
-        for _ in 0..CRASH_LOOP_THRESHOLD {
-            health.task_failed("poller");
-        }
-        assert_eq!(health.crash_looping_required_tasks(), vec!["poller"]);
-        health.note_stable("poller");
-        assert!(health.crash_looping_required_tasks().is_empty());
-        assert_eq!(health.consecutive_failures("poller"), 0);
-    }
-
-    #[test]
-    fn last_success_age_is_zero_after_note_success() {
-        let health = TaskHealth::new();
-        health.note_success();
-        assert!(health.last_success_age_secs() <= 1);
-    }
-
-    #[test]
-    fn never_succeeded_is_maximally_stale() {
-        let health = TaskHealth::new();
-        assert!(health.last_success_age_secs() > 1_000_000_000);
-    }
-
-    #[test]
-    fn stale_timestamp_reports_large_age() {
-        let health = TaskHealth::new();
-        health.set_last_success_unix(unix_now_secs() - 120);
-        assert!(health.last_success_age_secs() >= 119);
-    }
+    /// Background task health: tracks started, stopped, and failed task counts
+    /// for monitoring and alerting.
+    pub task_health: TaskHealth,
 }

@@ -130,9 +130,12 @@ paths:
       summary: Prometheus-compatible metrics snapshot
       description: >-
         Text-exposition-format counters and gauges covering webhook delivery,
-        authentication, and background task health. Currently unauthenticated
-        — see issue #250 for the access-control decision tracked against that.
-      security: []
+        authentication, and background task health. Gated behind
+        Authorization: Bearer <METRICS_TOKEN>; an unset METRICS_TOKEN disables
+        this route entirely (every request gets 401) rather than leaving it
+        open (issue #250).
+      security:
+        - metricsToken: []
       responses:
         "200":
           description: Metrics snapshot
@@ -447,7 +450,7 @@ paths:
                     error: merchant not found
                     code: merchant_not_found
 
-  /payments:
+  /v1/payments:
     post:
       operationId: createPayment
       summary: Create a payment intent
@@ -944,18 +947,53 @@ paths:
     post:
       operationId: redeliverWebhook
       summary: Re-attempt a webhook delivery
+      description: |
+        Re-sends the stored payload with a fresh timestamp and signature.
+        The SSRF guard is re-evaluated against the stored target on every call.
+
+        A delivery already marked `delivered` is refused with `409 already_delivered`
+        unless `?force=true` is passed — accidental double-clicks on the dashboard
+        button must not silently send a duplicate event (issue #236).
       security:
         - bearerAuth: []
       parameters:
         - $ref: "#/components/parameters/PaymentId"
         - $ref: "#/components/parameters/DeliveryId"
+        - name: force
+          in: query
+          required: false
+          description: |
+            Pass `true` to redeliver a webhook that was already successfully delivered.
+            Without it, an `already_delivered` `409` is returned for a `delivered` row.
+          schema:
+            type: boolean
       responses:
         "200":
           description: Redelivery succeeded
+        "400":
+          description: Webhook target rejected by the SSRF guard
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "webhook target is not allowed"
+                code: "webhook_target_blocked"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            Delivery was already successfully delivered.
+            Pass `?force=true` to redeliver anyway.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "this webhook was already successfully delivered; pass ?force=true to redeliver anyway"
+                code: "already_delivered"
         "502":
           $ref: "#/components/responses/WebhookBadGateway"
 
@@ -1166,6 +1204,14 @@ paths:
       parameters:
         - $ref: "#/components/parameters/PaymentId"
         - $ref: "#/components/parameters/DeliveryId"
+        - name: force
+          in: query
+          required: false
+          description: |
+            Pass `true` to redeliver a webhook that was already successfully delivered.
+            Without it, an `already_delivered` `409` is returned for a `delivered` row.
+          schema:
+            type: boolean
       responses:
         "200":
           description: Redelivery succeeded
@@ -1178,6 +1224,17 @@ paths:
               $ref: "#/components/headers/Link"
         "404":
           $ref: "#/components/responses/DeprecatedNotFound"
+        "409":
+          description: |
+            Delivery was already successfully delivered.
+            Pass `?force=true` to redeliver anyway.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+              example:
+                error: "this webhook was already successfully delivered; pass ?force=true to redeliver anyway"
+                code: "already_delivered"
         "502":
           $ref: "#/components/responses/DeprecatedWebhookBadGateway"
 
@@ -1311,6 +1368,13 @@ components:
         provisioning and the API-key lifecycle routes only; it is never
         accepted on a payment route. An unset ADMIN_PROVISIONING_SECRET
         disables those routes entirely rather than leaving them open.
+    metricsToken:
+      type: http
+      scheme: bearer
+      description: >-
+        Operator secret from METRICS_TOKEN. Guards GET /metrics only; it is
+        never accepted on a payment or admin route. An unset METRICS_TOKEN
+        disables the route entirely rather than leaving it open (issue #250).
 
   responses:
     Unauthorized:
@@ -1669,6 +1733,15 @@ components:
         asset:
           type: string
           enum: [XLM, USDC]
+        asset_issuer:
+          type: [string, "null"]
+          description: >-
+            Issuer account of `asset`, recorded when the intent was created.
+            `null` for the native asset (XLM), which has no issuer. Persisted
+            with the intent, so it always reflects the asset the payment was
+            priced in even if the gateway's accepted-asset configuration
+            changes later.
+          example: GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5
         status:
           $ref: "#/components/schemas/PaymentStatus"
         tx_hash:

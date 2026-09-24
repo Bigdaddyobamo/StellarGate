@@ -1,5 +1,7 @@
 # Security Policy
 
+_Last reviewed: 2026-08-29_
+
 StellarGate handles Stellar-network payments — destination addresses, memos,
 webhook secrets, and (in self-hosted deployments) gateway wallet keys.
 Vulnerabilities here can have direct financial impact, so we ask that you
@@ -10,11 +12,11 @@ report them privately rather than through a public GitHub issue.
 StellarGate is pre-1.0 and does not yet maintain parallel release branches.
 Security fixes are made against the `main` branch only. Deployments should
 track `main` (or the latest tagged release, once releases exist) to receive
-fixes.
+fixes. The minimum supported Rust version is **1.88** (see `rust-toolchain.toml`).
 
 | Version | Supported |
 |---|---|
-| `main` | :white_check_mark: |
+| `main` / latest release | :white_check_mark: |
 | older commits / forks | :x: |
 
 ## Reporting a Vulnerability
@@ -31,10 +33,10 @@ Instead, report privately using one of these channels:
    collaborate with you on a fix (including credit in the advisory, if
    desired) before disclosure.
 2. **Alternative: email.** If you're unable to use GitHub's advisory flow,
-   email the maintainers at **security@stellargate.dev** with a description
+   email the maintainers at **security@stellargatelabs.com** with a description
    of the issue, steps to reproduce, and any proof-of-concept code. If you
-   don't receive a response within 5 business days, please follow up — email
-   can be missed.
+   don't receive a response within 72 hours, please follow up — email can
+   be missed.
 
 Please include as much of the following as you can:
 
@@ -47,12 +49,13 @@ Please include as much of the following as you can:
 
 ## What to Expect
 
-- **Acknowledgement:** within 3 business days of your report.
-- **Triage:** we'll confirm the issue, assess severity/impact, and let you
-  know if we need more information.
-- **Fix & disclosure:** we aim to ship a fix as quickly as the severity
-  warrants. Once a fix is released, we'll coordinate public disclosure timing
-  with you and credit reporters (unless you prefer to stay anonymous).
+- **Acknowledgement:** within **72 hours** of your report.
+- **Triage and severity assessment:** within **7 days** — we'll confirm the
+  issue, assess severity/impact, and let you know if we need more information.
+- **Resolution target:** within **90 days** for critical severity issues;
+  within **180 days** for all other severity levels. Once a fix is released,
+  we'll coordinate public disclosure timing with you and credit reporters
+  (unless you prefer to stay anonymous).
 
 ## Scope
 
@@ -84,8 +87,17 @@ For context when triaging reports, StellarGate already implements:
 - An SSRF guard on `webhook_url` that rejects loopback/link-local/private/
   reserved destinations, re-checked on redelivery against the resolved
   address (not a fresh DNS lookup) to mitigate DNS rebinding.
+  `WEBHOOK_ALLOW_PRIVATE_TARGETS` bypasses this guard and is only intended
+  for local development and tests — it is rejected at boot when
+  `STELLAR_NETWORK=public` (issue #246).
 - Admin-gated merchant provisioning (`X-Admin-Secret`), disabled entirely
   when `ADMIN_PROVISIONING_SECRET` is unset.
+- **`webhook_url` is treated as a secret.** Webhook endpoint URLs commonly
+  embed capability tokens in the path or query string (e.g.
+  `https://hooks.example.com/t/SecretToken`). StellarGate never logs the
+  full URL; log statements redact it to scheme and host only
+  (`https://hooks.example.com/…`) so the credential is not copied into log
+  sinks, aggregators, or support tickets (issue #240).
 
 If you find a way around any of the above, that's exactly what this policy
 is for — please report it privately.

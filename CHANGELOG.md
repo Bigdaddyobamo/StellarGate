@@ -9,6 +9,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`GET /metrics` is no longer reachable anonymously.** It was registered on
+  the public router with no authentication, exposing webhook delivery volume,
+  latency, and — most usefully to an attacker — auth outcome counters
+  (`stellargate_auth_attempts_total{outcome="failure",reason="invalid_key"}`
+  let a credential-stuffing attempt watch its own progress). The endpoint is
+  now gated behind `Authorization: Bearer <METRICS_TOKEN>`; unset (the
+  default) disables it entirely, returning `401` for every request rather
+  than falling back to an open default. `deploy/Caddyfile` also blocks the
+  path at the edge by default (issue #250).
+
+- **API hardening review of the remaining unauthenticated/admin-gated
+  surface, prompted by the `/metrics` finding above.** Each route was
+  inspected against the concern its issue raised; none needed a behavior
+  change, and each conclusion now has a regression test so a future change
+  can't silently regress it:
+  - `GET /dashboard`, `/dashboard/app.css`, `/dashboard/app.js` (issue #460):
+    confirmed safe to serve unauthenticated. The three handlers take no
+    `State`/DB parameter — they return `include_str!`-embedded static assets
+    baked in at compile time — so the shell cannot leak per-request or
+    merchant data by construction. Every figure the dashboard displays is
+    fetched client-side from the same authenticated endpoints a merchant
+    would call directly, using an API key the operator supplies in the
+    browser; already covered by `test_dashboard_assets_served_unauthenticated`
+    and `test_dashboard_data_endpoints_reject_missing_key`.
+  - `POST /merchants` (`provision_merchant`, issue #461): confirmed it can't
+    be used to mass-create merchant records. The handler takes no request
+    body to validate, and the route already sits in the base-rate
+    `"merchants"` rate-limit bucket (1×), not the 5× read bucket — same
+    quota as any other write, on top of requiring
+    `ADMIN_PROVISIONING_SECRET`. Added
+    `test_provision_merchant_rate_limit_exceeded_returns_429`, which the
+    existing test suite was missing (every other write route had one).
+  - `POST /merchants/:id/keys` and `GET /merchants/:id/keys` (issue #462):
+    confirmed a raw key is returned exactly once, at issuance, and never
+    again — `list_api_keys` projects only `key_id`/`prefix`/`label`/
+    timestamps/`active`, never the key material — and that only a SHA-256
+    digest is ever persisted (`hash_api_key`, `db.rs`). Added
+    `api_keys_are_stored_hashed_not_plaintext`, asserting the stored
+    `api_keys.key_hash` and legacy `merchants.api_key_hash` columns differ
+    from the raw key and equal its digest; listing-side coverage already
+    existed in `test_listing_keys_never_returns_the_secret`.
+
+- **Restored a batch of previously-shipped fixes that a bad merge had
+  silently reverted from `main`, discovered while landing the fix above** (a
+  base-branch build failure led to auditing the rest of `main` for the same
+  pattern — several PRs' worth of work had the same fate). Each of the
+  following was already implemented, tested, and merged at some point; this
+  restores the code, not just the behavior:
+  - Baseline security headers (`X-Content-Type-Options`, `Referrer-Policy`,
+    `Cache-Control`, and `Strict-Transport-Security` on `public`) on every API
+    response, not only the dashboard's static assets (issues #251–#254).
+  - The Horizon SSE stream listener bounds every read with
+    `STREAM_IDLE_TIMEOUT_SECS`, so a half-open connection (dropped by a NAT or
+    load balancer without `RST`) is detected and reconnected instead of
+    parking the listener forever (issue #312).
+  - The Horizon poller backs off on failure — honoring `Retry-After` on a
+    `429`/`503` exactly, and falling back to an equal-jitter exponential
+    schedule otherwise — instead of retrying every cycle at the fixed poll
+    interval regardless of why the previous one failed (issue #313).
+  - First-run cursor baselining walks backward with overlap instead of
+    adopting the account's single most recent payment as the floor, which
+    silently skipped a still-open intent's payment on a reused account or a
+    startup race (issue #311).
+  - The periodic trustline checker (`run_trustline_checker`) is wired into
+    the process again — trustlines are re-verified on `RETENTION_INTERVAL_SECS`
+    for as long as a gateway is configured, not only once at boot.
+  - Inline webhook retries grow exponentially with jitter
+    (`WEBHOOK_RETRY_DELAY_MS` doubling up to `WEBHOOK_RETRY_MAX_DELAY_MS`)
+    instead of sleeping a constant delay between attempts, which retried an
+    entire failed settlement burst in lockstep against a receiver that was
+    already struggling (issue #318). Boot now also refuses a
+    `WEBHOOK_REDRIVE_GRACE_SECS` shorter than the worst-case inline delivery
+    time, closing a window where the redrive worker could double-send a
+    delivery whose inline attempt was still in flight (issue #238).
+  - `POST /merchants` and `POST /payments` emit the same structured audit
+    event (`audit=true`, `action`, `actor`, `outcome`, `source_ip`,
+    `request_id`) the key-lifecycle routes already had (issue #305).
+  - The strict CORS layer permits `DELETE` (key revocation),
+    `Idempotency-Key` and `X-Admin-Secret` request headers, and exposes
+    `X-Request-Id`/`Deprecation`/`Link` to browser clients — all four were
+    silently dropped from the allow-list despite the routes needing them
+    (issue #281).
+  - `db::migrate` now runs inside a transaction, so a failure partway through
+    (a corrupt row a backfill can't touch, a disk error) rolls back instead of
+    leaving the schema half-migrated.
+  - `GET /metrics`'s database gauges (`stellargate_db_file_size_bytes`) are
+    populated from the actual SQLite file sizes instead of always reporting
+    absent.
+  - A partial composite index on `payments(status, expires_at)` for the
+    watchable-status queries (`list_pending`, `expire_overdue`,
+    `find_pending_by_memo`) that run on every poll/sweep cycle (issue #270).
+  - Horizon paging cursors are properly percent-encoded when built into a
+    request URL; an opaque cursor containing `&` or `#` used to corrupt the
+    query string it was interpolated into.
+
 - **Unknown query parameters on the listing endpoints are now rejected
   instead of ignored.** `GET /payments`, `GET /payments/:id/webhooks`, and
   `GET /payments/webhooks` deserialized the parameters they knew and discarded
@@ -324,6 +419,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`payments.asset_issuer`.** An intent recorded only the asset *code*, so
+  which USDC it was priced in lived in process configuration and changed
+  retroactively whenever `ACCEPTED_ASSETS` was edited — historical rows could
+  not be audited or reconciled against an external ledger, and a webhook saying
+  `"asset": "USDC"` did not tell the receiver which USDC. The issuer is now
+  persisted alongside the code and exposed in `GET /payments/:id` and every
+  webhook payload (`null` for the native asset). Settlement matches against the
+  issuer recorded on the intent rather than today's configuration. Rows created
+  before the column existed are backfilled once from the configured allow-list,
+  best-effort — the issuer they were priced in was never recorded (issue #223).
+- **`POLL_MAX_PAGES_PER_CYCLE`.** Bounds how many Horizon pages one poll cycle
+  walks before yielding to the next tick, so a large catch-up cannot monopolise
+  the poller task indefinitely. `0` restores the previous unlimited behaviour
+  (issue #226).
+- Prometheus counter `stellargate_horizon_records_skipped_total`, tracking
+  Horizon records the reconciler refused to credit (issue #224).
 - **`GET /payments/:id/webhooks` now paginates like the payments listing.**
   The endpoint previously serialised every delivery row for a payment with no
   `LIMIT`, so a payment with unbounded delivery activity (see issue #233) grew
@@ -414,6 +525,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Horizon records with no `transaction_hash` are no longer credited.** A
+  missing hash was defaulted to the empty string and used as half of the
+  `processed_transactions` primary key, so two different unhashed transactions
+  looked like the same one and the second was silently discarded as "already
+  credited" — money on chain, never credited to the merchant. Such a record is
+  now skipped, counted and logged instead; the poller re-sees it on the next
+  cycle, so skipping is self-healing. The schema rejects an empty `tx_hash`
+  outright, and rows written before the fix are reported at startup rather than
+  deleted (issue #224).
+- **The poller observes shutdown mid-catch-up.** `poll_once` looped over
+  Horizon pages until caught up without ever checking the shutdown signal, so
+  `SIGTERM` during a long backlog drain was ignored until the backlog finished
+  or the 30 s shutdown grace killed the task mid-page — which replayed that page
+  on the next boot and made the next shutdown worse. The signal is now checked
+  at every page boundary, immediately after the cursor is checkpointed
+  (issue #226).
+- **The stream listener resumes from a persisted cursor.** It hard-coded
+  `cursor=now` on every process start, so payments that landed while the
+  process was down were invisible to the stream and recoverable only by the
+  poller — whose own catch-up is slower, and which is disabled entirely in a
+  poll-less configuration. The stream now resumes from its own persisted cursor
+  (falling back to the poller's, then to the live edge), under a separate
+  `kv_state` key so the two cursors never overwrite one another (issue #228).
 - **`GET /payments` offset pages now order rows exactly like cursor pages.**
   The offset query sorted by `created_at DESC` alone while the keyset query
   broke whole-second `created_at` ties on `id DESC`, so a `next_cursor` minted
