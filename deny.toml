@@ -63,8 +63,8 @@ allow = [
     "Apache-2.0 WITH LLVM-exception", # compiler-builtins and related LLVM crates
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "ISC",                             # ring and rustls-webpki, via the rustls TLS stack
-    # webpki-roots — the Mozilla CA root store. A permissive *data* licence
+    "ISC",                             # ring, aws-lc-rs and rustls-webpki, via the rustls TLS stack
+    # webpki-root-certs — the Mozilla CA root store. A permissive *data* licence
     # (no copyleft, redistribution unrestricted) covering the certificate set
     # rather than code. Arrives with the rustls stack.
     "CDLA-Permissive-2.0",
@@ -72,8 +72,8 @@ allow = [
     "Unicode-3.0",                     # newer unicode-ident / icu_* releases
     "Zlib",                            # miniz_oxide and compression crates
 ]
-# Note: "OpenSSL" was removed with the move to rustls (sqlx uses
-# runtime-tokio-rustls, reqwest uses rustls-tls). openssl-sys is no longer in
+# Note: "OpenSSL" was removed with the move to rustls (reqwest uses its
+# `rustls` feature; sqlx's SQLite driver needs no TLS). openssl-sys is no longer in
 # the tree, and keeping the allowance would let it return unnoticed.
 
 # ── Bans ──────────────────────────────────────────────────────────────────────
@@ -352,6 +352,12 @@ version = "=0.52.6"
 # wit-bindgen splits between wasmtime generations pulled by different deps.
 name = "wit-bindgen"
 version = "=0.51.0"
+
+[[bans.skip]]
+# base64 0.23 required by reqwest 0.13; 0.22 by hyper-util (via axum and
+# hyper-rustls). Collapse when hyper-util moves to base64 0.23.
+name = "base64"
+version = "=0.22.1"
 
 # ── Sources ───────────────────────────────────────────────────────────────────
 [sources]

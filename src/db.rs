@@ -1,7 +1,40 @@
 use anyhow::Result;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 use sqlx::{Pool, Row, Sqlite};
+use std::str::FromStr;
+use std::time::Duration;
 
 pub type Db = Pool<Sqlite>;
+
+/// Connection options the service runs with in production: WAL so a single
+/// writer and many readers proceed concurrently, `synchronous = NORMAL` (safe
+/// under WAL), and a busy timeout so contending writers wait rather than fail
+/// with `SQLITE_BUSY`.
+///
+/// Kept in the library rather than `main.rs` so tests can assert the PRAGMAs
+/// each pooled connection actually ends up with (issue #642): builder methods
+/// on `SqliteConnectOptions` have been renamed or re-defaulted across sqlx
+/// majors before, and a silent change here would only show up as lock
+/// contention in production.
+pub fn connect_options(database_url: &str, busy_timeout: Duration) -> Result<SqliteConnectOptions> {
+    Ok(SqliteConnectOptions::from_str(database_url)?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        .synchronous(SqliteSynchronous::Normal)
+        .busy_timeout(busy_timeout))
+}
+
+/// Open the SQLite pool with [`connect_options`].
+pub async fn open_pool(
+    database_url: &str,
+    max_connections: u32,
+    busy_timeout: Duration,
+) -> Result<Db> {
+    Ok(SqlitePoolOptions::new()
+        .max_connections(max_connections)
+        .connect_with(connect_options(database_url, busy_timeout)?)
+        .await?)
+}
 
 /// Normalize a raw SQLite timestamp to strict RFC 3339 UTC with a Z suffix.
 ///
