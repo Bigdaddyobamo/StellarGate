@@ -187,3 +187,33 @@ async fn test_provision_merchant_rate_limit_exceeded_returns_429() {
     second.assert_status(StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(second.json::<Value>()["code"], "rate_limit_exceeded");
 }
+
+/// Layer order on redelivery (#634): `auth_middleware` must run before
+/// `merchant_redeliver_limit_middleware`. The limiter extracts the
+/// `AuthenticatedMerchant` extension auth inserts, so if the order were ever
+/// flipped (e.g. by an axum upgrade changing `route_layer` semantics) an
+/// unauthenticated call would surface as a 500 missing-extension rejection
+/// instead of the auth middleware's JSON 401.
+#[tokio::test]
+async fn test_redeliver_runs_auth_before_merchant_limiter() {
+    let (server, _pool) = server_with_config(make_config(1000)).await;
+
+    for path in [
+        "/v1/payments/any/webhooks/any/redeliver",
+        "/payments/any/webhooks/any/redeliver",
+    ] {
+        let res = server.post(path).await;
+        res.assert_status(StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            res.json::<Value>()["code"],
+            "unauthorized",
+            "{path}: auth must reject before the merchant limiter runs"
+        );
+
+        let res = server
+            .post(path)
+            .add_header("Authorization", "Bearer not-a-real-key")
+            .await;
+        res.assert_status(StatusCode::UNAUTHORIZED);
+    }
+}

@@ -118,6 +118,12 @@ impl MerchantRedeliverLimitState {
     }
 }
 
+/* Every `from_fn` / `from_fn_with_state` middleware in this module uses the
+`(State<_>?, extractors…, req: Request, next: Next) -> Response` shape, with
+the non-generic `Next` and `axum::extract::Request` (= `Request<Body>`). That
+is the form axum 0.8 requires, so none of them need changing for the upgrade
+(issue #634); keep new middleware to the same shape. */
+
 /// Rejects a redelivery request once the calling merchant has exceeded their
 /// share of `RATE_LIMIT_REQUESTS_PER_SEC` on this endpoint, independent of
 /// which address(es) the requests arrive from. Must run after
@@ -302,7 +308,9 @@ fn api_v1(
     middleware every other route here also gets, it additionally needs a
     limiter keyed on the caller's identity rather than their address —
     layered outside-in as auth (runs first, populates the merchant identity)
-    then the merchant limiter (runs second, reads it). */
+    then the merchant limiter (runs second, reads it). The last `route_layer`
+    added is the outermost, so auth must stay below the limiter here —
+    `test_redeliver_runs_auth_before_merchant_limiter` pins this order. */
     let redeliver = axum::Router::new()
         .route(
             "/{id}/webhooks/{delivery_id}/redeliver",
