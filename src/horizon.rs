@@ -271,8 +271,8 @@ fn elapsed_secs(ts: &str) -> Option<i64> {
 /// on that intent (no `accepted_assets` allow-list lookup, since a terminal
 /// intent's priced asset/issuer is fixed regardless of today's configuration).
 #[derive(Debug, Clone, Copy)]
-struct IntentMatch {
-    new_stroops: i64,
+pub struct IntentMatch {
+    pub new_stroops: i64,
 }
 
 /// Return the parsed amount when a Horizon payment belongs to this intent.
@@ -281,7 +281,7 @@ struct IntentMatch {
 /// ledger. Mirrors the match checks in [`verify`], but against a (typically
 /// terminal) intent's own recorded `asset`/`asset_issuer` rather than the
 /// current `accepted_assets` allow-list.
-fn matches_intent(payment: &db::Payment, hp: &HorizonPayment) -> Option<IntentMatch> {
+pub fn matches_intent(payment: &db::Payment, hp: &HorizonPayment) -> Option<IntentMatch> {
     if hp.kind != "payment" {
         return None;
     }
@@ -520,6 +520,46 @@ pub async fn fetch_recent_payments(
         .into());
     }
 
+    let page: PaymentsPage = resp.json().await?;
+    Ok(page.embedded.records)
+}
+
+/// Fetch every payment operation of one transaction (`/transactions/{hash}/payments`),
+/// with the transaction joined so memo and success are available. Used by the
+/// under-credit audit to sum all operations of a multi-operation transaction.
+pub async fn fetch_transaction_payments(
+    client: &reqwest::Client,
+    horizon_url: &str,
+    tx_hash: &str,
+) -> anyhow::Result<Vec<HorizonPayment>> {
+    let mut url = reqwest::Url::parse(horizon_url)
+        .map_err(|e| anyhow::anyhow!("invalid Horizon URL {horizon_url:?}: {e}"))?;
+    {
+        let mut segments = url
+            .path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("Horizon URL cannot be used as a path base"))?;
+        segments.pop_if_empty();
+        segments.extend(["transactions", tx_hash, "payments"]);
+    }
+    url.query_pairs_mut()
+        .append_pair("join", "transactions")
+        .append_pair("limit", "200");
+    let resp = client
+        .get(url)
+        .header("Accept", "application/json")
+        .send()
+        .await?;
+    let status = resp.status();
+    if !status.is_success() {
+        let retry_after = parse_retry_after(resp.headers());
+        let body = resp.text().await.unwrap_or_default();
+        return Err(HorizonHttpError {
+            status,
+            retry_after,
+            body,
+        }
+        .into());
+    }
     let page: PaymentsPage = resp.json().await?;
     Ok(page.embedded.records)
 }
