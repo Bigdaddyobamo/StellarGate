@@ -1,13 +1,13 @@
 # Base image digests should be pinned for production builds.
-# To pin: docker buildx imagetools inspect rust:1.88-bookworm --format '{{.Manifest.Digest}}'
+# To pin: docker buildx imagetools inspect rust:1.94-bookworm --format '{{.Manifest.Digest}}'
 #         docker buildx imagetools inspect debian:bookworm-slim --format '{{.Manifest.Digest}}'
 # Then replace the FROM lines with:
-#   FROM rust:1.88-bookworm@sha256:<digest> AS chef
+#   FROM rust:1.94-bookworm@sha256:<digest> AS chef
 #   FROM debian:bookworm-slim@sha256:<digest> AS runtime
 # Pinning prevents silent base-image updates from changing the build.
 
 # ── Stage 1: dependency cache via cargo-chef ─────────────────────────────────
-FROM rust:1.88-bookworm AS chef
+FROM rust:1.94-bookworm AS chef
 RUN cargo install cargo-chef --locked
 WORKDIR /app
 

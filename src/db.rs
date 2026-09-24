@@ -400,7 +400,11 @@ pub async fn migrate(pool: &Db) -> Result<()> {
             tbl_col.0,
             col = tbl_col.1
         );
-        sqlx::query(&sql).execute(&mut *tx).await?;
+        // Table and column names come from the fixed list above, never from
+        // input, so interpolating them is safe.
+        sqlx::query(sqlx::AssertSqlSafe(sql))
+            .execute(&mut *tx)
+            .await?;
     }
 
     tx.commit().await?;
