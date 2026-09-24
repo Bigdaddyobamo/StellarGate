@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum_test::TestServer;
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use std::future::IntoFuture;
 use std::str::FromStr;
 use std::sync::Arc;
 use stellargate::{
@@ -216,4 +217,37 @@ async fn test_redeliver_runs_auth_before_merchant_limiter() {
             .await;
         res.assert_status(StatusCode::UNAUTHORIZED);
     }
+}
+
+/// Regression for the per-merchant limiter check-then-act race: with a cold
+/// limiter cache, many concurrent requests must share one limiter (atomic
+/// `get_with`) rather than each building a fresh full-burst limiter. At most
+/// the configured quota (plus at most one cell replenished mid-test) may be
+/// admitted.
+#[tokio::test]
+async fn test_merchant_redeliver_limiter_cold_cache_burst_is_bounded() {
+    const QUOTA: u32 = 3;
+    const N: usize = 40;
+
+    let (server, _pool) = server_with_config(make_config(QUOTA)).await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    // First authenticated redeliver request for this merchant: limiter absent.
+    let responses = futures_util::future::join_all((0..N).map(|_| {
+        server
+            .post("/payments/nope/webhooks/nope/redeliver")
+            .add_header("Authorization", auth.clone())
+            .into_future()
+    }))
+    .await;
+
+    let admitted = responses
+        .iter()
+        .filter(|r| r.status_code() != StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        admitted <= QUOTA as usize + 1,
+        "admitted {admitted} of {N} concurrent requests; quota is {QUOTA}"
+    );
 }
