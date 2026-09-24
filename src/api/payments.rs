@@ -1,6 +1,5 @@
 use crate::{api::AuthenticatedMerchant, db, money, AppState};
 use axum::{
-    async_trait,
     extract::{ConnectInfo, Extension, FromRequest, FromRequestParts, Path, Query, Request, State},
     http::{request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -102,7 +101,6 @@ fn rejection_code(status: StatusCode) -> &'static str {
 /// instead of axum's default 422 plaintext rejection.
 pub struct JsonBody<T>(pub T);
 
-#[async_trait]
 impl<T, S> FromRequest<S> for JsonBody<T>
 where
     T: serde::de::DeserializeOwned,
@@ -197,7 +195,6 @@ where
 /// and its failures surface as the [`JsonBody`] rejection they are.
 pub struct OptionalJsonBody<T>(pub Option<T>);
 
-#[async_trait]
 impl<T, S> FromRequest<S> for OptionalJsonBody<T>
 where
     T: serde::de::DeserializeOwned,
@@ -237,7 +234,6 @@ where
 /// offending key and lists the accepted ones.
 pub struct QueryParams<T>(pub T);
 
-#[async_trait]
 impl<T, S> FromRequestParts<S> for QueryParams<T>
 where
     T: serde::de::DeserializeOwned,
