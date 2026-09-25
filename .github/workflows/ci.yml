@@ -135,7 +135,6 @@ jobs:
         uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          ignore: RUSTSEC-2023-0071
 
   # Coverage report uploaded as an artifact for inspection.
   # A hard numeric gate can be added here once a baseline is established.
