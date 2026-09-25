@@ -107,7 +107,7 @@ async fn strict_cors_server() -> TestServer {
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    TestServer::new(router).unwrap()
+    TestServer::new(router)
 }
 
 /// Issue a CORS preflight (`OPTIONS` + the two `Access-Control-Request-*`

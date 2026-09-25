@@ -1,6 +1,5 @@
 use crate::{api::AuthenticatedMerchant, db, money, AppState};
 use axum::{
-    async_trait,
     extract::{ConnectInfo, Extension, FromRequest, FromRequestParts, Path, Query, Request, State},
     http::{request::Parts, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -67,7 +66,6 @@ impl From<anyhow::Error> for AppError {
 /// instead of axum's default 422 plaintext rejection.
 pub struct JsonBody<T>(pub T);
 
-#[async_trait]
 impl<T, S> FromRequest<S> for JsonBody<T>
 where
     T: serde::de::DeserializeOwned,
@@ -76,7 +74,7 @@ where
     type Rejection = AppError;
 
     async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
-        match Json::<T>::from_request(req, state).await {
+        match <Json<T> as FromRequest<S>>::from_request(req, state).await {
             Ok(Json(value)) => Ok(JsonBody(value)),
             Err(rejection) => {
                 use axum::extract::rejection::JsonRejection;
@@ -105,6 +103,24 @@ where
     }
 }
 
+/// Lets handlers take `Option<JsonBody<T>>` for an optional body. axum 0.8
+/// requires an explicit impl for `Option<_>` extractors; this keeps 0.7's
+/// behaviour, where any rejection (missing, empty or invalid body) yields
+/// `None` rather than an error response.
+impl<T, S> OptionalFromRequest<S> for JsonBody<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = std::convert::Infallible;
+
+    async fn from_request(req: Request, state: &S) -> Result<Option<Self>, Self::Rejection> {
+        Ok(<Self as FromRequest<S>>::from_request(req, state)
+            .await
+            .ok())
+    }
+}
+
 /// A drop-in replacement for `Query<T>` that maps a query-string failure into
 /// our standard `{"code": "...", "error": "..."}` 400 instead of axum's
 /// plaintext rejection.
@@ -116,7 +132,6 @@ where
 /// offending key and lists the accepted ones.
 pub struct QueryParams<T>(pub T);
 
-#[async_trait]
 impl<T, S> FromRequestParts<S> for QueryParams<T>
 where
     T: serde::de::DeserializeOwned,

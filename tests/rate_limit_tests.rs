@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum_test::TestServer;
 use serde_json::{json, Value};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
+use std::future::IntoFuture;
 use std::str::FromStr;
 use std::sync::Arc;
 use stellargate::{
@@ -82,7 +83,7 @@ async fn server_with_config(cfg: Config) -> (TestServer, db::Db) {
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    (TestServer::new(router).unwrap(), pool)
+    (TestServer::new(router), pool)
 }
 
 async fn provision_merchant(server: &TestServer) -> String {
@@ -186,4 +187,67 @@ async fn test_provision_merchant_rate_limit_exceeded_returns_429() {
         .await;
     second.assert_status(StatusCode::TOO_MANY_REQUESTS);
     assert_eq!(second.json::<Value>()["code"], "rate_limit_exceeded");
+}
+
+/// Layer order on redelivery (#634): `auth_middleware` must run before
+/// `merchant_redeliver_limit_middleware`. The limiter extracts the
+/// `AuthenticatedMerchant` extension auth inserts, so if the order were ever
+/// flipped (e.g. by an axum upgrade changing `route_layer` semantics) an
+/// unauthenticated call would surface as a 500 missing-extension rejection
+/// instead of the auth middleware's JSON 401.
+#[tokio::test]
+async fn test_redeliver_runs_auth_before_merchant_limiter() {
+    let (server, _pool) = server_with_config(make_config(1000)).await;
+
+    for path in [
+        "/v1/payments/any/webhooks/any/redeliver",
+        "/payments/any/webhooks/any/redeliver",
+    ] {
+        let res = server.post(path).await;
+        res.assert_status(StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            res.json::<Value>()["code"],
+            "unauthorized",
+            "{path}: auth must reject before the merchant limiter runs"
+        );
+
+        let res = server
+            .post(path)
+            .add_header("Authorization", "Bearer not-a-real-key")
+            .await;
+        res.assert_status(StatusCode::UNAUTHORIZED);
+    }
+}
+
+/// Regression for the per-merchant limiter check-then-act race: with a cold
+/// limiter cache, many concurrent requests must share one limiter (atomic
+/// `get_with`) rather than each building a fresh full-burst limiter. At most
+/// the configured quota (plus at most one cell replenished mid-test) may be
+/// admitted.
+#[tokio::test]
+async fn test_merchant_redeliver_limiter_cold_cache_burst_is_bounded() {
+    const QUOTA: u32 = 3;
+    const N: usize = 40;
+
+    let (server, _pool) = server_with_config(make_config(QUOTA)).await;
+    let key = provision_merchant(&server).await;
+    let auth = format!("Bearer {key}");
+
+    // First authenticated redeliver request for this merchant: limiter absent.
+    let responses = futures_util::future::join_all((0..N).map(|_| {
+        server
+            .post("/payments/nope/webhooks/nope/redeliver")
+            .add_header("Authorization", auth.clone())
+            .into_future()
+    }))
+    .await;
+
+    let admitted = responses
+        .iter()
+        .filter(|r| r.status_code() != StatusCode::TOO_MANY_REQUESTS)
+        .count();
+    assert!(
+        admitted <= QUOTA as usize + 1,
+        "admitted {admitted} of {N} concurrent requests; quota is {QUOTA}"
+    );
 }

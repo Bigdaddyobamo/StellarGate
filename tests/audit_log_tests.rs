@@ -86,7 +86,7 @@ async fn test_server() -> TestServer {
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    TestServer::new(router).unwrap()
+    TestServer::new(router)
 }
 
 /// Provisions a merchant and returns its API key.
