@@ -288,6 +288,25 @@ pub async fn migrate(pool: &Db) -> Result<()> {
         .execute(&mut *tx)
         .await?;
 
+    /* Defense-in-depth for issue #621: `revoke_api_key` already refuses to
+    revoke a merchant's last active key atomically, but this trigger enforces
+    the same invariant in the database itself, so any other code path (or a
+    future regression) that tombstones the final active key is rejected
+    within the same statement/transaction. */
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS trg_api_keys_keep_one_active
+         BEFORE UPDATE OF revoked_at ON api_keys
+         WHEN OLD.revoked_at IS NULL
+          AND NEW.revoked_at IS NOT NULL
+          AND (SELECT COUNT(*) FROM api_keys
+                WHERE merchant_id = OLD.merchant_id AND revoked_at IS NULL) <= 1
+         BEGIN
+             SELECT RAISE(ABORT, 'last_active_key');
+         END",
+    )
+    .execute(&mut *tx)
+    .await?;
+
     /* Carry pre-existing single-key merchants across. Their raw key is not
     recoverable, but the hash is all authentication needs, so keys issued
     before this table existed keep working. The prefix is unknown for those

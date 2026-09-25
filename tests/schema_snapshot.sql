@@ -103,3 +103,13 @@ CREATE TABLE webhook_deliveries (
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         , acknowledged_at TEXT, manual_attempts INTEGER NOT NULL DEFAULT 0)
 ;
+CREATE TRIGGER trg_api_keys_keep_one_active
+         BEFORE UPDATE OF revoked_at ON api_keys
+         WHEN OLD.revoked_at IS NULL
+          AND NEW.revoked_at IS NOT NULL
+          AND (SELECT COUNT(*) FROM api_keys
+                WHERE merchant_id = OLD.merchant_id AND revoked_at IS NULL) <= 1
+         BEGIN
+             SELECT RAISE(ABORT, 'last_active_key');
+         END
+;

@@ -1772,7 +1772,7 @@ mod tests {
     /// 401, whereas an unmatched path would fall through to the 404 fallback.
     #[tokio::test]
     async fn full_router_builds_and_matches_path_params() {
-        let server = TestServer::new(router(header_test_state("testnet").await)).unwrap();
+        let server = TestServer::new(router(header_test_state("testnet").await));
 
         for path in [
             "/v1/payments/some-id/webhooks",
