@@ -73,6 +73,9 @@ pub async fn validate(url: &str, allow_private: bool) -> Result<SafeTarget> {
 pub fn pinned_client(target: &SafeTarget, timeout: Duration) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
+        // Redirects must be rejected rather than followed: the destination
+        // of a redirect has not passed the SSRF validation and pinning above.
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
         .resolve(&target.host, target.addr)
         .build()
@@ -113,6 +116,7 @@ fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn blocks_loopback_link_local_and_private_v4() {
@@ -325,6 +329,45 @@ mod tests {
         assert!(
             !err.to_string().is_empty(),
             "expected a resolution failure error, got empty string"
+        );
+    }
+
+    #[tokio::test]
+    async fn refuses_redirect_to_private_address() {
+        let initial = MockServer::start().await;
+        let private = MockServer::start().await;
+
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", private.uri()))
+            .mount(&initial)
+            .await;
+        Mock::given(wiremock::matchers::method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&private)
+            .await;
+
+        let initial_url = format!("{}/webhook", initial.uri());
+        let target = validate(&initial_url, true)
+            .await
+            .expect("loopback test target should validate");
+        let client = pinned_client(&target, Duration::from_secs(1))
+            .expect("pinned webhook client should build");
+
+        let response = client
+            .post(initial_url)
+            .send()
+            .await
+            .expect("redirect response should be returned, not followed");
+
+        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            private
+                .received_requests()
+                .await
+                .expect("private mock request count should be available")
+                .len(),
+            0,
+            "redirect target must not receive a webhook request"
         );
     }
 }
