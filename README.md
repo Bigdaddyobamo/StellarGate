@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-855 -->
+- #855: Idempotency-Key hardening regressed: key not bound to request body, unbounded length, and a lost race returns 500
