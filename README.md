@@ -1732,3 +1732,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-891 -->
 - #891: Allow a per-intent expiry (`expires_in`) instead of a single global `PAYMENT_TTL_SECS`
+
+<!-- handsoff-issue-892 -->
+- #892: Support a merchant-level default webhook URL instead of requiring `webhook_url` on every intent
