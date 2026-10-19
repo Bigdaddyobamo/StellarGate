@@ -121,6 +121,40 @@ jobs:
       - name: Check deploy assets against Dockerfile
         run: bash scripts/check-deploy-consistency.sh
 
+  # Guards against silently dropping regression tests (issue #861). Fails a PR
+  # when the number of #[test] / #[tokio::test] functions drops by more than
+  # the allowed threshold unless the PR carries the `test-removal-approved`
+  # label. See CONTRIBUTING.md for the regression-test-per-issue convention.
+  test-count-guard:
+    name: test count guard
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for test-removal-approved label
+        id: label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          if gh pr view "$PR_NUMBER" --json labels \
+              --jq '.labels[].name' | grep -qx 'test-removal-approved'; then
+            echo "approved=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "approved=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Compare test counts against base
+        if: steps.label.outputs.approved != 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MAX_DROP: "5"
+        run: bash scripts/check-test-count.sh "$BASE_SHA" "$HEAD_SHA" "$MAX_DROP"
+
   # Belt-and-suspenders alongside supply-chain.yml: running cargo audit
   # directly in CI ensures every PR gets a RustSec advisory scan even without
   # the scheduled weekly supply-chain workflow. Mirrors the same RUSTSEC ignore
