@@ -1732,3 +1732,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-859 -->
 - #859: API error responses no longer include `request_id`, so failures can't be correlated with server logs
+
+<!-- handsoff-issue-860 -->
+- #860: `asset` filter and search on `GET /v1/payments` (closed #688, #692) are not implemented on `main`
