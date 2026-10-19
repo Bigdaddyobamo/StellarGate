@@ -7,7 +7,10 @@
 
 # ── Stage 1: dependency cache via cargo-chef ─────────────────────────────────
 FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS chef
-RUN cargo install cargo-chef --locked
+# cargo-chef is pinned to an exact version so builds are reproducible and do
+# not silently pick up a newly published release. Bump deliberately.
+ARG CARGO_CHEF_VERSION=0.1.71
+RUN cargo install cargo-chef --locked --version "${CARGO_CHEF_VERSION}"
 WORKDIR /app
 
 FROM chef AS planner
