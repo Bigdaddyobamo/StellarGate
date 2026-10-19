@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-854 -->
+- #854: `MIN_PAYMENT_AMOUNT` / `MAX_PAYMENT_AMOUNT` bounds were removed — the only ceiling on an intent is `i64` stroop overflow again
