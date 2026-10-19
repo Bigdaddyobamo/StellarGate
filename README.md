@@ -1735,3 +1735,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-896 -->
 - #896: `GET /v1/payments/summary` returns only counts per status: add per-asset amounts and a date range
+
+<!-- handsoff-issue-897 -->
+- #897: Nothing prevents two StellarGate instances from running against the same database, which duplicates webhooks
