@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-883 -->
+- #883: Webhook delivery rows record only `status` and `attempts`, not the receiver's response, so a failed delivery can't be diagnosed
