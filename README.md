@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-843 -->
+- #843: `main` does not compile: `auth_layer` is undefined at `src/api/mod.rs:355`
