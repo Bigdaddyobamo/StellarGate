@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-887 -->
+- #887: Bearer-token parsing is copy-pasted three times and only accepts the exact case `Bearer `
