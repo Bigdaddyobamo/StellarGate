@@ -149,6 +149,8 @@ Every webhook request includes four headers:
 
 **Important:** `X-StellarGate-Event` and `X-StellarGate-Delivery` are not covered by the HMAC signature. They mirror the body's `event` and `id` fields but can be altered in transit. Always read the event type and event id from the signed JSON body after verifying the signature.
 
+**Retries are re-signed.** Each inline delivery attempt (including every retry after a backoff) is signed at send time with a fresh `X-StellarGate-Timestamp` and a matching `X-StellarGate-Signature`. Redrive and manual redelivery behave the same way. This means the timestamp always reflects when that particular attempt was sent, not when the event was first generated — so a retry that fires minutes after the original attempt still passes the freshness check below. The `id` in the body stays constant across attempts (see [Event identity and deduplication](#event-identity-and-deduplication)); only the signature headers change.
+
 ## Verifying Webhooks
 
 Use this recipe to verify each incoming webhook:
@@ -161,6 +163,7 @@ Use this recipe to verify each incoming webhook:
    - Reject if `abs(now - t) > tolerance`
    - Recommended tolerance: **5 minutes** (300 seconds)
    - This bounds the replay window: a stolen request becomes useless after 5 minutes
+   - Because retries are re-signed at send time, a retry is never rejected for being stale regardless of how long the backoff was
 
 3. **Recompute signature:**
    - Get the **exact raw bytes** received (before JSON re-encoding)
@@ -217,69 +220,3 @@ function handleWebhook(rawBody, headers, secret) {
   switch (event) {
     case "payment.completed":
       console.log("Payment completed:", payload.payment_id);
-      break;
-    case "payment.overpaid":
-      console.log("Overpaid by:", payload.delta);
-      break;
-    case "payment.underpaid":
-      console.log("Underpaid by:", payload.delta);
-      break;
-    case "payment.expired":
-      console.log("Payment expired");
-      break;
-  }
-}
-```
-
-**Python:**
-
-```python
-import hmac
-import hashlib
-import json
-import time
-
-def verify(raw_body, headers, secret, tolerance_sec=300):
-    """Verify webhook signature and timestamp."""
-    try:
-        t = int(headers.get("x-stellargate-timestamp", 0))
-        sig = headers.get("x-stellargate-signature", "")
-    except (ValueError, TypeError):
-        return False
-    
-    # 1. Check timestamp freshness
-    if not t or abs(time.time() - t) > tolerance_sec:
-        return False
-    
-    # 2. Recompute signature (ensure raw_body is bytes, not string)
-    if isinstance(raw_body, str):
-        raw_body = raw_body.encode("utf-8")
-    
-    payload = f"{t}.".encode("utf-8") + raw_body
-    computed = hmac.new(
-        secret.encode("utf-8"),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
-    
-    # 3. Constant-time comparison
-    return hmac.compare_digest(computed, sig)
-
-def handle_webhook(raw_body, headers, secret):
-    """Handle incoming webhook with verification."""
-    if not verify(raw_body, headers, secret):
-        raise ValueError("invalid signature")
-    
-    payload = json.loads(raw_body)
-    event = payload["event"]  # authenticated; safe to route on
-    event_id = payload["id"]  # authenticated; deduplicate on this
-    
-    if event == "payment.completed":
-        print(f"Payment completed: {payload['payment_id']}")
-    elif event == "payment.overpaid":
-        print(f"Overpaid by: {payload['delta']}")
-    elif event == "payment.underpaid":
-        print(f"Underpaid by: {payload['delta']}")
-    elif event == "payment.expir
-
-/* … truncated 7627 chars — edit only what you need near the top … */
