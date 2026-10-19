@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-859 -->
+- #859: API error responses no longer include `request_id`, so failures can't be correlated with server logs
