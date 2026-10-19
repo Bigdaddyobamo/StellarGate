@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-849 -->
+- #849: [Tracking] Commit 9263a8e reverted ~12,900 lines of previously merged fixes — audit and restore
