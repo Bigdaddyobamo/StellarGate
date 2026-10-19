@@ -1738,3 +1738,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-857 -->
 - #857: `GET /v1/payments` query hardening regressed: unknown params, silent `limit` clamp, unbounded `offset`, misleading `next_cursor`, per-request `COUNT(*)`
+
+<!-- handsoff-issue-858 -->
+- #858: Payment memos are back to 32 bits taken from a UUID, with check-then-insert — collisions surface as `500`
