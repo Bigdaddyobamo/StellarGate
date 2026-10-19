@@ -128,16 +128,26 @@ jobs:
   # directly in CI ensures every PR gets a RustSec advisory scan even without
   # the scheduled weekly supply-chain workflow. Mirrors the same RUSTSEC ignore
   # list kept in supply-chain.yml — see that file for the full triage rationale.
+  #
+  # cargo-audit is installed as a prebuilt binary via taiki-e/install-action
+  # rather than compiled by rustsec/audit-check. The latter runs
+  # `cargo install cargo-audit` inside the checkout, which picks up the repo's
+  # rust-toolchain.toml pin (1.94) and then fails to build the newest
+  # transitive deps (kstring 2.0.5 needs rustc 1.96). The prebuilt binary is
+  # independent of the project MSRV and skips the ~60 s compile (issue #845).
   audit:
     name: cargo audit (RustSec)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run cargo audit
-        uses: rustsec/audit-check@v2
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit
 
   # Coverage report uploaded as an artifact for inspection.
   # A hard numeric gate can be added here once a baseline is established.
