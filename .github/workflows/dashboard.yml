@@ -50,6 +50,23 @@ jobs:
             node --check "$f"
           done
 
+      # `node --check` only parses; it never resolves imports, so a module that
+      # imports a name its target no longer exports passes the syntax check and
+      # then blows up in the browser with "does not provide an export named …".
+      # This walks the module graph and fails naming the missing export (#866).
+      - name: Module-graph link check
+        run: |
+          node --input-type=module -e "
+            import('./static/format.js').then(m => {
+              for (const n of ['buildListQuery','toCsv','CSV_COLUMNS','shortId'])
+                if (!(n in m)) throw new Error('static/format.js is missing export: ' + n);
+            });
+            import('./static/session.js').then(m => {
+              for (const n of ['getKey','setKey','clearKey'])
+                if (!(n in m)) throw new Error('static/session.js is missing export: ' + n);
+            });
+          "
+
       - name: Accessibility smoke check
         run: node scripts/check-dashboard-a11y.mjs
 
@@ -69,6 +86,57 @@ jobs:
 
       - name: Run unit tests for the pure JS modules
         run: node --test static/tests/*.test.js
+
+  # A fast browser smoke test that proves the dashboard actually loads in a
+  # real browser — independent of the Rust toolchain (#866). The e2e job below
+  # runs `cargo build` first, so a broken backend masks a broken frontend; this
+  # job serves `static/` with a tiny Node server and stubs `/v1/*`, so it fails
+  # on the frontend breakage itself with a message naming the missing export or
+  # undefined identifier. Chromium only, well under a minute.
+  dashboard-smoke:
+    name: dashboard browser smoke (no rust)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-smoke-${{ hashFiles('e2e/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-playwright-smoke-
+
+      - name: Install Playwright
+        working-directory: e2e
+        run: npm ci --no-audit --no-fund
+
+      - name: Install Chromium only
+        working-directory: e2e
+        run: npx playwright install --with-deps chromium
+
+      # Loads `/dashboard`, fails on any `pageerror` or `console.error`, signs
+      # in with a fixture key and asserts the payments table renders a row.
+      # No `cargo`, no Rust toolchain, no database.
+      - name: Run browser smoke test
+        working-directory: e2e
+        run: npx playwright test --project=chromium smoke
+
+      - name: Upload failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-smoke-report
+          path: |
+            e2e/playwright-report/
+            e2e/test-results/
+          retention-days: 7
+          if-no-files-found: ignore
 
   # End-to-end smoke test against a real server and a seeded database
   # (issue #724), plus the credential-leak regression assertion (#726) and
