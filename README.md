@@ -1735,3 +1735,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-856 -->
 - #856: `POST /v1/payments` silently accepts unknown body fields, including `merchant_id`
+
+<!-- handsoff-issue-857 -->
+- #857: `GET /v1/payments` query hardening regressed: unknown params, silent `limit` clamp, unbounded `offset`, misleading `next_cursor`, per-request `COUNT(*)`
