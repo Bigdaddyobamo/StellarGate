@@ -1735,3 +1735,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-876 -->
 - #876: Funds sent to the gateway that match no intent (missing/unknown memo, wrong asset, non-`text` memo) are silently ignored with no record
+
+<!-- handsoff-issue-877 -->
+- #877: `STELLAR_NETWORK` is never validated, so `mainnet`, `Public` or `pubnet` silently disables every public-network safety check
