@@ -32,6 +32,14 @@ Thumbs.db
 *.rej
 *.bak
 
+# ── Assistant / editor workspace directories ─────────────────────────────────
+# Tool-specific scratch directories are not part of the product or build.
+.kiro/
+.cursor/
+.claude/
+.idea/
+.vscode/
+
 # ── Test and coverage artifacts ───────────────────────────────────────────────
 proptest-regressions/
 *.pending-snap

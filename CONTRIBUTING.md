@@ -32,6 +32,12 @@ create ambiguity about where work is tracked and can become stale. Design
 rationale and decision records belong in code comments, issue discussions, or
 `CHANGELOG.md`.
 
+**Editor and assistant workspaces:** tool-specific scratch directories such as
+`.kiro/`, `.cursor/`, `.claude/`, `.idea/`, and `.vscode/` are ignored by
+`.gitignore` and should not be committed. Keep working notes in an issue (or a
+PR description) rather than in a committed tool directory, so they don't go
+stale or lock the project into one contributor's tooling.
+
 ## Development Setup
 
 ### Prerequisites
