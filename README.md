@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-873 -->
+- #873: A single global `WEBHOOK_SECRET` signs every merchant's webhooks, so any merchant can forge events for every other merchant
