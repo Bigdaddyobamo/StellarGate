@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-901 -->
+- #901: Remove stale `#[allow(dead_code)]` attributes whose comments say the code is unused when it is used
