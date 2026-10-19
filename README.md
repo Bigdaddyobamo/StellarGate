@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-875 -->
+- #875: Crediting a transaction and settling its intent are two separate writes, so a failure between them leaves a paid intent pending forever
