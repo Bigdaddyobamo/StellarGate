@@ -1738,3 +1738,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-877 -->
 - #877: `STELLAR_NETWORK` is never validated, so `mainnet`, `Public` or `pubnet` silently disables every public-network safety check
+
+<!-- handsoff-issue-878 -->
+- #878: `POST /v1/payments` mints intents with `destination_address: "UNCONFIGURED"` when no gateway account is set
