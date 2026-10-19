@@ -1735,3 +1735,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-892 -->
 - #892: Support a merchant-level default webhook URL instead of requiring `webhook_url` on every intent
+
+<!-- handsoff-issue-893 -->
+- #893: There is no merchant lifecycle: merchants can't be named, listed, inspected, suspended or deleted
