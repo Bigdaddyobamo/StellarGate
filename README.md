@@ -1732,3 +1732,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-875 -->
 - #875: Crediting a transaction and settling its intent are two separate writes, so a failure between them leaves a paid intent pending forever
+
+<!-- handsoff-issue-876 -->
+- #876: Funds sent to the gateway that match no intent (missing/unknown memo, wrong asset, non-`text` memo) are silently ignored with no record
