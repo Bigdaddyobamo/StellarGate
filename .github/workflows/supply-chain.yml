@@ -57,3 +57,21 @@ jobs:
         with:
           command: check bans licenses sources advisories
           fail-on-error: true
+
+  npm-audit:
+    name: npm audit (e2e)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      # Audits the committed e2e/package-lock.json (Playwright and its
+      # transitive deps). `--audit-level=high` fails the job only on high or
+      # critical advisories, so low/moderate noise doesn't block CI. The
+      # weekly `schedule:` cron above re-runs this against a fresh advisory
+      # DB, surfacing newly-disclosed npm advisories without a code change.
+      - name: Run npm audit
+        run: npm audit --audit-level=high --prefix e2e
