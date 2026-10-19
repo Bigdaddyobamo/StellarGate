@@ -14,7 +14,7 @@ use stellargate::{
     metrics::{
         AuthMetrics, HorizonMetrics, HttpMetrics, PaymentMetrics, TrustlineMetrics, WebhookMetrics,
     },
-    retention, webhook,
+    retention, supervise, webhook,
 };
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
@@ -71,37 +71,45 @@ async fn main() -> Result<()> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let health = state.task_health.clone();
 
+    // Required workers: a panic must be restarted, not silently dropped.
+    health.require("poller");
+    health.require("sweeper");
+    health.require("retention");
+    health.require("trustline_checker");
+    health.require("redrive");
+    if state.config.listener_mode == ListenerMode::Stream {
+        health.require("stream");
+    }
+
     let stream = (state.config.listener_mode == ListenerMode::Stream).then(|| {
-        spawn_task(
-            &health,
+        supervise::supervise(
+            health.clone(),
             "stream",
             horizon::run_stream_listener(state.clone(), shutdown_rx.clone()),
         )
     });
-    let poller = spawn_task(
-        &health,
+    let poller = supervise::supervise(
+        health.clone(),
         "poller",
         horizon::run_poller(state.clone(), shutdown_rx.clone()),
     );
-    let sweeper = spawn_task(
-        &health,
+    let sweeper = supervise::supervise(
+        health.clone(),
         "sweeper",
         expiry::run_sweeper(state.clone(), shutdown_rx.clone()),
     );
-    let retention = spawn_task(
-        &health,
+    let retention = supervise::supervise(
+        health.clone(),
         "retention",
         retention::run_retention_worker(state.clone(), shutdown_rx.clone()),
     );
-    let trustline_checker = spawn_task(&health, "trustline_checker", {
-        let state = state.clone();
-        let shutdown_rx = shutdown_rx.clone();
-        async move {
-            horizon::run_trustline_checker(state, shutdown_rx).await;
-        }
-    });
-    let redrive = spawn_task(
-        &health,
+    let trustline_checker = supervise::supervise(
+        health.clone(),
+        "trustline_checker",
+        horizon::run_trustline_checker(state.clone(), shutdown_rx.clone()),
+    );
+    let redrive = supervise::supervise(
+        health.clone(),
         "redrive",
         webhook::run_redrive_worker(state.clone(), shutdown_rx),
     );
@@ -162,23 +170,9 @@ async fn report_trustlines(state: &Arc<AppState>) {
     }
 }
 
-/// Spawn a background task, keeping [`TaskHealth`] accurate across its
-/// lifetime: counted as started before it runs and as stopped when it returns
-/// normally. A panic is recorded instead by [`join_task`] at shutdown.
-fn spawn_task<F>(health: &TaskHealth, name: &'static str, task: F) -> JoinHandle<()>
-where
-    F: Future<Output = ()> + Send + 'static,
-{
-    let health = health.clone();
-    health.task_started(name);
-    tokio::spawn(async move {
-        task.await;
-        health.task_stopped(name);
-    })
-}
-
-/// Await a background task. A `JoinError` means it panicked, which is recorded
-/// so the failure counter — and any alert watching it — fires.
+/// Await a supervised background task. A `JoinError` means the supervisor
+/// itself panicked, which is recorded so the failure counter — and any alert
+/// watching it — fires.
 async fn join_task(handle: JoinHandle<()>, name: &'static str, health: &TaskHealth) {
     if let Err(e) = handle.await
         && e.is_panic()
