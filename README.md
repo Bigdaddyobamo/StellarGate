@@ -1732,3 +1732,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-883 -->
 - #883: Webhook delivery rows record only `status` and `attempts`, not the receiver's response, so a failed delivery can't be diagnosed
+
+<!-- handsoff-issue-884 -->
+- #884: Manual redelivery consumes the automatic retry budget again (regression of #235), and has no audit log, no metrics, and can overwrite a `delivered` record
