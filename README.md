@@ -1735,3 +1735,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-884 -->
 - #884: Manual redelivery consumes the automatic retry budget again (regression of #235), and has no audit log, no metrics, and can overwrite a `delivered` record
+
+<!-- handsoff-issue-886 -->
+- #886: Failed `X-Admin-Secret` attempts are neither logged nor counted, and admin key listing gets the 5× read quota, so brute force goes unnoticed
