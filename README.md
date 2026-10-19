@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-895 -->
+- #895: API key `label` length is checked in bytes while the error message says characters, and control characters are accepted
