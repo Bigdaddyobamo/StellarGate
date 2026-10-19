@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-865 -->
+- #865: Orphaned dashboard modules: `static/api.js`, `static/dom.js` and `static/dashboard-format.js` are never served or imported
