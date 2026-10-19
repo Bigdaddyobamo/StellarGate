@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-891 -->
+- #891: Allow a per-intent expiry (`expires_in`) instead of a single global `PAYMENT_TTL_SECS`
