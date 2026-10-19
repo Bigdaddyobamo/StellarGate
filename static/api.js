@@ -5,6 +5,12 @@
 // in the `Authorization` header — never in a URL, a log line or the console.
 // All paths are absolute `/v1/...` paths so the module works regardless of
 // the page the dashboard is served from.
+//
+// For local frontend development without Postgres/Horizon/gateway, run
+// `node scripts/mock-api.mjs` (see docs/dashboard-dev.md). It serves
+// `static/` plus canned JSON for `/v1/payments`, the summary, webhooks,
+// `/ready` and `/`. The mock ignores the bearer header entirely, so no API
+// key is ever needed — or logged — while developing.
 
 const API_BASE = "/v1";
 
