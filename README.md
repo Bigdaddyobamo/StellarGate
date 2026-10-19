@@ -1732,3 +1732,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-895 -->
 - #895: API key `label` length is checked in bytes while the error message says characters, and control characters are accepted
+
+<!-- handsoff-issue-896 -->
+- #896: `GET /v1/payments/summary` returns only counts per status: add per-asset amounts and a date range
