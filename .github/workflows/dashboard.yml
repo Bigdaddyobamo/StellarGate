@@ -13,6 +13,8 @@ on:
       - "e2e/**"
       - "src/**"
       - "scripts/check-dashboard-a11y.mjs"
+      - ".prettierrc.json"
+      - ".prettierignore"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -24,6 +26,8 @@ on:
       - "e2e/**"
       - "src/**"
       - "scripts/check-dashboard-a11y.mjs"
+      - ".prettierrc.json"
+      - ".prettierignore"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -49,6 +53,13 @@ jobs:
           for f in static/format.js static/session.js static/state.js static/keys.js; do
             node --check "$f"
           done
+
+      # Formatting check for the dashboard frontend (issue #827). Prettier is
+      # scoped to `static/` via `.prettierignore`, so this only verifies the
+      # HTML/CSS/JS under that directory. `--check` fails the job on any file
+      # that is not formatted, keeping diffs noise-free without rewriting them.
+      - name: Prettier formatting check (static/)
+        run: npx --yes prettier@3 --check "static/**/*.{html,css,js}"
 
       - name: Accessibility smoke check
         run: node scripts/check-dashboard-a11y.mjs
