@@ -1732,3 +1732,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-879 -->
 - #879: `POST /v1/payments` no longer rejects assets without a gateway trustline, although `openapi.yaml` documents `trustline_missing`
+
+<!-- handsoff-issue-880 -->
+- #880: `stellargate_http_*` and `stellargate_payment*` metrics are exported but never recorded, so they are always zero
