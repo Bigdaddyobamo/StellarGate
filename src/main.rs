@@ -27,8 +27,8 @@ const USER_AGENT: &str = concat!("StellarGate/", env!("CARGO_PKG_VERSION"));
 /// configurable per-attempt timeout instead.
 const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long shutdown waits for background tasks to drain before forcing exit.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(30);
+/// Fallback overall shutdown deadline when `SHUTDOWN_GRACE_SECS` is unset.
+const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,6 +38,7 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
+    let shutdown_grace = shutdown_grace();
     let pool = db::open_pool(
         &cfg.database_url,
         cfg.db_pool_max_connections,
@@ -110,14 +111,24 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!("StellarGate API listening on {addr}");
 
-    axum::serve(
+    // One overall deadline covers both the HTTP drain and the worker drain, so
+    // the process can never overrun the orchestrator's stop grace period.
+    let deadline = tokio::time::Instant::now() + shutdown_grace;
+
+    // Signal the workers at the same time as the HTTP graceful shutdown starts
+    // so both drain in parallel rather than sequentially.
+    let shutdown_tx_signal = shutdown_tx.clone();
+    let http_shutdown = async move {
+        shutdown_signal().await;
+        let _ = shutdown_tx_signal.send(true);
+    };
+
+    let serve = axum::serve(
         listener,
         api::router(state).into_make_service_with_connect_info::<SocketAddr>(),
     )
-    .with_graceful_shutdown(shutdown_signal())
-    .await?;
+    .with_graceful_shutdown(http_shutdown);
 
-    let _ = shutdown_tx.send(true);
     let drain = async {
         join_task(poller, "poller", &health).await;
         join_task(sweeper, "sweeper", &health).await;
@@ -128,15 +139,37 @@ async fn main() -> Result<()> {
             join_task(handle, "stream", &health).await;
         }
     };
-    if tokio::time::timeout(SHUTDOWN_GRACE, drain).await.is_err() {
-        info!(
-            timeout_secs = SHUTDOWN_GRACE.as_secs(),
-            "background tasks did not drain in time; forcing exit"
+
+    let shutdown = async {
+        if let Err(e) = serve.await {
+            warn!(error = %e, "HTTP server error during shutdown");
+        }
+        drain.await;
+    };
+
+    if tokio::time::timeout_at(deadline, shutdown).await.is_err() {
+        let running = health.running_tasks();
+        warn!(
+            timeout_secs = shutdown_grace.as_secs(),
+            ?running,
+            "shutdown deadline reached; forcing exit with tasks still running"
         );
     }
 
     info!("shutdown complete");
     Ok(())
+}
+
+/// Overall shutdown deadline, read from `SHUTDOWN_GRACE_SECS` (falling back to
+/// [`DEFAULT_SHUTDOWN_GRACE_SECS`]). The orchestrator's stop grace period must
+/// exceed this value.
+fn shutdown_grace() -> Duration {
+    let secs = std::env::var("SHUTDOWN_GRACE_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&s| s > 0)
+        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS);
+    Duration::from_secs(secs)
 }
 
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {
