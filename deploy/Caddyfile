@@ -41,14 +41,17 @@
 		# HSTS: this service handles API keys and payment data, so never allow
 		# a downgrade to plaintext once a browser has seen it over TLS.
 		Strict-Transport-Security "max-age=31536000; includeSubDomains"
-		X-Content-Type-Options "nosniff"
 		X-Frame-Options "DENY"
-		Referrer-Policy "strict-origin-when-cross-origin"
 		# This is a JSON API with no camera/mic/geolocation surface of its
 		# own; deny every browser feature a client might otherwise inherit.
 		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
 		# The dashboard sets its own CSP per-response; don't override it here.
 		-Server
+		# The app owns Referrer-Policy (no-referrer) and X-Content-Type-Options
+		# (nosniff) on every response via SetResponseHeaderLayer::overriding.
+		# Do not set them here: Caddy's `header Field value` form would replace
+		# the app's stricter value. If a proxy-level fallback is ever needed,
+		# use the `?Field value` form so upstream values win.
 	}
 
 	log {

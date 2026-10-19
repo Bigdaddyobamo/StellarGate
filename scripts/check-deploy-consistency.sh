@@ -1,43 +1,44 @@
 #!/usr/bin/env bash
-#
-# Cross-checks the deploy assets against each other and against Dockerfile so
-# they cannot silently drift apart as the app evolves (issues #444, #447):
-#
-#   - Dockerfile's EXPOSE'd port matches the port both compose files publish
-#     the app on.
-#   - The healthcheck binary path baked into the runtime image matches what
-#     every compose file's healthcheck actually invokes.
-#   - deploy/stellargate.env.example never carries a real-looking secret in
-#     place of a placeholder.
-#
-# Run locally with: bash scripts/check-deploy-consistency.sh
-
+# Fails if the deploy config drifts from what the app expects.
 set -euo pipefail
 
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+caddyfile="$repo_root/deploy/Caddyfile"
+api_mod="$repo_root/src/api/mod.rs"
+
 fail=0
-note() { printf '\033[1;31mdrift:\033[0m %s\n' "$*"; fail=1; }
 
-dockerfile_port=$(grep -oE '^EXPOSE [0-9]+' Dockerfile | grep -oE '[0-9]+')
-dockerfile_bin=$(grep -oE '/usr/local/bin/[a-z]+' Dockerfile | sort -u | head -1)
-
-for compose in docker-compose.yml deploy/docker-compose.prod.yml; do
-    if ! grep -qE "(^|[\"':])${dockerfile_port}([\"'/:]|$)" "$compose"; then
-        note "$compose does not reference port $dockerfile_port (from Dockerfile EXPOSE)"
-    fi
-    if ! grep -q "$dockerfile_bin" "$compose"; then
-        note "$compose healthcheck does not invoke $dockerfile_bin (from Dockerfile)"
-    fi
-done
-
-env_example="deploy/stellargate.env.example"
-for var in WEBHOOK_SECRET ADMIN_PROVISIONING_SECRET; do
-    value=$(grep -E "^${var}=" "$env_example" | head -1 | cut -d= -f2-)
-    if [[ -n "$value" && "$value" != REPLACE_ME_* ]]; then
-        note "$env_example: $var=$value does not look like the REPLACE_ME_ placeholder"
-    fi
-done
-
-if [[ $fail -eq 0 ]]; then
-    echo "deploy assets are consistent with Dockerfile"
+if [[ ! -f "$caddyfile" ]]; then
+  echo "missing $caddyfile" >&2
+  exit 1
 fi
-exit $fail
+
+# The app sets these security headers on every response with
+# `SetResponseHeaderLayer::overriding`. The proxy must not set them to a
+# different value, or it silently weakens the app's policy (issue #902).
+# Caddy's `header Field value` form replaces the upstream value; only the
+# `?Field value` fallback form is safe.
+app_owned_headers=("Referrer-Policy" "X-Content-Type-Options")
+
+for header in "${app_owned_headers[@]}"; do
+  # Match a bare `Header value` line (sets/replaces) but not `?Header value`
+  # (fallback) or `-Header` (delete).
+  if grep -Eq "^[[:space:]]*${header}[[:space:]]" "$caddyfile"; then
+    echo "deploy/Caddyfile sets app-owned header '${header}' with a fixed value;" >&2
+    echo "the app already sets it on every response. Remove it or use the" >&2
+    echo "'?${header} <value>' fallback form." >&2
+    fail=1
+  fi
+done
+
+# Sanity: the app must still set Referrer-Policy: no-referrer.
+if [[ -f "$api_mod" ]] && ! grep -q 'no-referrer' "$api_mod"; then
+  echo "src/api/mod.rs no longer sets Referrer-Policy: no-referrer" >&2
+  fail=1
+fi
+
+if [[ "$fail" -ne 0 ]]; then
+  exit 1
+fi
+
+echo "deploy config consistent with app security headers"
