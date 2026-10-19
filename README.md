@@ -1732,3 +1732,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-855 -->
 - #855: Idempotency-Key hardening regressed: key not bound to request body, unbounded length, and a lost race returns 500
+
+<!-- handsoff-issue-856 -->
+- #856: `POST /v1/payments` silently accepts unknown body fields, including `merchant_id`
