@@ -1729,3 +1729,6 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-879 -->
+- #879: `POST /v1/payments` no longer rejects assets without a gateway trustline, although `openapi.yaml` documents `trustline_missing`
