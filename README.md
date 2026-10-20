@@ -1730,14 +1730,8 @@ Released under the [MIT License](LICENSE).
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
 
-<!-- handsoff-issue-875 -->
-- #875: Crediting a transaction and settling its intent are two separate writes, so a failure between them leaves a paid intent pending forever
+<!-- handsoff-issue-285 -->
+- #285: No tracing spans carry `merchant_id` or `payment_id` through the settlement path
 
-<!-- handsoff-issue-876 -->
-- #876: Funds sent to the gateway that match no intent (missing/unknown memo, wrong asset, non-`text` memo) are silently ignored with no record
-
-<!-- handsoff-issue-877 -->
-- #877: `STELLAR_NETWORK` is never validated, so `mainnet`, `Public` or `pubnet` silently disables every public-network safety check
-
-<!-- handsoff-issue-878 -->
-- #878: `POST /v1/payments` mints intents with `destination_address: "UNCONFIGURED"` when no gateway account is set
+<!-- handsoff-issue-301 -->
+- #301: `settle()` awaits webhook delivery inline, so one slow receiver stalls settlement for every other intent
