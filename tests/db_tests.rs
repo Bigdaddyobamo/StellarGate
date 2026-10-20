@@ -205,6 +205,133 @@ async fn api_keys_are_stored_hashed_not_plaintext() {
     assert_eq!(key_hash, expected_digest);
 }
 
+// ── foreign key enforcement (issue #271) ─────────────────────────────────────
+
+/// A fresh in-memory pool with foreign-key enforcement explicitly enabled, as
+/// `db::open_pool` does for production connections.
+async fn fk_pool() -> sqlx::SqlitePool {
+    SqlitePoolOptions::new()
+        .min_connections(1)
+        .connect_with(
+            SqliteConnectOptions::from_str("sqlite::memory:")
+                .unwrap()
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap()
+}
+
+/// Insert a merchant and a payment so child rows have a valid parent.
+async fn seed_payment(pool: &sqlx::SqlitePool, payment_id: &str) {
+    let (raw_key, prefix) = db::generate_api_key();
+    db::create_merchant(pool, "m1", &raw_key, &prefix)
+        .await
+        .unwrap();
+
+    let ts = "2026-01-01T00:00:00Z";
+    sqlx::query(
+        "INSERT INTO payments
+            (id, merchant_id, destination_address, memo, amount, asset, status,
+             created_at, updated_at, expires_at)
+         VALUES (?, 'm1', 'GDEST', ?, '1', 'XLM', 'pending', ?, ?, ?)",
+    )
+    .bind(payment_id)
+    .bind(format!("MEMO-{payment_id}"))
+    .bind(ts)
+    .bind(ts)
+    .bind("2026-01-01T01:00:00Z")
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A child row pointing at a nonexistent payment must be rejected by the
+/// declared foreign key rather than silently persisted as an orphan.
+#[tokio::test]
+async fn orphan_insert_is_rejected_by_foreign_key() {
+    let pool = fk_pool().await;
+    db::migrate(&pool).await.unwrap();
+
+    let err = sqlx::query(
+        "INSERT INTO webhook_deliveries
+            (payment_id, url, payload, status, attempts, next_attempt_at, created_at)
+         VALUES ('does-not-exist', 'https://example.com/hook', '{}', 'pending', 0,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("inserting a delivery for a nonexistent payment must fail");
+
+    match err {
+        sqlx::Error::Database(db_err) => assert!(
+            db_err.message().contains("FOREIGN KEY constraint failed"),
+            "unexpected database error: {}",
+            db_err.message()
+        ),
+        other => panic!("expected a database error, got {other:?}"),
+    }
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "the orphan row must not have been persisted");
+}
+
+/// The same insert succeeds once the referenced payment exists.
+#[tokio::test]
+async fn child_insert_succeeds_with_existing_parent() {
+    let pool = fk_pool().await;
+    db::migrate(&pool).await.unwrap();
+    seed_payment(&pool, "payment-1").await;
+
+    sqlx::query(
+        "INSERT INTO webhook_deliveries
+            (payment_id, url, payload, status, attempts, next_attempt_at, created_at)
+         VALUES ('payment-1', 'https://example.com/hook', '{}', 'pending', 0,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("a delivery for an existing payment must be accepted");
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+/// Deleting a payment must cascade to its dependent rows.
+#[tokio::test]
+async fn deleting_payment_cascades_to_children() {
+    let pool = fk_pool().await;
+    db::migrate(&pool).await.unwrap();
+    seed_payment(&pool, "payment-1").await;
+
+    sqlx::query(
+        "INSERT INTO webhook_deliveries
+            (payment_id, url, payload, status, attempts, next_attempt_at, created_at)
+         VALUES ('payment-1', 'https://example.com/hook', '{}', 'pending', 0,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("DELETE FROM payments WHERE id = 'payment-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "deleting the payment must cascade to webhook_deliveries");
+}
+
 // ── production pool settings (issue #642) ────────────────────────────────────
 
 /// A throwaway on-disk database URL. WAL needs a real file: an in-memory

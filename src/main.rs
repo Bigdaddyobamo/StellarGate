@@ -58,6 +58,9 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
+    // `open_pool` builds every connection through `db::connect_options`, which
+    // enables `PRAGMA foreign_keys = ON`, so referential integrity is enforced
+    // on each pooled connection without any extra setup here.
     let pool = db::open_pool(
         &cfg.database_url,
         cfg.db_pool_max_connections,
