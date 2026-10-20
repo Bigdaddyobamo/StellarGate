@@ -1730,14 +1730,8 @@ Released under the [MIT License](LICENSE).
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
 
-<!-- handsoff-issue-855 -->
-- #855: Idempotency-Key hardening regressed: key not bound to request body, unbounded length, and a lost race returns 500
+<!-- handsoff-issue-285 -->
+- #285: No tracing spans carry `merchant_id` or `payment_id` through the settlement path
 
-<!-- handsoff-issue-856 -->
-- #856: `POST /v1/payments` silently accepts unknown body fields, including `merchant_id`
-
-<!-- handsoff-issue-857 -->
-- #857: `GET /v1/payments` query hardening regressed: unknown params, silent `limit` clamp, unbounded `offset`, misleading `next_cursor`, per-request `COUNT(*)`
-
-<!-- handsoff-issue-858 -->
-- #858: Payment memos are back to 32 bits taken from a UUID, with check-then-insert — collisions surface as `500`
+<!-- handsoff-issue-301 -->
+- #301: `settle()` awaits webhook delivery inline, so one slow receiver stalls settlement for every other intent
