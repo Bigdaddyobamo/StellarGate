@@ -136,17 +136,21 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-  # Coverage report uploaded as an artifact for inspection.
-  # A hard numeric gate can be added here once a baseline is established.
+  # Coverage is measured with cargo-llvm-cov (works on the pinned stable
+  # toolchain, no nightly required) and reported only — there is deliberately
+  # no absolute threshold here. The LCOV report is uploaded as a build
+  # artifact and to Codecov, whose status check flags regressions against the
+  # recorded baseline rather than enforcing a fixed floor (issue #292).
   coverage:
-    name: coverage (tarpaulin)
+    name: coverage (llvm-cov)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: "1.94"
+          toolchain: stable
+          components: llvm-tools-preview
 
       - uses: actions/cache@v4
         with:
@@ -158,14 +162,20 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-coverage-
 
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin --locked
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
 
       - name: Generate coverage report
-        run: cargo tarpaulin --locked --out Xml --output-dir coverage/
+        run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
 
       - name: Upload coverage report
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
-          path: coverage/
+          path: lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
