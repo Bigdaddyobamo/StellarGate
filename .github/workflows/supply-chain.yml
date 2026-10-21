@@ -57,3 +57,17 @@ jobs:
         with:
           command: check bans licenses sources advisories
           fail-on-error: true
+
+  npm-audit:
+    name: npm audit (e2e Playwright dependencies)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run npm audit
+        run: npm audit --audit-level=high --prefix e2e
