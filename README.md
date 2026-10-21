@@ -1730,11 +1730,8 @@ Released under the [MIT License](LICENSE).
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
 
-<!-- handsoff-issue-895 -->
-- #895: API key `label` length is checked in bytes while the error message says characters, and control characters are accepted
+<!-- handsoff-issue-285 -->
+- #285: No tracing spans carry `merchant_id` or `payment_id` through the settlement path
 
-<!-- handsoff-issue-896 -->
-- #896: `GET /v1/payments/summary` returns only counts per status: add per-asset amounts and a date range
-
-<!-- handsoff-issue-897 -->
-- #897: Nothing prevents two StellarGate instances from running against the same database, which duplicates webhooks
+<!-- handsoff-issue-301 -->
+- #301: `settle()` awaits webhook delivery inline, so one slow receiver stalls settlement for every other intent

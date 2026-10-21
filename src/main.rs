@@ -30,15 +30,37 @@ const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
 /// Fallback overall shutdown deadline when `SHUTDOWN_GRACE_SECS` is unset.
 const DEFAULT_SHUTDOWN_GRACE_SECS: u64 = 30;
 
+/// Timeout for the `healthcheck` subcommand's probe request. Kept short so a
+/// hung server fails the probe quickly instead of stalling the orchestrator.
+const HEALTHCHECK_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default probe path when the subcommand is invoked without one.
+const HEALTHCHECK_DEFAULT_PATH: &str = "health";
+
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Handle the `healthcheck` subcommand before anything else: no config
+    // loading, tracing init, DB open, migrations, Horizon calls, or port
+    // binding. Container probes must not start a second server.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("healthcheck") {
+        let path = args
+            .get(2)
+            .map(String::as_str)
+            .unwrap_or(HEALTHCHECK_DEFAULT_PATH);
+        let code = run_healthcheck(path).await;
+        std::process::exit(code);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     dotenvy::dotenv().ok();
 
     let cfg = Config::from_env()?;
-    let shutdown_grace = shutdown_grace();
+    // `open_pool` builds every connection through `db::connect_options`, which
+    // enables `PRAGMA foreign_keys = ON`, so referential integrity is enforced
+    // on each pooled connection without any extra setup here.
     let pool = db::open_pool(
         &cfg.database_url,
         cfg.db_pool_max_connections,
@@ -160,16 +182,50 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Overall shutdown deadline, read from `SHUTDOWN_GRACE_SECS` (falling back to
-/// [`DEFAULT_SHUTDOWN_GRACE_SECS`]). The orchestrator's stop grace period must
-/// exceed this value.
-fn shutdown_grace() -> Duration {
-    let secs = std::env::var("SHUTDOWN_GRACE_SECS")
+/// Build the probe URL for the `healthcheck` subcommand. Trims any leading
+/// slashes from `path` so both `health` and `/health` produce the same URL.
+fn healthcheck_url(port: u16, path: &str) -> String {
+    let path = path.trim_start_matches('/');
+    let path = if path.is_empty() {
+        HEALTHCHECK_DEFAULT_PATH
+    } else {
+        path
+    };
+    format!("http://127.0.0.1:{port}/{path}")
+}
+
+/// Probe the local server's health endpoint and return the process exit code:
+/// `0` when the endpoint answers with a success status, `1` otherwise.
+async fn run_healthcheck(path: &str) -> i32 {
+    let port = std::env::var("PORT")
         .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&s| s > 0)
-        .unwrap_or(DEFAULT_SHUTDOWN_GRACE_SECS);
-    Duration::from_secs(secs)
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(3000);
+    let url = healthcheck_url(port, path);
+
+    let client = match reqwest::Client::builder()
+        .timeout(HEALTHCHECK_TIMEOUT)
+        .user_agent(USER_AGENT)
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("healthcheck: failed to build HTTP client: {e}");
+            return 1;
+        }
+    };
+
+    match client.get(&url).send().await {
+        Ok(resp) if resp.status().is_success() => 0,
+        Ok(resp) => {
+            eprintln!("healthcheck: {url} returned {}", resp.status());
+            1
+        }
+        Err(e) => {
+            eprintln!("healthcheck: {url} failed: {e}");
+            1
+        }
+    }
 }
 
 fn http_client(timeout: Duration) -> Result<reqwest::Client> {
@@ -245,4 +301,45 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
     info!("shutdown signal received");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn healthcheck_url_uses_port_and_path() {
+        assert_eq!(
+            healthcheck_url(3000, "health"),
+            "http://127.0.0.1:3000/health"
+        );
+        assert_eq!(
+            healthcheck_url(8080, "ready"),
+            "http://127.0.0.1:8080/ready"
+        );
+    }
+
+    #[test]
+    fn healthcheck_url_trims_leading_slashes() {
+        assert_eq!(
+            healthcheck_url(3000, "/health"),
+            "http://127.0.0.1:3000/health"
+        );
+        assert_eq!(
+            healthcheck_url(3000, "///ready"),
+            "http://127.0.0.1:3000/ready"
+        );
+    }
+
+    #[test]
+    fn healthcheck_url_falls_back_to_default_path() {
+        assert_eq!(
+            healthcheck_url(3000, ""),
+            "http://127.0.0.1:3000/health"
+        );
+        assert_eq!(
+            healthcheck_url(3000, "/"),
+            "http://127.0.0.1:3000/health"
+        );
+    }
 }

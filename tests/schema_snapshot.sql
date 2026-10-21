@@ -27,7 +27,7 @@ CREATE INDEX idx_webhook_deliveries_redrive
 ;
 CREATE TABLE api_keys (
             id TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL,
+            merchant_id TEXT NOT NULL REFERENCES merchants(id) ON DELETE CASCADE,
             key_hash TEXT NOT NULL UNIQUE,
             prefix TEXT NOT NULL,
             label TEXT,
@@ -39,7 +39,7 @@ CREATE TABLE api_keys (
 CREATE TABLE idempotency_keys (
             merchant_id TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
-            payment_id TEXT NOT NULL,
+            payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
             created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
             PRIMARY KEY (merchant_id, idempotency_key)
         )
@@ -58,7 +58,7 @@ CREATE TABLE merchants (
 ;
 CREATE TABLE payments (
             id TEXT PRIMARY KEY,
-            merchant_id TEXT NOT NULL DEFAULT 'anonymous',
+            merchant_id TEXT NOT NULL DEFAULT 'anonymous' REFERENCES merchants(id) ON DELETE CASCADE,
             destination_address TEXT NOT NULL,
             memo TEXT NOT NULL UNIQUE,
             amount TEXT NOT NULL,
@@ -74,7 +74,7 @@ CREATE TABLE payments (
         )
 ;
 CREATE TABLE processed_transactions (
-            payment_id TEXT NOT NULL,
+            payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
             /* The transaction hash is part of the dedup key, so an empty value
             would make every unhashed record collide and silently discard all
             but the first (issue #224). Reject it in the schema as well as at
@@ -93,7 +93,7 @@ CREATE TABLE processed_transactions (
 ;
 CREATE TABLE webhook_deliveries (
             id TEXT PRIMARY KEY,
-            payment_id TEXT NOT NULL,
+            payment_id TEXT NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
             url TEXT NOT NULL,
             payload TEXT NOT NULL,
             event_type TEXT,
