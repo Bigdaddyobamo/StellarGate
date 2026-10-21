@@ -32,6 +32,27 @@ connection on every network. If your integration needs the omitted fields,
 either set `WEBHOOK_PAYLOAD_DETAIL=full` or call `GET /v1/payments/:id` with
 your API key.
 
+## Event identity and deduplication
+
+Every webhook body carries a stable, unique event identifier in the `id`
+field, plus an RFC 3339 `created_at` timestamp. Both are part of the signed
+body, so they are covered by the HMAC signature.
+
+- `id` is unique per event. It is **identical across inline retries, redrive,
+  and manual redelivery** of the same event, because those replay the stored
+  payload verbatim.
+- **Deduplicate on `id`.** If you receive the same `id` twice, it is a retry
+  of the same event and you should ignore the duplicate.
+- **Do not deduplicate on `payment_id`.** A single payment legitimately emits
+  several different events (for example `payment.underpaid` followed by
+  `payment.completed` after a top-up, or `payment.completed` followed by
+  `payment.unexpected` when the payer sends again). Deduplicating on
+  `payment_id` would drop those real follow-up events. Use `payment_id` only
+  to correlate events that belong to the same payment.
+- Deduplicating on `(payment_id, event)` is also unsafe: `payment.unexpected`
+  and `payment.underpaid` can each fire more than once for the same payment
+  with different amounts.
+
 ## Event Types
 
 StellarGate fires exactly one event when a payment settles, determined by comparing received amount to requested amount:
@@ -42,6 +63,8 @@ Fired when cumulative payment equals the requested amount exactly.
 
 ```json
 {
+  "id": "9f1c2e7a-4b3d-4e5f-8a6b-1c2d3e4f5a6b",
+  "created_at": "2024-06-22T15:30:45Z",
   "event": "payment.completed",
   "payment_id": "a1b2c3d4-...",
   "merchant_id": "your-merchant-id",
@@ -60,6 +83,8 @@ Fired when cumulative payment **exceeds** the requested amount. The `delta` fiel
 
 ```json
 {
+  "id": "9f1c2e7a-4b3d-4e5f-8a6b-1c2d3e4f5a6b",
+  "created_at": "2024-06-22T15:30:45Z",
   "event": "payment.overpaid",
   "payment_id": "a1b2c3d4-...",
   "merchant_id": "your-merchant-id",
@@ -78,6 +103,8 @@ Fired when a payment arrives but falls **short** of the requested amount. The `d
 
 ```json
 {
+  "id": "9f1c2e7a-4b3d-4e5f-8a6b-1c2d3e4f5a6b",
+  "created_at": "2024-06-22T15:30:45Z",
   "event": "payment.underpaid",
   "payment_id": "a1b2c3d4-...",
   "merchant_id": "your-merchant-id",
@@ -96,6 +123,8 @@ Fired when a payment intent's TTL elapses before payment arrives. No further tra
 
 ```json
 {
+  "id": "9f1c2e7a-4b3d-4e5f-8a6b-1c2d3e4f5a6b",
+  "created_at": "2024-06-22T15:30:45Z",
   "event": "payment.expired",
   "payment_id": "a1b2c3d4-...",
   "merchant_id": "your-merchant-id",
@@ -109,15 +138,18 @@ Fired when a payment intent's TTL elapses before payment arrives. No further tra
 
 ## Webhook Headers
 
-Every webhook request includes three headers:
+Every webhook request includes four headers:
 
 | Header | Description | Signed? |
 |---|---|---|
 | `X-StellarGate-Timestamp` | Unix time (seconds) when event was signed | ✅ Yes |
 | `X-StellarGate-Signature` | Hex HMAC-SHA256 of `"{timestamp}.{raw_body}"` | ✅ Yes |
 | `X-StellarGate-Event` | Copy of the `event` field from body (routing convenience) | ❌ No |
+| `X-StellarGate-Delivery` | Copy of the `id` field from body (deduplication convenience) | ❌ No |
 
-**Important:** `X-StellarGate-Event` is not covered by the HMAC signature. It mirrors the body's `event` field but can be altered in transit. Always read the event type from the signed JSON body after verifying the signature.
+**Important:** `X-StellarGate-Event` and `X-StellarGate-Delivery` are not covered by the HMAC signature. They mirror the body's `event` and `id` fields but can be altered in transit. Always read the event type and event id from the signed JSON body after verifying the signature.
+
+**Retries are re-signed.** Each inline delivery attempt (including every retry after a backoff) is signed at send time with a fresh `X-StellarGate-Timestamp` and a matching `X-StellarGate-Signature`. Redrive and manual redelivery behave the same way. This means the timestamp always reflects when that particular attempt was sent, not when the event was first generated — so a retry that fires minutes after the original attempt still passes the freshness check below. The `id` in the body stays constant across attempts (see [Event identity and deduplication](#event-identity-and-deduplication)); only the signature headers change.
 
 ## Verifying Webhooks
 
@@ -131,6 +163,7 @@ Use this recipe to verify each incoming webhook:
    - Reject if `abs(now - t) > tolerance`
    - Recommended tolerance: **5 minutes** (300 seconds)
    - This bounds the replay window: a stolen request becomes useless after 5 minutes
+   - Because retries are re-signed at send time, a retry is never rejected for being stale regardless of how long the backoff was
 
 3. **Recompute signature:**
    - Get the **exact raw bytes** received (before JSON re-encoding)
@@ -145,6 +178,7 @@ Use this recipe to verify each incoming webhook:
 5. **Parse and route:**
    - After signature verification passes, parse the JSON
    - Read the `event` field from the body to determine the event type
+   - Read the `id` field from the body and deduplicate on it
    - Route based on `event` (not on the `X-StellarGate-Event` header)
 
 ### Verification Examples
@@ -181,315 +215,8 @@ function handleWebhook(rawBody, headers, secret) {
   
   const payload = JSON.parse(rawBody);
   const event = payload.event; // authenticated; safe to route on
+  const eventId = payload.id;  // authenticated; deduplicate on this
   
   switch (event) {
     case "payment.completed":
       console.log("Payment completed:", payload.payment_id);
-      break;
-    case "payment.overpaid":
-      console.log("Overpaid by:", payload.delta);
-      break;
-    case "payment.underpaid":
-      console.log("Underpaid by:", payload.delta);
-      break;
-    case "payment.expired":
-      console.log("Payment expired");
-      break;
-  }
-}
-```
-
-**Python:**
-
-```python
-import hmac
-import hashlib
-import json
-import time
-
-def verify(raw_body, headers, secret, tolerance_sec=300):
-    """Verify webhook signature and timestamp."""
-    try:
-        t = int(headers.get("x-stellargate-timestamp", 0))
-        sig = headers.get("x-stellargate-signature", "")
-    except (ValueError, TypeError):
-        return False
-    
-    # 1. Check timestamp freshness
-    if not t or abs(time.time() - t) > tolerance_sec:
-        return False
-    
-    # 2. Recompute signature (ensure raw_body is bytes, not string)
-    if isinstance(raw_body, str):
-        raw_body = raw_body.encode("utf-8")
-    
-    payload = f"{t}.".encode("utf-8") + raw_body
-    computed = hmac.new(
-        secret.encode("utf-8"),
-        payload,
-        hashlib.sha256
-    ).hexdigest()
-    
-    # 3. Constant-time comparison
-    return hmac.compare_digest(computed, sig)
-
-def handle_webhook(raw_body, headers, secret):
-    """Handle incoming webhook with verification."""
-    if not verify(raw_body, headers, secret):
-        raise ValueError("invalid signature")
-    
-    payload = json.loads(raw_body)
-    event = payload["event"]  # authenticated; safe to route on
-    
-    if event == "payment.completed":
-        print(f"Payment completed: {payload['payment_id']}")
-    elif event == "payment.overpaid":
-        print(f"Overpaid by: {payload['delta']}")
-    elif event == "payment.underpaid":
-        print(f"Underpaid by: {payload['delta']}")
-    elif event == "payment.expired":
-        print("Payment expired")
-```
-
-## Webhook Delivery Management
-
-StellarGate tracks all webhook delivery attempts in the `webhook_deliveries` table. Two endpoints expose this history:
-
-### GET /payments/:id/webhooks
-
-List all delivery attempts for a payment.
-
-**Response (200 OK):**
-```json
-{
-  "payment_id": "550e8400-e29b-41d4-a716-446655440000",
-  "deliveries": [
-    {
-      "id": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
-      "url": "https://merchant.example.com/webhook",
-      "event": "payment.completed",
-      "status": "delivered",
-      "attempts": 2,
-      "last_attempt": "2026-06-22T15:30:45",
-      "created_at": "2026-06-22T15:20:00"
-    }
-  ]
-}
-```
-
-**Error (404 Not Found):**
-```json
-{ "error": "payment not found" }
-```
-
-### POST /payments/:id/webhooks/:delivery_id/redeliver
-
-Manually re-attempt a webhook delivery.
-
-**Response (200 OK):**
-- Delivery succeeded (empty body)
-
-**Error (502 Bad Gateway):**
-```json
-{ "error": "webhook delivery failed" }
-```
-
-**Error (404 Not Found):**
-```json
-{ "error": "delivery not found" }
-```
-
-**Behavior:**
-- Re-sends the exact same signed payload (preserves authenticity)
-- Records a new attempt, incrementing the attempt counter
-- Respects merchant's webhook authentication (signature recomputed from original payload)
-- Sets status to `delivered` only if recipient returns 2xx
-- Scoped to payment owner (merchant authentication required)
-
-## Configuration
-
-Configure webhook behavior via environment variables:
-
-| Variable | Description | Default |
-|---|---|---|
-| `WEBHOOK_SECRET` | HMAC signing secret (shared with you at gateway provisioning) | — |
-| `WEBHOOK_RETRY_ATTEMPTS` | Inline delivery retry count | `3` |
-| `WEBHOOK_RETRY_DELAY_MS` | Delay between retries | `5000` |
-| `WEBHOOK_TIMEOUT_SECS` | Per-attempt timeout for outbound POST requests | `10` |
-| `WEBHOOK_REDRIVE_INTERVAL_SECS` | How often background redrive worker scans for stuck deliveries | `30` |
-| `WEBHOOK_REDRIVE_CONCURRENCY` | Maximum concurrent redrive attempts in flight | `4` |
-| `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | Total attempts (inline + redrive) before permanent failure | `8` |
-| `WEBHOOK_REDRIVE_GRACE_SECS` | Grace period before a stuck delivery is touched by redrive worker | `60` |
-| `WEBHOOK_ALLOW_PRIVATE_TARGETS` | Bypass SSRF guard for private IPs (dev/test only, never production) | `false` |
-
-## Delivery Guarantee
-
-StellarGate guarantees **at-least-once** delivery with automatic retries:
-
-- **Initial dispatch:** When a payment settles, the webhook is dispatched synchronously with inline retries (configurable, default 3 attempts)
-- **Background redrive:** If dispatch encounters an error or the process crashes mid-delivery, a background worker periodically scans for stuck deliveries and redrives them
-- **Idempotency:** Use the `payment_id` as a deduplication key on your end. If you receive the same `payment_id` twice, it's a retry — process it idempotently
-- **Timestamps for ordering:** Use `created_at` (initial creation time) or `updated_at` (last change time) from payment status to order events, not webhook delivery times
-
-## SSRF Protection
-
-All webhook URLs are validated for SSRF attacks:
-
-- Hostname is resolved and checked against loopback (`127.0.0.0/8`), link-local (`169.254.0.0/16`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and reserved ranges
-- The same check runs on every redelivery against the exact resolved address (not a fresh DNS lookup), preventing DNS-rebinding attacks
-- Production deployments enforce HTTPS; testnet/development allows HTTP
-- Set `WEBHOOK_ALLOW_PRIVATE_TARGETS=true` only for local development
-
-## Integration Checklist
-
-- [ ] Store `WEBHOOK_SECRET` securely in environment (never commit)
-- [ ] Implement signature verification with timestamp freshness check
-- [ ] Use constant-time comparison for signature checking
-- [ ] Read event type from JSON body, not from `X-StellarGate-Event` header
-- [ ] Make webhook handler idempotent (deduplicate by `payment_id`)
-- [ ] Return HTTP 2xx for success; any other status triggers retries
-- [ ] Keep handler fast; long-running tasks should be queued asynchronously
-- [ ] Log all webhook events for audit trail
-- [ ] Monitor redelivery dashboard for failed deliveries
-- [ ] Set up alerts for delivery failures
-- [ ] Test signature verification with provided examples before going live
-
-## Links
-
-- **API Reference:** See `POST /payments` in [README.md](README.md#post-payments) for payment creation with `webhook_url`
-- **Event Flow:** See "Payment Flow" section in [README.md](README.md#payment-flow) for end-to-end payment lifecycle
-- **Integration Examples:** See [Integration Examples](#integration-examples) below
-
----
-
-## Integration Examples
-
-### Complete Workflow
-
-**Step 1: Create a payment with webhook**
-
-```bash
-curl -X POST http://localhost:3000/payments \
-  -H "Content-Type: application/json" \
-  -d '{
-    "amount": "100.0",
-    "asset": "XLM",
-    "merchant_id": "my-shop",
-    "webhook_url": "https://yourapp.com/webhooks/stellar"
-  }'
-```
-
-**Step 2: User sends payment via Stellar wallet**
-
-Sends exactly 100 XLM to the destination address with memo included.
-
-**Step 3: StellarGate detects and verifies transaction**
-
-Detects on-chain transaction within ~1-10 seconds (depends on network).
-
-**Step 4: Webhook delivered to your endpoint**
-
-```
-POST https://yourapp.com/webhooks/stellar
-Content-Type: application/json
-X-StellarGate-Timestamp: 1719072645
-X-StellarGate-Signature: 3f5e...
-X-StellarGate-Event: payment.completed
-
-{
-  "event": "payment.completed",
-  "payment_id": "550e8400-...",
-  "merchant_id": "my-shop",
-  "tx_hash": "abc123def456...",
-  "amount": "100.00",
-  "paid_amount": "100.00",
-  "asset": "XLM",
-  "status": "completed"
-}
-```
-
-**Step 5: Check delivery status (optional)**
-
-```bash
-curl http://localhost:3000/payments/550e8400-.../webhooks
-```
-
-Response shows all attempts and their status (delivered/failed/pending).
-
-**Step 6: If delivery failed, manually redeliver**
-
-```bash
-curl -X POST http://localhost:3000/payments/550e8400-.../webhooks/[delivery-id]/redeliver
-```
-
-### Handling Overpayment
-
-User sends 120 XLM instead of 100 XLM:
-
-```json
-{
-  "event": "payment.overpaid",
-  "payment_id": "550e8400-...",
-  "merchant_id": "my-shop",
-  "tx_hash": "abc123def456...",
-  "amount": "100.00",
-  "paid_amount": "120.00",
-  "asset": "XLM",
-  "status": "completed",
-  "delta": "20.00"
-}
-```
-
-Your app should track the `delta` and issue a refund to the sender for the excess.
-
-### Handling Underpayment (Top-up)
-
-User sends 70 XLM (shortfall of 30 XLM):
-
-```json
-{
-  "event": "payment.underpaid",
-  "payment_id": "550e8400-...",
-  "merchant_id": "my-shop",
-  "tx_hash": "abc123def456...",
-  "amount": "100.00",
-  "paid_amount": "70.00",
-  "asset": "XLM",
-  "status": "underpaid",
-  "delta": "30.00"
-}
-```
-
-The payment intent stays open and watchable. If user sends the remaining 30 XLM (or more) to the same address and memo, you'll receive:
-
-```json
-{
-  "event": "payment.completed",
-  "payment_id": "550e8400-...",
-  "merchant_id": "my-shop",
-  "tx_hash": "def456abc123...",  // Different on-chain transaction
-  "amount": "100.00",
-  "paid_amount": "100.00",  // Cumulative total
-  "asset": "XLM",
-  "status": "completed"
-}
-```
-
-### Handling Expiry
-
-No payment arrives before TTL (default 1 hour):
-
-```json
-{
-  "event": "payment.expired",
-  "payment_id": "550e8400-...",
-  "merchant_id": "my-shop",
-  "tx_hash": null,
-  "amount": "100.00",
-  "paid_amount": null,
-  "asset": "XLM",
-  "status": "expired"
-}
-```
-
-Payment intent is no longer watched. The user must create a new payment intent if they want to retry.
