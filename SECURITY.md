@@ -77,6 +77,33 @@ Out of scope:
 - Denial-of-service reports that rely purely on brute-force volume rather
   than a logic flaw.
 
+## Audit Logging
+
+Security-relevant actions emit a `tracing` event with `audit = true` so
+operators can build log alerts on a stable schema. Every audit event carries:
+
+| Field | Meaning |
+|---|---|
+| `audit` | Always `true`; use it to select audit records from other logs. |
+| `action` | Stable action name (see table below). |
+| `actor` | Who performed the action (e.g. `admin`, `merchant:<id>`). |
+| `outcome` | `success` or `failure`. |
+| `source_ip` | Caller's source address, derived via `client_ip_key_from_parts`. |
+| `request_id` | Caller's `x-request-id` (or a generated one) via `api::request_id()`. |
+| subject ids | Action-specific ids (e.g. `merchant_id`, `api_key_id`, `payment_id`). |
+
+Every admin action emits exactly one `audit = true` event carrying
+`source_ip` and `request_id`. The current `action` values are:
+
+| `action` | Handler | Subject ids |
+|---|---|---|
+| `merchant.provision` | `provision_merchant` | `merchant_id` |
+| `api_key.issue` | `issue_api_key` | `merchant_id`, `api_key_id` |
+| `api_key.list` | `list_api_keys` | `merchant_id` |
+| `api_key.revoke` | `revoke_api_key` | `merchant_id`, `api_key_id` |
+| `payment.create` | `payments::create` | `merchant_id`, `payment_id` |
+| `webhook.redeliver` | `payments::redeliver_webhook` | `payment_id` |
+
 ## Known Security Design Notes
 
 For context when triaging reports, StellarGate already implements:

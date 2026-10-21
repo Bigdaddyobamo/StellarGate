@@ -7,7 +7,10 @@
 
 # ── Stage 1: dependency cache via cargo-chef ─────────────────────────────────
 FROM rust:1.94-bookworm@sha256:6ae102bdbf528294bc79ad6e1fae682f6f7c2a6e6621506ba959f9685b308a55 AS chef
-RUN cargo install cargo-chef --locked
+# cargo-chef is pinned to an exact version so builds are reproducible and do
+# not silently pick up a newly published release. Bump deliberately.
+ARG CARGO_CHEF_VERSION=0.1.71
+RUN cargo install cargo-chef --locked --version "${CARGO_CHEF_VERSION}"
 WORKDIR /app
 
 FROM chef AS planner
@@ -24,7 +27,7 @@ RUN cargo build --release --locked
 # ── Stage 2: slim runtime image ───────────────────────────────────────────────
 FROM debian:bookworm-slim@sha256:3783cc01769c7b2b1b83a5c5ad96c815348e28ed7da68e2e3687004faa906251 AS runtime
 
-LABEL org.opencontainers.image.description="StellarGate payment gateway — runs as non-root uid 1001"
+LABEL org.opencontainers.image.description="Non-custodial payment gateway API for accepting and settling payments on the Stellar network"
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
