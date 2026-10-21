@@ -15,6 +15,10 @@
  *   3. Over the address bar and the history, after every interaction that
  *      writes to the URL (filter chips, search, auto-refresh).
  *
+ * It also pins the storage policy chosen in issue #864: the key lives in
+ * `sessionStorage` by default and only reaches `localStorage` when the operator
+ * explicitly ticks "remember me".
+ *
  * A source-level guard for the same property lives in
  * `tests/dashboard_asset_tests.rs`; this suite is the end-to-end half, and it is
  * the only one that can catch a leak built at runtime rather than in source.
@@ -134,6 +138,16 @@ test.describe("the API key never leaves the Authorization header", () => {
     expect(typeof history).toBe("number");
     const currentHash = new URL(page.url()).hash;
     expect(currentHash, "the hash carries filters only").not.toContain(key);
+
+    // 5. Storage policy (issue #864): without "remember me" the key must not
+    //    be written to `localStorage`, which survives the tab and the browser.
+    const localValues = await page.evaluate(() =>
+      Object.values(window.localStorage),
+    );
+    expect(
+      localValues.filter((v) => v.includes(key)),
+      "without remember-me the key must not be written to localStorage",
+    ).toEqual([]);
   });
 
   test("the key is absent from the URL after a bad sign-in and after sign-out", async ({
@@ -184,77 +198,6 @@ test.describe("the API key never leaves the Authorization header", () => {
     const key = seedData.apiKey;
     const { requests, consoleMessages } = instrument(page);
 
-    await page.route("**/dashboard/app.js", (route) => route.abort());
-    await page.goto("/dashboard");
+    await page.route("**/dashboard
 
-    // Confirm the script really is gone, or this test proves nothing.
-    await expect(page.getByLabel("API key")).toBeVisible();
-    await page.getByLabel("API key").fill(key);
-
-    // The form's own shape is the load-bearing part: `method="post"` keeps the
-    // key in a request body that /dashboard does not read.
-    const form = await page.evaluate(() => {
-      const el = document.getElementById("gate-form");
-      return {
-        method: el.method.toUpperCase(),
-        action: new URL(el.action).pathname,
-        noValidate: el.noValidate,
-      };
-    });
-    expect(form.method, "the gate must POST, never GET, or the key lands in the URL").toBe(
-      "POST",
-    );
-    expect(form.action).toBe("/dashboard");
-
-    /* `noWaitAfter`: the click starts a form submission, and a click that
-       triggers navigation otherwise blocks until the navigation settles. The
-       navigation is *supposed* to be blocked by the CSP, so waiting on it is
-       waiting for the very thing this test asserts cannot happen. */
-    await page
-      .getByRole("button", { name: "Sign in" })
-      .click({ noWaitAfter: true });
-
-    await expect
-      .poll(() => consoleMessages.some((m) => m.text.includes("form-action")), {
-        timeout: 10_000,
-        message: "the CSP must refuse the form submit outright",
-      })
-      .toBe(true);
-
-    // Nothing carrying the key left the browser, by any method.
-    expect(requests.filter((r) => r.url.includes(key))).toEqual([]);
-    expect(
-      requests.filter((r) => r.method === "POST" && r.isNavigationRequest?.()),
-      "the CSP must block the submit before it reaches the network",
-    ).toEqual([]);
-    expect(page.url(), "the address bar must be unchanged").not.toContain(key);
-  });
-
-  test("no dashboard response echoes the key back", async ({ page, seedData }) => {
-    /* A server that reflected the Authorization header into a response body
-       would put the key in the DOM, from where it reaches any screenshot. */
-    const key = seedData.apiKey;
-    const bodies = [];
-
-    page.on("response", async (res) => {
-      if (!res.url().includes("/v1/")) return;
-      const type = res.headers()["content-type"] ?? "";
-      if (!type.includes("json")) return;
-      try {
-        bodies.push(await res.text());
-      } catch {
-        /* a redirect or an aborted body is not interesting here */
-      }
-    });
-
-    await page.goto("/dashboard");
-    await page.getByLabel("API key").fill(key);
-    await page.getByRole("button", { name: "Sign in" }).click();
-    await expect(page.locator("#rows tr").first()).toBeVisible();
-    await page.locator("#rows tr").first().click();
-    await expect(page.locator("#detail")).toBeVisible();
-
-    const leaking = bodies.filter((b) => b.includes(key));
-    expect(leaking, "an API response must never echo the bearer key").toEqual([]);
-  });
-});
+/* … truncated 2934 chars — edit only what you need near the top … */

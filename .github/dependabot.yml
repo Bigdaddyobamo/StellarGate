@@ -53,10 +53,8 @@ updates:
         update-types:
           ["version-update:semver-major", "version-update:semver-minor"]
 
-  # The Playwright dashboard tests in e2e/ have their own committed lockfile.
-  # Without this entry Playwright and its transitive dependencies never get
-  # bumped and never get security PRs, and the browsers the tests run against
-  # drift behind what merchants use.
+  # End-to-end dashboard tests depend on Playwright in e2e/.
+  # Kept covered so security advisories surface and browser versions stay current.
   - package-ecosystem: npm
     directory: "/e2e"
     schedule:

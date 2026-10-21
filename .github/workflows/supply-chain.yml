@@ -16,15 +16,21 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # rustsec/audit-check ships a prebuilt binary and caches it, so this
-      # job no longer pays the ~60 s compile cost of `cargo install cargo-audit`.
-      #
+      # Install a prebuilt cargo-audit binary instead of compiling it with the
+      # repo's pinned 1.94 toolchain (rust-toolchain.toml). The latest
+      # cargo-audit pulls transitive deps (e.g. kstring 2.0.5) that require
+      # rustc 1.96, so `cargo install cargo-audit` fails on 1.94. A prebuilt
+      # binary is independent of the MSRV and avoids the ~60 s compile cost.
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
       # The weekly `schedule:` cron above re-runs this audit against a fresh
       # advisory DB, so a newly-published fix surfaces without a code change.
+      # The `ignore` list in .cargo/audit.toml stays consistent with deny.toml.
       - name: Run cargo audit
-        uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit
 
   deny:
     name: cargo deny (licenses + bans + sources + advisories)
@@ -59,19 +65,15 @@ jobs:
           fail-on-error: true
 
   npm-audit:
-    name: npm audit (e2e)
+    name: npm audit (e2e Playwright dependencies)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: "22"
 
-      # Audits the committed e2e/package-lock.json (Playwright and its
-      # transitive deps). `--audit-level=high` fails the job only on high or
-      # critical advisories, so low/moderate noise doesn't block CI. The
-      # weekly `schedule:` cron above re-runs this against a fresh advisory
-      # DB, surfacing newly-disclosed npm advisories without a code change.
       - name: Run npm audit
         run: npm audit --audit-level=high --prefix e2e

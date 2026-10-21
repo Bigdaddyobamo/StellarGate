@@ -192,6 +192,17 @@ async fn database_file_from_current_release_upgrades_cleanly() {
                 .await
                 .unwrap();
         }
+        // `payments.merchant_id` references `merchants(id)`, and the column
+        // defaults to 'anonymous', so the parent row has to exist before the
+        // payment can be inserted once foreign keys are enforced.
+        sqlx::query(
+            "INSERT INTO merchants (id, name, created_at, updated_at)
+             VALUES ('anonymous', 'anonymous', '2026-01-01T00:00:00Z',
+                     '2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         sqlx::query(
             "INSERT INTO payments
                 (id, destination_address, memo, amount, asset_issuer,
