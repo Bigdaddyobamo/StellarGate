@@ -49,6 +49,19 @@ Object.assign(process.env, {
   DATABASE_URL: `sqlite:${DB_FILE}`,
 });
 
+/**
+ * Visual-regression baselines (#826). Committed under `e2e/__screenshots__` so
+ * a CSS refactor that shifts the gate, table, drawer or empty states shows up
+ * as a diff in review. `maxDiffPixelRatio` is the threshold: a handful of
+ * anti-aliasing pixels across engines is tolerated, a layout shift is not.
+ * Regenerate with `npx playwright test --update-snapshots` and commit the
+ * result alongside the change that caused it.
+ */
+export const SNAPSHOT_DIR = join(here, "__screenshots__");
+export const MAX_DIFF_PIXEL_RATIO = Number(
+  process.env.E2E_MAX_DIFF_PIXEL_RATIO || 0.01,
+);
+
 export default defineConfig({
   testDir: join(here, "tests"),
   /* Serial, not parallel: every spec shares one seeded merchant and one webhook
@@ -66,7 +79,20 @@ export default defineConfig({
   retries: process.env.CI ? 1 : 0,
   /* A hung locator should fail the run, not stall CI until the job times out. */
   timeout: 30_000,
-  expect: { timeout: 10_000 },
+  expect: {
+    timeout: 10_000,
+    /* Visual comparisons fail the run when more than this fraction of pixels
+       differ, so a real layout change is red in CI rather than a silent pass. */
+    toHaveScreenshot: {
+      maxDiffPixelRatio: MAX_DIFF_PIXEL_RATIO,
+      /* Baselines are per-project (engine × width), so the path includes the
+         project name and the snapshot name only — no absolute paths, which
+         would make the committed baselines machine-specific. */
+      pathTemplate: `${SNAPSHOT_DIR}/{projectName}/{testFilePath}/{arg}{ext}`,
+      animations: "disabled",
+      caret: "hide",
+    },
+  },
   /* The GitHub reporter annotates the failing step inline, which is most of what
      makes a red run readable; `list` keeps the per-test lines. The HTML report
      is only written when something failed — on a green run it would be an empty

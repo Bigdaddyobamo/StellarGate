@@ -10,6 +10,13 @@
 //! narrow — a full spec-vs-router reflection check is a larger project
 //! (tracked separately) — but it means a field added to one side without the
 //! other fails `cargo test`, in CI, on every PR.
+//!
+//! It also checks the router → spec direction for the payments summary
+//! endpoint (issue #869): `GET /v1/payments/summary` is mounted in
+//! `src/api/mod.rs` but was missing from `openapi.yaml`, and the existing
+//! spec → router contract test couldn't notice. The list below mirrors the
+//! routes the router serves; every entry must appear as a path in the spec
+//! (or be explicitly marked internal).
 
 use std::collections::BTreeSet;
 
@@ -72,5 +79,54 @@ fn create_payment_request_spec_matches_struct_fields() {
         "openapi.yaml's CreatePaymentRequest properties must match \
          CreatePaymentRequest's fields in src/api/payments.rs field-for-field \
          — update whichever side is now out of date"
+    );
+}
+
+/// Every `(method, path)` the router serves, mirroring the `.route(...)` calls
+/// in `src/api/mod.rs`. Paths are the OpenAPI-style templates (e.g.
+/// `/v1/payments/{id}`), not the axum `:id` form. Entries marked `internal`
+/// (dashboard assets, health probes) are exempt from the spec check.
+const ROUTER_ROUTES: &[(&str, &str, bool)] = &[
+    ("get", "/v1/payments", false),
+    ("post", "/v1/payments", false),
+    ("get", "/v1/payments/{id}", false),
+    ("get", "/v1/payments/summary", false),
+    ("get", "/payments", false),
+    ("post", "/payments", false),
+    ("get", "/payments/{id}", false),
+    ("get", "/payments/summary", false),
+    ("get", "/health", true),
+    ("get", "/dashboard/{*path}", true),
+];
+
+#[test]
+fn every_router_route_is_documented_in_spec() {
+    let spec = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/openapi.yaml"))
+        .expect("openapi.yaml must be readable");
+
+    // Path keys under `paths:` sit at exactly two spaces of indentation
+    // (`  /v1/payments:`). Collect them so we can look up each router route.
+    let documented_paths: BTreeSet<&str> = spec
+        .lines()
+        .filter_map(|line| line.strip_prefix("  "))
+        .filter(|rest| !rest.starts_with(' ') && rest.starts_with('/'))
+        .filter_map(|rest| rest.split_once(':').map(|(path, _)| path))
+        .collect();
+
+    let mut missing = Vec::new();
+    for (method, path, internal) in ROUTER_ROUTES {
+        if *internal {
+            continue;
+        }
+        if !documented_paths.contains(path) {
+            missing.push(format!("{method} {path}"));
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "openapi.yaml is missing paths for router routes: {missing:?} — \
+         document them in openapi.yaml (or mark them internal in \
+         ROUTER_ROUTES if they are not part of the public API)"
     );
 }

@@ -16,6 +16,15 @@ Closes #
 - [ ] `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` pass
 - [ ] New behaviour is covered by a test that fails without this change
 
+## Changelog
+
+<!-- Every PR that touches `src/` must update the `## [Unreleased]` section
+     of CHANGELOG.md. Describe only behaviour that is actually on `main`.
+     If no changelog entry is warranted, add the `no-changelog` label and
+     say why below. -->
+
+- [ ] `CHANGELOG.md` `## [Unreleased]` updated (or `no-changelog` label applied)
+
 ## Risk
 
 <!-- Delete any that do not apply. -->
