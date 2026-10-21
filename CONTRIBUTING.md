@@ -104,6 +104,31 @@ workflow (`cargo audit` via `cargo-deny`) to run in CI — check `deny.toml` if
 you're adding a new dependency with a license or advisory it doesn't already
 allow.
 
+## Code Coverage
+
+CI measures test coverage on every run with
+[`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) and uploads the
+LCOV report as a build artifact and to Codecov, so the report is reachable
+from the pull request. Coverage is **report-only** — there is no absolute
+threshold gate. Instead, Codecov flags a regression when a PR drops coverage
+relative to the recorded baseline, so a change that leaves new paths
+unexercised is visible in review without encouraging tests written purely for
+the metric.
+
+To produce the same report locally:
+
+```bash
+cargo install cargo-llvm-cov --locked
+cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
+```
+
+For a human-readable summary instead of LCOV, run
+`cargo llvm-cov --locked --all-features --summary-only`, or open an HTML
+report with `cargo llvm-cov --locked --all-features --html --open`. Use the
+report to see which paths your change leaves unexercised — especially in
+security-sensitive areas like the SSRF guard, webhook delivery, and
+retention error handling.
+
 ## Toolchain & CI Policy
 
 Blocking CI jobs (like formatting and clippy) are strictly tied to our pinned MSRV (1.94) as defined in `rust-toolchain.toml`. This ensures that your local `cargo clippy` and `cargo fmt` results perfectly match CI. An advisory lint job runs on the latest stable toolchain to catch upcoming lints, but it is set to `continue-on-error: true` and will not block your pull request.

@@ -645,8 +645,6 @@ pub struct RedeliverQuery {
 /// One delivery as the API exposes it. The stored `payload` is deliberately
 /// omitted — it is the signed event body, it can be large, and a listing is for
 /// triage rather than replay.
-// Kept for the delivery-detail response; not yet referenced by a handler.
-#[allow(dead_code)]
 fn delivery_to_json(d: &db::WebhookDelivery) -> Value {
     json!({
         "id": d.id,
