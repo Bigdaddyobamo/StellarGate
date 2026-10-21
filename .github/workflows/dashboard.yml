@@ -13,6 +13,8 @@ on:
       - "e2e/**"
       - "src/**"
       - "scripts/check-dashboard-a11y.mjs"
+      - ".prettierrc.json"
+      - ".prettierignore"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -24,6 +26,8 @@ on:
       - "e2e/**"
       - "src/**"
       - "scripts/check-dashboard-a11y.mjs"
+      - ".prettierrc.json"
+      - ".prettierignore"
       - "Cargo.toml"
       - "Cargo.lock"
       - "rust-toolchain.toml"
@@ -54,6 +58,35 @@ jobs:
           for f in scripts/*.mjs; do
             node --check "$f"
           done
+
+      # `node --check` validates syntax only, not import bindings, so a missing
+      # export in `format.js` (issue #862) slips past it and only surfaces in
+      # the browser as a module-linking SyntaxError. Actually link the module
+      # graph here with a minimal DOM shim so CI fails on any
+      # `import { x } from "./y.js"` that refers to a missing export.
+      - name: Link the dashboard module graph
+        run: |
+          node --input-type=module -e '
+            const noop = () => {};
+            const el = () => ({
+              addEventListener: noop, removeEventListener: noop,
+              appendChild: noop, removeChild: noop, setAttribute: noop,
+              getAttribute: () => null, querySelector: () => null,
+              querySelectorAll: () => [], classList: { add: noop, remove: noop, toggle: noop },
+              style: {}, dataset: {}, textContent: "", innerHTML: "",
+            });
+            globalThis.window = globalThis;
+            globalThis.document = {
+              addEventListener: noop, removeEventListener: noop,
+              querySelector: () => null, querySelectorAll: () => [],
+              getElementById: () => null, createElement: el,
+              body: el(), documentElement: el(),
+            };
+            globalThis.localStorage = { getItem: () => null, setItem: noop, removeItem: noop };
+            globalThis.location = { href: "http://localhost/", pathname: "/dashboard", search: "" };
+            globalThis.fetch = () => Promise.reject(new Error("no network in link check"));
+            await import("./static/dashboard.js");
+          '
 
       - name: Accessibility smoke check
         run: node scripts/check-dashboard-a11y.mjs
