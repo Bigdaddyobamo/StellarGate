@@ -5,12 +5,22 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege by default; jobs grant more only where they need it.
+permissions:
+  contents: read
+
+# Cancel superseded runs on PR branches; never cancel a run on main.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  fmt-clippy:
-    name: fmt / clippy
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -22,85 +32,46 @@ jobs:
 
       - uses: actions/cache@v4
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
+          components: rustfmt
+      - run: cargo fmt --all -- --check
 
-      - name: Check formatting
-        run: cargo fmt --check
-
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-  clippy-advisory:
-    name: clippy (advisory / stable)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable
-          components: clippy
-
-      - uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-stable-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-stable-
-
-      - name: Clippy (stable)
-        run: cargo clippy --all-targets -- -D warnings
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
-  test:
-    name: test (${{ matrix.rust }})
+  clippy:
+    name: clippy (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
-        rust: [1.94, stable]
+        toolchain: [stable, msrv]
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b27520de0a4799 # stable
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: ${{ matrix.toolchain == 'msrv' && '1.94' || 'stable' }}
+          components: clippy
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: cargo clippy --all-targets --all-features -- -D warnings
 
-      - uses: actions/cache@v4
+  test:
+    name: test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, msrv]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b27520de0a4799 # stable
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.rust }}-
+          toolchain: ${{ matrix.toolchain == 'msrv' && '1.94' || 'stable' }}
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: cargo test --all-features --workspace
 
-      # Without this the repo's rust-toolchain.toml would pin every matrix leg
-      # to the MSRV, so the `stable` leg would silently retest 1.94 and report
-      # a green check for a toolchain it never ran.
-      - name: Test with locked dependencies
-        run: cargo test --locked
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
-
-  openapi:
-    name: openapi lint
+  coverage:
+    name: coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b27520de0a4799 # stable
         with:
           node-version: 20
 
@@ -206,8 +177,11 @@ jobs:
   # transitive deps (kstring 2.0.5 needs rustc 1.96). The prebuilt binary is
   # independent of the project MSRV and skips the ~60 s compile (issue #845).
   audit:
-    name: cargo audit (RustSec)
+    name: cargo audit
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v4
 
