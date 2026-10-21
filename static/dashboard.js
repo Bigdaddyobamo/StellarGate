@@ -16,6 +16,8 @@
   var PAGE_SIZE = 25;
   var KEY_NAME = "stellargate.apiKey";
 
+  var t = window.I18N.t;
+
   var state = {
     key: null,
     status: "",
@@ -100,7 +102,7 @@
     return fetch(path, { method: opts.method || "GET", headers: headers }).then(
       function (res) {
         if (res.status === 401) {
-          signOut("That API key was rejected. Please sign in again.");
+          signOut(t("error.rejected"));
           throw new Error("unauthorized");
         }
         return res
@@ -110,7 +112,7 @@
           })
           .then(function (body) {
             if (!res.ok) {
-              throw new Error(body.error || "Request failed (" + res.status + ")");
+              throw new Error(body.error || t("error.requestFailed", { status: res.status }));
             }
             return body;
           });
@@ -263,20 +265,20 @@
     api("/payments/" + encodeURIComponent(id))
       .then(function (p) {
         [
-          ["Status", p.status],
-          ["Amount", p.amount + " " + p.asset],
-          ["Received", p.paid_amount ? p.paid_amount + " " + p.asset : "—"],
-          ["Memo", p.memo],
-          ["Destination", p.destination_address],
-          ["Transaction", p.tx_hash || "—"],
-          ["Payment ID", p.id],
-          ["Merchant", p.merchant_id],
-          ["Created", fmtTime(p.created_at)],
-          ["Updated", fmtTime(p.updated_at)],
-          ["Expires", fmtTime(p.expires_at)],
+          [t("field.status"), p.status, true],
+          [t("field.amount"), p.amount + " " + p.asset],
+          [t("field.received"), p.paid_amount ? p.paid_amount + " " + p.asset : "—"],
+          [t("field.memo"), p.memo],
+          [t("field.destination"), p.destination_address],
+          [t("field.transaction"), p.tx_hash || "—"],
+          [t("field.paymentId"), p.id],
+          [t("field.merchant"), p.merchant_id],
+          [t("field.created"), fmtTime(p.created_at)],
+          [t("field.updated"), fmtTime(p.updated_at)],
+          [t("field.expires"), fmtTime(p.expires_at)],
         ].forEach(function (pair) {
           fields.appendChild(el("dt", null, pair[0]));
-          if (pair[0] === "Status") {
+          if (pair[2]) {
             var dd = document.createElement("dd");
             dd.appendChild(el("span", pillClass(p.status), p.status));
             fields.appendChild(dd);
@@ -316,7 +318,7 @@
     var li = el("li", "delivery");
 
     var head = el("div", "delivery-head");
-    head.appendChild(el("strong", null, d.event || "webhook"));
+    head.appendChild(el("strong", null, d.event || t("delivery.webhook")));
     head.appendChild(el("span", pillClass(d.status), d.status));
     li.appendChild(head);
 
@@ -325,14 +327,17 @@
       el(
         "div",
         "delivery-meta",
-        "attempt " + d.attempts + " · last " + fmtTime(d.last_attempt)
+        t("delivery.meta", {
+          attempts: d.attempts,
+          last: fmtTime(d.last_attempt),
+        })
       )
     );
 
-    var button = el("button", "ghost", "Redeliver");
+    var button = el("button", "ghost", t("delivery.redeliver"));
     button.addEventListener("click", function () {
       button.disabled = true;
-      button.textContent = "Sending…";
+      button.textContent = t("delivery.sending");
       api(
         "/payments/" +
           encodeURIComponent(paymentId) +
@@ -346,7 +351,7 @@
         })
         .catch(function (err) {
           button.disabled = false;
-          button.textContent = "Redeliver";
+          button.textContent = t("delivery.redeliver");
           if (err.message !== "unauthorized") {
             setError($("deliveries-error"), err.message);
           }
@@ -391,18 +396,40 @@
       .then(function (r) {
         var pill = $("health");
         pill.className = r.ok ? "pill pill-ok" : "pill pill-err";
-        pill.textContent = r.ok ? "healthy" : r.body.reason || "unavailable";
+        pill.textContent = r.ok ? t("health.healthy") : r.body.reason || t("health.unavailable");
       })
       .catch(function () {
         var pill = $("health");
         pill.className = "pill pill-err";
-        pill.textContent = "unreachable";
+        pill.textContent = t("health.unreachable");
       });
   }
 
   // ── Wiring ────────────────────────────────────────────────────────────
 
+  // ── Language ──────────────────────────────────────────────────────────
+
+  function initLanguage() {
+    var select = $("language");
+    Object.keys(window.I18N.catalogs).forEach(function (code) {
+      var option = el("option", null, window.I18N.names[code] || code);
+      option.value = code;
+      select.appendChild(option);
+    });
+    select.value = window.I18N.locale();
+    window.I18N.apply();
+    select.addEventListener("change", function () {
+      window.I18N.setLocale(select.value);
+      if (state.key) {
+        pollHealth();
+        reload();
+      }
+    });
+  }
+
   function init() {
+    initLanguage();
+
     $("gate-form").addEventListener("submit", function (ev) {
       ev.preventDefault();
       var key = $("api-key").value.trim();
@@ -459,7 +486,7 @@
            login page — must land there too. Swallowing it would leave both
            panels hidden and render a blank page with no way forward. */
         if (err.message !== "unauthorized") {
-          showGate("Could not restore your session: " + err.message);
+          showGate(t("error.restore", { message: err.message }));
         }
       });
     }

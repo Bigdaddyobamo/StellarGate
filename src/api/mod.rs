@@ -164,6 +164,7 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         .route("/dashboard", get(dashboard_html))
         .route("/dashboard/app.css", get(dashboard_css))
         .route("/dashboard/app.js", get(dashboard_js))
+        .route("/dashboard/i18n.js", get(dashboard_i18n))
         /* The versioned API surface, mounted twice.
         `/v1` is canonical. The same routes stay mounted unprefixed so every
         existing integrator keeps working — shipping versioning by breaking all
@@ -1376,6 +1377,7 @@ for the two to drift apart. */
 const DASHBOARD_HTML: &str = include_str!("../../static/dashboard.html");
 const DASHBOARD_CSS: &str = include_str!("../../static/dashboard.css");
 const DASHBOARD_JS: &str = include_str!("../../static/dashboard.js");
+const DASHBOARD_I18N: &str = include_str!("../../static/i18n.js");
 
 /// Locks the dashboard to its own origin: no third-party script, style, frame
 /// or connection. The page ships no inline script or style, so this needs no
@@ -1417,6 +1419,10 @@ async fn dashboard_css() -> impl IntoResponse {
 
 async fn dashboard_js() -> impl IntoResponse {
     dashboard_asset(DASHBOARD_JS, "text/javascript; charset=utf-8")
+}
+
+async fn dashboard_i18n() -> impl IntoResponse {
+    dashboard_asset(DASHBOARD_I18N, "text/javascript; charset=utf-8")
 }
 
 async fn not_found() -> impl IntoResponse {

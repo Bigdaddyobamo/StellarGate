@@ -248,7 +248,7 @@ main {
 
 .payments th,
 .payments td {
-  text-align: left;
+  text-align: start;
   padding: 0.65rem 0.9rem;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
@@ -312,11 +312,11 @@ main {
 .detail {
   position: fixed;
   top: 0;
-  right: 0;
+  inset-inline-end: 0;
   bottom: 0;
   width: min(460px, 100%);
   background: var(--surface);
-  border-left: 1px solid var(--border);
+  border-inline-start: 1px solid var(--border);
   padding: 1.25rem;
   overflow-y: auto;
   z-index: 5;
@@ -393,11 +393,11 @@ main {
   }
 }
 
-/* Skip link: hidden off-screen until focused, then pinned top-left. */
+/* Skip link: hidden off-screen until focused, then pinned top inline-start. */
 .skip-link {
   position: absolute;
   top: 8px;
-  left: 8px;
+  inset-inline-start: 8px;
   z-index: 100;
   padding: 8px 12px;
   border-radius: var(--radius);
@@ -416,4 +416,13 @@ main {
 
 #payments:focus {
   outline: none;
+}
+
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
 }

@@ -23,23 +23,24 @@
            in a request body that this route answers with 405. -->
       <form id="gate-form" class="card gate-card" method="post" autocomplete="off">
         <h1>StellarGate</h1>
-        <p class="muted">Sign in with a merchant API key to view payments.</p>
-        <label for="api-key">API key</label>
+        <p class="muted" data-i18n="gate.intro">Sign in with a merchant API key to view payments.</p>
+        <label for="api-key" data-i18n="gate.apiKey">API key</label>
         <input
           id="api-key"
           name="api-key"
           type="password"
           placeholder="merchant API key"
+          data-i18n-placeholder="gate.apiKeyPlaceholder"
           spellcheck="false"
           required
         />
         <label class="checkbox">
           <input id="remember" type="checkbox" />
-          <span>Keep me signed in on this device</span>
+          <span data-i18n="gate.remember">Keep me signed in on this device</span>
         </label>
-        <button type="submit" class="primary">Sign in</button>
+        <button type="submit" class="primary" data-i18n="gate.signIn">Sign in</button>
         <p id="gate-error" class="error" hidden></p>
-        <p class="muted small">
+        <p class="muted small" data-i18n="gate.notice">
           The key is held in your browser only and sent as a bearer token
           directly to this gateway. It is never stored on the server.
         </p>
@@ -48,7 +49,7 @@
 
     <!-- Main application. -->
     <div id="app" hidden>
-      <a class="skip-link" href="#payments">Skip to payments</a>
+      <a class="skip-link" href="#payments" data-i18n="nav.skip">Skip to payments</a>
       <header class="topbar">
         <div class="brand">
           <span class="star">&#9733;</span>
@@ -56,56 +57,61 @@
           <span class="muted small" id="version"></span>
         </div>
         <div class="topbar-right">
-          <span id="health" class="pill pill-idle" title="Gateway health">
+          <span id="health" class="pill pill-idle" title="Gateway health"
+            data-i18n="health.checking" data-i18n-title="health.title">
             checking&hellip;
           </span>
-          <button id="sign-out" class="ghost">Sign out</button>
+          <label class="visually-hidden" for="language" data-i18n="nav.language">Language</label>
+          <select id="language" class="ghost" data-i18n-title="nav.language"></select>
+          <button id="sign-out" class="ghost" data-i18n="nav.signOut">Sign out</button>
         </div>
       </header>
 
       <main>
         <section class="toolbar">
-          <div class="filters" role="group" aria-label="Filter by status">
-            <button class="chip chip-on" data-status="">All</button>
-            <button class="chip" data-status="pending">Pending</button>
-            <button class="chip" data-status="completed">Completed</button>
-            <button class="chip" data-status="underpaid">Underpaid</button>
-            <button class="chip" data-status="expired">Expired</button>
+          <div class="filters" role="group" aria-label="Filter by status"
+            data-i18n-aria-label="filter.label">
+            <button class="chip chip-on" data-status="" data-i18n="filter.all">All</button>
+            <button class="chip" data-status="pending" data-i18n="filter.pending">Pending</button>
+            <button class="chip" data-status="completed" data-i18n="filter.completed">Completed</button>
+            <button class="chip" data-status="underpaid" data-i18n="filter.underpaid">Underpaid</button>
+            <button class="chip" data-status="expired" data-i18n="filter.expired">Expired</button>
           </div>
-          <button id="refresh" class="ghost">Refresh</button>
+          <button id="refresh" class="ghost" data-i18n="list.refresh">Refresh</button>
         </section>
 
         <section class="card">
           <table id="payments" class="payments" tabindex="-1">
             <thead>
               <tr>
-                <th>Status</th>
-                <th>Amount</th>
-                <th>Memo</th>
-                <th>Created</th>
-                <th>Payment ID</th>
+                <th data-i18n="field.status">Status</th>
+                <th data-i18n="field.amount">Amount</th>
+                <th data-i18n="field.memo">Memo</th>
+                <th data-i18n="field.created">Created</th>
+                <th data-i18n="field.paymentId">Payment ID</th>
               </tr>
             </thead>
             <tbody id="rows"></tbody>
           </table>
-          <p id="empty" class="empty" hidden>No payments match this filter.</p>
+          <p id="empty" class="empty" hidden data-i18n="list.empty">No payments match this filter.</p>
           <p id="list-error" class="error" hidden></p>
           <div class="table-foot">
-            <button id="load-more" class="ghost" hidden>Load more</button>
+            <button id="load-more" class="ghost" hidden data-i18n="list.loadMore">Load more</button>
           </div>
         </section>
       </main>
 
       <!-- Detail panel, opened by clicking a row. -->
-      <aside id="detail" class="detail" hidden aria-label="Payment detail">
+      <aside id="detail" class="detail" hidden aria-label="Payment detail"
+        data-i18n-aria-label="detail.label">
         <div class="detail-head">
-          <h2>Payment</h2>
-          <button id="detail-close" class="ghost" aria-label="Close">&times;</button>
+          <h2 data-i18n="detail.title">Payment</h2>
+          <button id="detail-close" class="ghost" aria-label="Close" data-i18n-aria-label="detail.close">&times;</button>
         </div>
         <dl id="detail-fields" class="fields"></dl>
 
-        <h3>Webhook deliveries</h3>
-        <p id="deliveries-empty" class="muted small" hidden>
+        <h3 data-i18n="detail.deliveries">Webhook deliveries</h3>
+        <p id="deliveries-empty" class="muted small" hidden data-i18n="detail.noDeliveries">
           No delivery attempts recorded for this payment.
         </p>
         <p id="deliveries-error" class="error" hidden></p>
@@ -114,6 +120,7 @@
       <div id="scrim" class="scrim" hidden></div>
     </div>
 
+    <script src="/dashboard/i18n.js"></script>
     <script src="/dashboard/app.js"></script>
   </body>
 </html>
