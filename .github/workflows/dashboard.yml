@@ -47,10 +47,15 @@ jobs:
 
       # Every module plus the entry point: `node --check` only parses, so this
       # catches a syntax error before the tests try to import the file.
+      # `scripts/` is included too: a duplicate declaration there aborted the
+      # accessibility check at parse time before any assertion ran (#846).
       - name: JavaScript syntax check
         run: |
           node --check static/dashboard.js
           for f in static/format.js static/session.js static/state.js static/keys.js; do
+            node --check "$f"
+          done
+          for f in scripts/*.mjs; do
             node --check "$f"
           done
 
