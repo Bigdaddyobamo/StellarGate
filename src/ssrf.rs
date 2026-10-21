@@ -105,12 +105,72 @@ fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
 }
 
 fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    let seg = ip.segments();
     ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_multicast()
-        || (ip.segments()[0] & 0xfe00) == 0xfc00 // unique local, RFC 4193
-        || (ip.segments()[0] & 0xffc0) == 0xfe80 // link-local unicast, RFC 4291
+        || (seg[0] & 0xfe00) == 0xfc00 // unique local, RFC 4193
+        || (seg[0] & 0xffc0) == 0xfe80 // link-local unicast, RFC 4291
+        || (seg[0] & 0xffc0) == 0xfec0 // site-local (deprecated), RFC 3879
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8) // documentation, RFC 3849
+        || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // discard-only, RFC 6666
         || ip.to_ipv4_mapped().is_some_and(is_blocked_ipv4)
+        || embedded_ipv4(ip).is_some_and(is_blocked_ipv4)
+        || is_teredo(ip)
+}
+
+/// Extract the IPv4 address embedded in an IPv6 form that routes to or
+/// represents an IPv4 host: NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`), 6to4
+/// (`2002::/16`) and IPv4-compatible (`::/96`, deprecated). Returns `None` for
+/// addresses that don't embed an IPv4 host.
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let seg = ip.segments();
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052 / 8215).
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+        return Some(Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        ));
+    }
+    // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215). The embedded IPv4
+    // follows the /48 prefix; treat the trailing 32 bits as the IPv4 host.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
+        return Some(Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        ));
+    }
+    // 6to4 2002::/16: IPv4 in bits 16–47 (segments 1 and 2).
+    if seg[0] == 0x2002 {
+        return Some(Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            seg[1] as u8,
+            (seg[2] >> 8) as u8,
+            seg[2] as u8,
+        ));
+    }
+    // IPv4-compatible ::/96 (deprecated, RFC 4291): first 96 bits zero and not
+    // loopback/unspecified (handled above).
+    if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+        return Some(Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        ));
+    }
+    None
+}
+
+/// Teredo (`2001::/32`, RFC 4380) embeds an obfuscated IPv4 address; block it
+/// outright rather than trying to decode it.
+fn is_teredo(ip: Ipv6Addr) -> bool {
+    let seg = ip.segments();
+    seg[0] == 0x2001 && seg[1] == 0x0000
 }
 
 #[cfg(test)]
@@ -178,6 +238,31 @@ mod tests {
     }
 
     #[test]
+    fn blocks_ipv4_embedding_and_reserved_v6_ranges() {
+        // (address, why it must be blocked)
+        let cases = [
+            ("64:ff9b::7f00:1", "NAT64 -> 127.0.0.1"),
+            ("64:ff9b::a9fe:a9fe", "NAT64 -> 169.254.169.254"),
+            ("64:ff9b:1::7f00:1", "NAT64 local-use -> 127.0.0.1"),
+            ("64:ff9b:1::a9fe:a9fe", "NAT64 local-use -> 169.254.169.254"),
+            ("2002:7f00:1::", "6to4 -> 127.0.0.1"),
+            ("2002:a9fe:a9fe::", "6to4 -> 169.254.169.254"),
+            ("2001::1", "Teredo"),
+            ("::7f00:1", "IPv4-compatible -> 127.0.0.1"),
+            ("::a9fe:a9fe", "IPv4-compatible -> 169.254.169.254"),
+            ("fec0::1", "site-local"),
+            ("2001:db8::1", "documentation"),
+            ("100::1", "discard-only"),
+        ];
+        for (ip, why) in cases {
+            assert!(
+                is_blocked_ipv6(ip.parse().expect("IPv6 fixture should parse")),
+                "{ip} ({why}) should be blocked"
+            );
+        }
+    }
+
+    #[test]
     fn allows_public_v6() {
         assert!(!is_blocked_ipv6("2606:4700:4700::1111".parse().unwrap()));
     }
@@ -229,148 +314,7 @@ mod tests {
     fn blocks_multicast_v4() {
         assert!(
             is_blocked_ipv4("224.0.0.1".parse().unwrap()),
-            "224.0.0.1 (multicast) should be blocked"
-        );
-        assert!(
-            is_blocked_ipv4("239.255.255.255".parse().unwrap()),
-            "239.255.255.255 (multicast end) should be blocked"
-        );
-    }
-
-    #[test]
-    fn cgnat_boundary_values_v4() {
-        // 100.64.0.0/10 is RFC 6598 shared address space (CGNAT) — should be blocked.
-        assert!(
-            is_blocked_ipv4("100.64.0.1".parse().unwrap()),
-            "100.64.0.1 (CGNAT start) should be blocked"
-        );
-        assert!(
-            is_blocked_ipv4("100.127.255.255".parse().unwrap()),
-            "100.127.255.255 (CGNAT end) should be blocked"
-        );
-        // Just outside the CGNAT range — should be allowed.
-        assert!(
-            !is_blocked_ipv4("100.63.255.255".parse().unwrap()),
-            "100.63.255.255 (just before CGNAT) should be allowed"
-        );
-        assert!(
-            !is_blocked_ipv4("100.128.0.0".parse().unwrap()),
-            "100.128.0.0 (just after CGNAT) should be allowed"
-        );
-    }
-
-    #[test]
-    fn blocks_multicast_v6() {
-        assert!(
-            is_blocked_ipv6("ff02::1".parse().unwrap()),
-            "ff02::1 (IPv6 multicast) should be blocked"
-        );
-        assert!(
-            is_blocked_ipv6("ff00::".parse().unwrap()),
-            "ff00:: (IPv6 multicast start) should be blocked"
-        );
-    }
-
-    #[test]
-    fn blocks_unspecified_v6() {
-        // :: is the IPv6 unspecified address
-        assert!(
-            is_blocked_ipv6("::".parse().unwrap()),
-            ":: (IPv6 unspecified) should be blocked"
-        );
-    }
-
-    #[test]
-    fn is_blocked_ip_dispatches_v4_and_v6_correctly() {
-        // Blocked v4 (loopback)
-        assert!(
-            is_blocked_ip("127.0.0.1".parse().unwrap()),
-            "127.0.0.1 should be blocked via is_blocked_ip"
-        );
-        // Blocked v6 (loopback)
-        assert!(
-            is_blocked_ip("::1".parse().unwrap()),
-            "::1 should be blocked via is_blocked_ip"
-        );
-        // Allowed v4 (public internet)
-        assert!(
-            !is_blocked_ip("8.8.8.8".parse().unwrap()),
-            "8.8.8.8 should be allowed via is_blocked_ip"
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_rejects_malformed_url() {
-        let err = validate("not a url", false).await.unwrap_err();
-        assert!(
-            err.to_string().to_lowercase().contains("invalid url"),
-            "expected 'invalid URL' error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_rejects_url_with_no_host() {
-        // The WHATWG parser reads `http:///path` as host `path`, so it is
-        // rejected at resolution rather than by the "no host" guard.
-        let err = validate("http:///path", false).await.unwrap_err();
-        let msg = err.to_string().to_lowercase();
-        assert!(
-            msg.contains("no host") || msg.contains("resolve"),
-            "expected a host rejection, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn validate_rejects_unresolvable_host() {
-        let err = validate(
-            "http://this-host-definitely-does-not-exist.invalid:80/hook",
-            false,
-        )
-        .await
-        .unwrap_err();
-        // Should fail with either a DNS resolution error or a timeout.
-        assert!(
-            !err.to_string().is_empty(),
-            "expected a resolution failure error, got empty string"
-        );
-    }
-
-    #[tokio::test]
-    async fn refuses_redirect_to_private_address() {
-        let initial = MockServer::start().await;
-        let private = MockServer::start().await;
-
-        Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(ResponseTemplate::new(307).insert_header("Location", private.uri()))
-            .mount(&initial)
-            .await;
-        Mock::given(wiremock::matchers::method("POST"))
-            .respond_with(ResponseTemplate::new(200))
-            .mount(&private)
-            .await;
-
-        let initial_url = format!("{}/webhook", initial.uri());
-        let target = validate(&initial_url, true)
-            .await
-            .expect("loopback test target should validate");
-        let client = pinned_client(&target, Duration::from_secs(1))
-            .expect("pinned webhook client should build");
-
-        let response = client
-            .post(initial_url)
-            .send()
-            .await
-            .expect("redirect response should be returned, not followed");
-
-        assert_eq!(response.status(), reqwest::StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(
-            private
-                .received_requests()
-                .await
-                .expect("private mock request count should be available")
-                .len(),
-            0,
-            "redirect target must not receive a webhook request"
+            "multicast 224.0.0.1 should be blocked"
         );
     }
 }

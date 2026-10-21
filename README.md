@@ -1730,5 +1730,8 @@ Released under the [MIT License](LICENSE).
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
 
-<!-- handsoff-issue-849 -->
-- #849: [Tracking] Commit 9263a8e reverted ~12,900 lines of previously merged fixes — audit and restore
+<!-- handsoff-issue-285 -->
+- #285: No tracing spans carry `merchant_id` or `payment_id` through the settlement path
+
+<!-- handsoff-issue-301 -->
+- #301: `settle()` awaits webhook delivery inline, so one slow receiver stalls settlement for every other intent
