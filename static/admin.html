@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>StellarGate Admin</title>
+    <link rel="stylesheet" href="/dashboard/app.css" />
+  </head>
+  <body>
+    <section id="admin-gate" class="gate">
+      <form id="admin-form" class="card gate-card" method="post" autocomplete="off">
+        <div class="gate-head">
+          <h1>StellarGate Admin</h1>
+        </div>
+        <p class="muted">Sign in with the admin secret to manage merchant API keys.</p>
+        <label for="admin-secret">Admin secret</label>
+        <input
+          id="admin-secret"
+          name="admin-secret"
+          type="password"
+          placeholder="admin secret"
+          spellcheck="false"
+          required
+        />
+        <button type="submit" class="primary">Open admin tools</button>
+        <p id="admin-error" class="error" role="alert" hidden></p>
+      </form>
+    </section>
+
+    <section id="admin-app" hidden>
+      <header class="topbar">
+        <div class="brand">
+          <span class="star">&#9733;</span>
+          <strong>StellarGate Admin</strong>
+        </div>
+        <div class="topbar-right">
+          <button id="admin-sign-out" class="ghost" type="button">Sign out</button>
+        </div>
+      </header>
+      <main>
+        <section class="card">
+          <h2>Merchant API keys</h2>
+          <form id="merchant-form" autocomplete="off">
+            <label for="merchant-id">Merchant ID</label>
+            <input id="merchant-id" name="merchant-id" placeholder="merchant ID" required />
+            <button type="submit" class="primary">List keys</button>
+          </form>
+          <p id="admin-status" class="muted small">No merchant selected.</p>
+          <form id="issue-form" autocomplete="off" hidden>
+            <label for="key-label">New key label (optional)</label>
+            <input id="key-label" maxlength="100" />
+            <button type="submit" class="primary">Issue key</button>
+          </form>
+          <p id="new-key" class="mono" hidden></p>
+          <button id="hide-key" type="button" hidden>Hide issued key</button>
+          <ul id="admin-output" class="deliveries" aria-live="polite"></ul>
+        </section>
+      </main>
+    </section>
+
+    <script type="module" src="/dashboard/admin.js"></script>
+  </body>
+</html>

@@ -91,10 +91,13 @@ const DASHBOARD_STATE_JS: &str = include_str!("../static/state.js");
 /// router actually serves. Add a new module here the moment it is created so
 /// the check stays exhaustive.
 const MODULES: &[(&str, &str)] = &[
-    ("/dashboard/format.js",  include_str!("../static/format.js")),
-    ("/dashboard/session.js", include_str!("../static/session.js")),
-    ("/dashboard/state.js",   include_str!("../static/state.js")),
-    ("/dashboard/keys.js",    include_str!("../static/keys.js")),
+    ("/dashboard/format.js", include_str!("../static/format.js")),
+    (
+        "/dashboard/session.js",
+        include_str!("../static/session.js"),
+    ),
+    ("/dashboard/state.js", include_str!("../static/state.js")),
+    ("/dashboard/keys.js", include_str!("../static/keys.js")),
 ];
 
 /// Every `/dashboard/…` path the router actually serves.
@@ -803,6 +806,16 @@ async fn dashboard_assets_keep_content_type_and_csp() {
 
     let mut assets: Vec<(&str, &str, &str)> = vec![
         ("/dashboard", "text/html; charset=utf-8", DASHBOARD_HTML),
+        (
+            "/dashboard/admin",
+            "text/html; charset=utf-8",
+            include_str!("../static/admin.html"),
+        ),
+        (
+            "/dashboard/admin.js",
+            "text/javascript; charset=utf-8",
+            include_str!("../static/admin.js"),
+        ),
         (
             "/dashboard/app.css",
             "text/css; charset=utf-8",
