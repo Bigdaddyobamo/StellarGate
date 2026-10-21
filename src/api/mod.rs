@@ -868,8 +868,6 @@ pub(crate) fn retry_after_secs(wait: Duration) -> u64 {
 ///
 /// Formula: `max(cells_missing × period_per_cell, next_wait)`, rounded up.
 /// Returns 0 when the bucket is already full (`remaining == burst`).
-// Only exercised by unit tests until the `X-RateLimit-Reset` header is wired up.
-#[allow(dead_code)]
 pub(crate) fn reset_secs(quota: governor::Quota, remaining: u32, next_wait: Duration) -> u64 {
     let missing = quota.burst_size().get().saturating_sub(remaining);
     let refill = quota.replenish_interval().saturating_mul(missing);
