@@ -224,7 +224,6 @@
 
   function appendRow(p) {
     var tr = document.createElement("tr");
-    tr.tabIndex = 0;
 
     var statusCell = document.createElement("td");
     statusCell.appendChild(el("span", pillClass(p.status), p.status));
@@ -233,16 +232,17 @@
     tr.appendChild(el("td", null, p.amount + " " + p.asset));
     tr.appendChild(el("td", "mono", p.memo));
     tr.appendChild(el("td", null, fmtTime(p.created_at)));
-    tr.appendChild(el("td", "mono", shortId(p.id)));
+    // The button is the accessible control; the row click is a mouse
+    // convenience on top of it.
+    var idCell = document.createElement("td");
+    var open = el("button", "row-link mono", shortId(p.id));
+    open.type = "button";
+    open.setAttribute("aria-label", "View payment " + p.id);
+    idCell.appendChild(open);
+    tr.appendChild(idCell);
 
     tr.addEventListener("click", function () {
       openDetail(p.id);
-    });
-    tr.addEventListener("keydown", function (ev) {
-      if (ev.key === "Enter" || ev.key === " ") {
-        ev.preventDefault();
-        openDetail(p.id);
-      }
     });
 
     $("rows").appendChild(tr);
@@ -438,6 +438,8 @@
           );
           chip.className = "chip chip-on";
           state.status = chip.getAttribute("data-status") || "";
+          $("payments-caption").textContent =
+            "Payments: " + (state.status || "all") + " statuses";
           reload();
         });
       }
