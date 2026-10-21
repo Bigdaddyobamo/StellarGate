@@ -602,12 +602,18 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     setError($("deliveries-error"), null);
     show($("deliveries-empty"), false);
 
+    $("invoice-print").disabled = true;
+    $("payment-invoice").hidden = true;
+    clear($("invoice-fields")); clear($("invoice-qr"));
+    $("invoice-uri").textContent = "";
     showDetailSkeleton();
     openModal(detail);
     focusDetail();
 
     api("/payments/" + encodeURIComponent(id))
       .then(function (p) {
+        if (store.get().selectedPaymentId !== id || !detail.open) return;
+        renderInvoice(p);
         clear(fields);
         [
           ["Status", p.status],
@@ -655,6 +661,31 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       });
 
     loadDeliveries(id);
+  }
+
+  function renderInvoice(payment) {
+    var fields = $("invoice-fields");
+    clear(fields);
+    [
+      ["Amount", formatAmount(payment.amount, payment.asset)],
+      ["Asset", payment.asset || "XLM"],
+      ["Asset issuer", payment.asset_issuer || "native"],
+      ["Destination", payment.destination_address],
+      ["Memo", payment.memo],
+      ["Expires", fmtTime(payment.expires_at)],
+    ].forEach(function (pair) {
+      fields.appendChild(el("dt", null, pair[0]));
+      fields.appendChild(el("dd", "mono", pair[1] == null ? "—" : pair[1]));
+    });
+    var uri = buildSep7Uri(payment);
+    $("invoice-uri").textContent = uri;
+    clear($("invoice-qr"));
+    if (typeof QRCode !== "undefined" && QRCode.toSvg) {
+      // Only the vendored encoder's SVG is markup; API fields remain text.
+      $("invoice-qr").innerHTML = QRCode.toSvg(uri, { size: 220, margin: 4 }) || "";
+    }
+    $("payment-invoice").hidden = false;
+    $("invoice-print").disabled = false;
   }
 
   /** Move focus to the first focusable element inside the detail panel. */
@@ -1329,6 +1360,9 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     /* Detail drawer wiring. */
     var detail = $("detail");
     if (detail) {
+      $("invoice-print").addEventListener("click", function () {
+        if (!$("invoice-print").disabled && detail.open) window.print();
+      });
       $("detail-close").addEventListener("click", closeDetail);
       $("detail").addEventListener("click", dismissOnBackdrop);
       $("detail").addEventListener("keydown", trapDetailFocus);

@@ -1015,3 +1015,28 @@ dialog::backdrop {
   gap: 0.5rem;
   margin-top: 1rem;
 }
+
+/* #765: print only the loaded invoice, including the payment QR. */
+#payment-invoice { margin-block: 1rem; }
+#invoice-uri, #payment-invoice dd { overflow-wrap: anywhere; white-space: normal; min-width: 0; }
+#invoice-qr svg { width: 220px; max-width: 100%; height: auto; }
+@media print {
+  @page { margin: 15mm; }
+  html, body { background: white !important; color: black !important; }
+  body > :not(#app), #app > :not(#detail),
+  #detail > :not(#payment-invoice) { display: none !important; }
+  #app, main { display: block !important; margin: 0 !important; padding: 0 !important; }
+  #detail[open] {
+    position: static !important; display: block !important; inset: auto !important;
+    width: 100% !important; max-width: none !important; height: auto !important;
+    max-height: none !important; margin: 0 !important; padding: 0 !important;
+    overflow: visible !important; border: 0 !important; border-radius: 0 !important; box-shadow: none !important;
+    background: white !important; color: black !important;
+  }
+  #detail::backdrop { display: none !important; background: transparent !important; opacity: 0 !important; }
+  #payment-invoice[hidden] { display: none !important; }
+  #payment-invoice:not([hidden]) { display: block !important; }
+  #payment-invoice .fields { display: grid; grid-template-columns: 7rem minmax(0, 1fr); }
+  #payment-invoice, #payment-invoice * { color: black !important; }
+  #invoice-qr { break-inside: avoid; }
+}

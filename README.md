@@ -1735,3 +1735,12 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-301 -->
 - #301: `settle()` awaits webhook delivery inline, so one slow receiver stalls settlement for every other intent
+
+### Printable payment invoices
+
+Open a payment in the dashboard and choose **Print invoice** to print or save
+as PDF. Only the invoice fields and SEP-7 QR code appear in the print output;
+filters, navigation, payment metadata and webhook deliveries are omitted.
+The action is enabled only after that payment has loaded.
+
+Static-only browser regression: `cd e2e && npx playwright test --config playwright.invoice.config.js`.

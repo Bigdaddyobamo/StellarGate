@@ -171,6 +171,195 @@
             <thead>
               <tr>
                 <th class="select-col">
-                  <input id="select-all" type="checkbox" aria-label
+                  <input id="select-all" type="checkbox" aria-label="Select all loaded payments" />
+                </th>
+                <th>Status</th>
+                <th>Amount</th>
+                <th>Memo</th>
+                <th>Created</th>
+                <th>Payment ID</th>
+              </tr>
+            </thead>
+            <tbody id="rows"></tbody>
+          </table>
+          <p id="empty" class="empty" hidden>No payments match this filter.</p>
+          <p id="list-error" class="error" hidden></p>
+          <!-- Announces the j/k highlight. Without it the row selection is a
+               purely visual change that a screen-reader user cannot perceive. -->
+          <p id="rows-status" class="muted small" role="status" aria-live="polite"></p>
+          <div class="table-foot">
+            <button id="load-more" class="ghost" hidden>Load more</button>
+          </div>
+        </section>
+      </main>
 
-/* … truncated 5332 chars — edit only what you need near the top … */
+      <!-- Detail panel, opened by clicking a row.
+
+           A real <dialog> rather than an <aside> (issue #715): `showModal()`
+           puts it in the top layer, which is what makes the rest of the page
+           genuinely unreachable rather than merely covered by a scrim, and
+           brings the ::backdrop, Escape handling and the UA's own focus
+           restoration with it.
+
+           `aria-modal` is the attribute assistive tech reads, and
+           `aria-labelledby` names the dialog from its heading, so a screen
+           reader announces "Payment, dialog" on entry instead of a bare
+           "dialog".
+
+           The explicit Tab trap from #714 stays: a modal dialog does not wrap
+           Tab at the ends in any current browser. -->
+      <dialog
+        id="detail"
+        class="detail"
+        aria-modal="true"
+        aria-labelledby="detail-title"
+      >
+        <div class="detail-head">
+          <h2 id="detail-title">Payment</h2>
+          <button id="detail-close" class="ghost" aria-label="Close">&times;</button>
+        </div>
+        <button id="invoice-print" type="button" class="primary" disabled>Print invoice</button>
+          <section id="payment-invoice" aria-label="Payment invoice" hidden>
+            <h2>Payment invoice</h2>
+            <dl id="invoice-fields" class="fields"></dl>
+            <div id="invoice-qr" aria-hidden="true"></div>
+            <p id="invoice-uri" class="mono"></p>
+          </section>
+          <dl id="detail-fields" class="fields"></dl>
+
+        <h3>Webhook deliveries</h3>
+        <p id="deliveries-empty" class="muted small" hidden>
+          No delivery attempts recorded for this payment.
+        </p>
+        <p id="deliveries-error" class="error" hidden></p>
+        <ul id="deliveries" class="deliveries"></ul>
+      </dialog>
+    </div>
+
+    <!-- Keyboard shortcut help (#721).
+         The list is rendered from the SHORTCUTS table in keys.js, so a shortcut
+         cannot exist without appearing here and cannot be documented with the
+         wrong key. Rendered as a dialog so it is announced as one, and kept out
+         of #app so it is reachable from anywhere the app is. -->
+    <div
+      id="help"
+      class="help"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="help-title"
+      hidden
+    >
+      <div class="help-panel card">
+        <div class="detail-head">
+          <h2 id="help-title">Keyboard shortcuts</h2>
+          <button id="help-close" class="ghost" aria-label="Close">&times;</button>
+        </div>
+        <ul id="help-list" class="help-list"></ul>
+        <p class="muted small">
+          Shortcuts are ignored while you are typing in a field. Press
+          <kbd>Esc</kbd> to close this panel.
+        </p>
+      </div>
+    </div>
+
+    <!-- Create payment dialog (#758 / #760 / #761 / #763).
+         A real <dialog> so it gets top-layer behaviour, ::backdrop, Escape and
+         UA focus-restoration for free. The form section and the instructions
+         section are mutually exclusive: the form is shown first, the
+         instructions appear after a successful POST. -->
+    <dialog
+      id="create-payment-dialog"
+      class="create-dialog"
+      aria-modal="true"
+      aria-labelledby="create-dialog-title"
+    >
+      <!-- ── Form section ────────────────────────────────────────────── -->
+      <div id="create-payment-form-section">
+        <div class="detail-head">
+          <h2 id="create-dialog-title">New payment</h2>
+          <button id="create-cancel" class="ghost" aria-label="Close">&times;</button>
+        </div>
+        <form id="create-payment-form" method="dialog" autocomplete="off" novalidate>
+          <label class="field-label" for="create-amount">Amount</label>
+          <input
+            id="create-amount"
+            name="amount"
+            type="text"
+            inputmode="decimal"
+            placeholder="e.g. 10.00"
+            required
+            spellcheck="false"
+          />
+          <label class="field-label" for="create-asset">Asset</label>
+          <select id="create-asset" name="asset">
+            <option value="XLM" selected>XLM (native)</option>
+            <option value="USDC">USDC</option>
+          </select>
+          <label class="field-label" for="create-webhook">Webhook URL <span class="muted small">(optional)</span></label>
+          <input
+            id="create-webhook"
+            name="webhook_url"
+            type="url"
+            placeholder="https://example.com/webhook"
+            spellcheck="false"
+          />
+          <p id="create-payment-error" class="error" hidden></p>
+          <div class="form-actions">
+            <button type="submit" id="create-submit" class="primary">Create payment</button>
+            <button type="button" id="create-cancel-2" class="ghost">Cancel</button>
+          </div>
+        </form>
+      </div>
+
+      <!-- ── Instructions section (#761 / #763) ──────────────────────── -->
+      <div id="create-payment-instructions" hidden>
+        <div class="detail-head">
+          <h2>Payment created</h2>
+          <button id="create-instr-close" class="ghost" aria-label="Close">&times;</button>
+        </div>
+        <p class="muted small">Share the details below with the payer.</p>
+        <dl class="fields">
+          <dt>Destination</dt>
+          <dd id="instr-destination-row" class="mono copy-row">
+            <span id="instr-destination"></span>
+          </dd>
+          <dt>Memo</dt>
+          <dd id="instr-memo-row" class="mono copy-row">
+            <span id="instr-memo"></span>
+          </dd>
+          <dt>Amount</dt>
+          <dd><span id="instr-amount"></span></dd>
+          <dt>Asset</dt>
+          <dd><span id="instr-asset"></span></dd>
+          <dt>Expires</dt>
+          <dd><span id="instr-expiry"></span></dd>
+          <dt>Payment ID</dt>
+          <dd id="instr-id-row" class="mono copy-row">
+            <span id="instr-id"></span>
+          </dd>
+        </dl>
+
+        <!-- QR code for the SEP-7 URI (#763). The SVG is rendered by the
+             vendored encoder and injected here. The text alternative below
+             always contains the full URI so the information is accessible
+             even when the QR image fails to render. -->
+        <div class="instr-qr-section">
+          <h3>Scan to pay</h3>
+          <div id="instr-qr" class="qr-container" aria-hidden="true"></div>
+          <details class="qr-uri-details">
+            <summary class="muted small">SEP-7 URI</summary>
+            <code id="instr-qr-alt" class="mono qr-uri-text"></code>
+          </details>
+        </div>
+
+        <div class="form-actions">
+          <button type="button" id="create-another" class="primary">Create another</button>
+          <button type="button" id="create-done" class="ghost">Done</button>
+        </div>
+      </div>
+    </dialog>
+
+    <script src="/dashboard/vendor/qrcode.js"></script>
+    <script type="module" src="/dashboard/app.js"></script>
+  </body>
+</html>

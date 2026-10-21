@@ -1,0 +1,28 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
+import vm from 'node:vm';
+import { buildSep7Uri, fmtTime, formatAmount } from '../format.js';
+const source=readFileSync(new URL('../dashboard.js',import.meta.url),'utf8');
+test('issue_765 renders invoice from payment fields only, with safe text and a QR',()=>{
+ const elements=new Map();
+ const node=()=>({children:[],textContent:'',appendChild(x){this.children.push(x);}});
+ const $=id=>{if(!elements.has(id))elements.set(id,node());return elements.get(id);};
+ const el=(tag,cls,text)=>Object.assign(node(),{textContent:text});
+ const render=source.slice(source.indexOf('  function renderInvoice('),source.indexOf('  /** Move focus to the first focusable'));
+ const context={$,el,clear:n=>n.children=[],fmtTime,formatAmount,buildSep7Uri,QRCode:{toSvg:uri=>'<svg>'+encodeURIComponent(uri)+'</svg>'}};
+ vm.createContext(context);vm.runInContext(render+'; this.renderInvoice=renderInvoice;',context);
+ context.renderInvoice({amount:'10.0000000',asset:'USDC',asset_issuer:'ISSUER',destination_address:'DEST',memo:'<img src=x>',expires_at:'2027-01-01T00:00:00Z',api_key:'must-not-print',merchant_id:'private-merchant'});
+ const fields=$('invoice-fields').children.map(n=>n.textContent);
+ assert.ok(fields.includes('<img src=x>'));
+ assert.ok(fields.includes('10 USDC'));
+ assert.ok(!fields.includes('must-not-print'));
+ assert.ok(!fields.includes('private-merchant'));
+ const uri=$('invoice-uri').textContent;
+ assert.ok(uri.includes('destination=DEST'));
+ assert.ok(uri.includes('asset_issuer=ISSUER'));
+ assert.ok(uri.includes('memo=%3Cimg%20src%3Dx%3E'));
+ assert.ok(!uri.includes('must-not-print'));
+ assert.equal($('invoice-print').disabled,false);
+ assert.equal($('payment-invoice').hidden,false);
+});

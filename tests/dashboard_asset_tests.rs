@@ -91,10 +91,13 @@ const DASHBOARD_STATE_JS: &str = include_str!("../static/state.js");
 /// router actually serves. Add a new module here the moment it is created so
 /// the check stays exhaustive.
 const MODULES: &[(&str, &str)] = &[
-    ("/dashboard/format.js",  include_str!("../static/format.js")),
-    ("/dashboard/session.js", include_str!("../static/session.js")),
-    ("/dashboard/state.js",   include_str!("../static/state.js")),
-    ("/dashboard/keys.js",    include_str!("../static/keys.js")),
+    ("/dashboard/format.js", include_str!("../static/format.js")),
+    (
+        "/dashboard/session.js",
+        include_str!("../static/session.js"),
+    ),
+    ("/dashboard/state.js", include_str!("../static/state.js")),
+    ("/dashboard/keys.js", include_str!("../static/keys.js")),
 ];
 
 /// Every `/dashboard/…` path the router actually serves.
@@ -891,4 +894,15 @@ async fn dashboard_security_headers_are_not_duplicated() {
             );
         }
     }
+}
+
+/// Regression: #765. Printing must be available only for a loaded invoice.
+#[test]
+fn issue_765_prints_invoice_without_dashboard_chrome() {
+    assert!(DASHBOARD_HTML.contains("id=\"invoice-print\""));
+    assert!(DASHBOARD_HTML.contains("id=\"payment-invoice\""));
+    assert!(DASHBOARD_JS.contains("window.print()"));
+    assert!(DASHBOARD_JS.contains("selectedPaymentId !== id"));
+    assert!(DASHBOARD_CSS.contains("#detail > :not(#payment-invoice)"));
+    assert!(DASHBOARD_CSS.contains("@media print"));
 }
