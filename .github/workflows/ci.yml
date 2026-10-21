@@ -30,11 +30,15 @@ jobs:
           toolchain: "1.94"
           components: rustfmt, clippy
 
-      - uses: actions/cache@v4
-        with:
-          components: rustfmt
       - run: cargo fmt --all -- --check
 
+  # The clippy and test jobs below pinned
+  # `dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b27520de0a4799 # stable`,
+  # a commit that does not exist in that repository (`gh api
+  # repos/dtolnay/rust-toolchain/commits/b3b07ba…` answers "No commit found for
+  # SHA"), so Actions failed them in "Set up job" before running any step.
+  # `@master` with the explicit `toolchain` input each job already passes is the
+  # form the fmt, coverage, dashboard and release workflows use.
   clippy:
     name: clippy (${{ matrix.toolchain }})
     runs-on: ubuntu-latest
@@ -44,7 +48,7 @@ jobs:
         toolchain: [stable, msrv]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b27520de0a4799 # stable
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain == 'msrv' && '1.94' || 'stable' }}
           components: clippy
@@ -60,7 +64,7 @@ jobs:
         toolchain: [stable, msrv]
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - uses: dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b27520de0a4799 # stable
+      - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.toolchain == 'msrv' && '1.94' || 'stable' }}
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
