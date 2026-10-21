@@ -2,30 +2,71 @@
    Self-contained: no external fonts or assets, so the page works offline and
    under a restrictive Content-Security-Policy. */
 
+/* ── Theme tokens ──────────────────────────────────────────────────────────
+ *
+ * Two palettes, four blocks, and each palette written once per selector.
+ *
+ * `:root` carries the light palette and declares `color-scheme: light dark`,
+ * which says "both are supported, follow the OS" — and is also what makes the
+ * native date pickers, the <select> and the scrollbar follow the theme instead
+ * of staying OS-coloured while the page around them changes.
+ *
+ * The `prefers-color-scheme` block is scoped to `:root:not([data-theme])`, so
+ * it stops applying the moment the operator has chosen one (#713). The two
+ * `data-theme` blocks then carry higher specificity than `:root` and win over
+ * it outright. Leaving the media query unscoped would make a stored "light"
+ * choice lose to an OS preference of dark.
+ *
+ * The light palette is written once (in `:root`) and restated only in the
+ * explicit light override; the dark palette appears in the media query and in
+ * the explicit dark override, because both are selectors something can target.
+ *
+ * Two border tokens, because they answer different questions. `--border` draws
+ * a decorative separator — a table row rule, a delivery card's edge, the top
+ * bar's hairline — and WCAG 2.1 AA does not ask for those to be
+ * distinguishable: nothing about a control is identified by them, and a 3:1
+ * line between every row would wreck the table. `--control-border` draws the
+ * boundary of something interactive, which is the case 1.4.11 is actually about
+ * — if the edge is all that tells you where to click, it has to be visible.
+ * Before this audit a single `--border` at 1.25:1 did both jobs, which is how
+ * the date inputs and the page-size <select> ended up with a border in a colour
+ * this stylesheet never chose at all.
+ *
+ * Every colour pair here is checked against WCAG 2.1 AA by
+ * `scripts/check-dashboard-contrast.mjs`, in both themes — see that script for
+ * the thresholds, the pairs and what counts as a non-text one. */
+
 :root {
+  color-scheme: light dark;
   --bg: #f6f7f9;
   --surface: #ffffff;
   --border: #e3e6ea;
+  --control-border: #7d828c;
+  --focus: #0b1220;
   --text: #1a1d21;
   --muted: #6b7280;
   --accent: #3b5bdb;
   --accent-text: #ffffff;
-  --ok: #17803d;
+  --ok: #146c34;
   --ok-bg: #e7f6ec;
-  --warn: #9a6700;
+  --warn: #946100;
   --warn-bg: #fff4e0;
   --err: #b42318;
   --err-bg: #fdeceb;
   --idle: #4b5563;
   --idle-bg: #eef0f3;
   --radius: 8px;
+  --skeleton-base: #e3e6ea;
+  --skeleton-shine: #f0f2f5;
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme]) {
     --bg: #14161a;
     --surface: #1c1f24;
     --border: #2c313a;
+    --control-border: #6b7280;
+    --focus: #a8c5ff;
     --text: #e8eaed;
     --muted: #9aa3af;
     --accent: #7c93f5;
@@ -38,7 +79,89 @@
     --err-bg: #3a1a17;
     --idle: #9aa3af;
     --idle-bg: #262a31;
+    --skeleton-base: #2c313a;
+    --skeleton-shine: #363c47;
   }
+}
+
+/* An explicit light choice on a dark OS. */
+html[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --border: #e3e6ea;
+  --control-border: #7d828c;
+  --focus: #0b1220;
+  --text: #1a1d21;
+  --muted: #6b7280;
+  --accent: #3b5bdb;
+  --accent-text: #ffffff;
+  --ok: #146c34;
+  --ok-bg: #e7f6ec;
+  --warn: #946100;
+  --warn-bg: #fff4e0;
+  --err: #b42318;
+  --err-bg: #fdeceb;
+  --idle: #4b5563;
+  --idle-bg: #eef0f3;
+  --skeleton-base: #e3e6ea;
+  --skeleton-shine: #f0f2f5;
+}
+
+/* An explicit dark choice on a light OS. */
+html[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #14161a;
+  --surface: #1c1f24;
+  --border: #2c313a;
+  --control-border: #6b7280;
+  --focus: #a8c5ff;
+  --text: #e8eaed;
+  --muted: #9aa3af;
+  --accent: #7c93f5;
+  --accent-text: #14161a;
+  --ok: #6ee7a0;
+  --ok-bg: #16301f;
+  --warn: #f5c451;
+  --warn-bg: #33280c;
+  --err: #f5867c;
+  --err-bg: #3a1a17;
+  --idle: #9aa3af;
+  --idle-bg: #262a31;
+  --skeleton-base: #2c313a;
+  --skeleton-shine: #363c47;
+}
+
+/* ── Focus ───────────────────────────────────────────────────────────────────
+ *
+ * Until this existed, focus was whatever the user agent drew: a hairline in a
+ * colour chosen by the browser, not by this stylesheet, and not checked against
+ * either theme. A keyboard user tabbing this page had no way to know where they
+ * were, which is 2.4.7 (Focus Visible) in the WCAG 2.1 AA range.
+ *
+ * `:focus-visible` rather than `:focus` so a mouse click does not leave a ring
+ * behind — every current browser already suppresses that for `:focus-visible`,
+ * and the one that matters (keyboard) keeps it.
+ *
+ * `outline` rather than `box-shadow` because an outline follows a border-radius
+ * in current browsers and is not clipped by an ancestor's `overflow`. The
+ * offset is 2px and is load-bearing, not cosmetic: it puts a gap of the
+ * surrounding background between the control's own fill and the ring, so a ring
+ * on an accent-filled button can never be read as part of that button. The
+ * contrast audit relies on that — which is why it checks the ring against the
+ * page and card backgrounds rather than against `--accent` — and why
+ * `tests/dashboard_asset_tests.rs` pins the offset in place. */
+:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* Keyboard focus on a <tr> is the same colour and token, but a table row has no
+   border-radius to follow and Safari draws row outlines inconsistently, so it
+   gets an inset box-shadow instead of an outline. */
+.payments tbody tr:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--focus);
 }
 
 * {
@@ -52,6 +175,23 @@
    authoritative, so declare it once here rather than per-component. */
 [hidden] {
   display: none !important;
+}
+
+/* Present to assistive technology, absent from the visual layout.
+   `clip-path` rather than the older `clip: rect()` because the latter is
+   deprecated; both are needed alongside it, since removing an element from the
+   box tree with `display: none` or `visibility: hidden` also removes it from
+   the accessibility tree — which is the opposite of what this is for. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+  border: 0;
 }
 
 body {
@@ -99,6 +239,23 @@ h3 {
   word-break: break-all;
 }
 
+/* Visually hidden, still announced. Used by the `aria-live` region: the text is
+   for a screen reader only, and a sighted operator gets the same information
+   from the visible row highlight (#721). `position: absolute` rather than
+   `display: none`, which would remove it from the accessibility tree entirely
+   and silence the announcement it exists to make. */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -129,13 +286,79 @@ h3 {
   margin-top: 0.5rem;
 }
 
+/* Title and theme control share the top line of the sign-in card. */
+.gate-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.gate-head h1 {
+  margin-bottom: 0;
+}
+
+/* ── Theme toggle ────────────────────────────────────────────────────────────
+ *
+ * The control is a toggle button, so its accessible name stays constant
+ * ("Dark theme") and `aria-pressed` carries the state. A label that swapped
+ * between "Dark" and "Light" would be a moving target for anyone navigating by
+ * that name, and would describe the action rather than the state.
+ *
+ * The glyph shows where the control takes you, not where you are — a moon on a
+ * light page, a sun on a dark one — which is the convention every OS and app
+ * uses for this and the reason it is worth an icon rather than two words. */
+.theme-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 2.25rem;
+  height: 2.25rem;
+  padding: 0;
+  flex: none;
+  line-height: 1;
+}
+.theme-icon {
+  font-size: 1.05rem;
+}
+
+/* ── Form controls ──────────────────────────────────────────────────────────
+ *
+ * Every control that takes a value gets its border from `--control-border`,
+ * not `--border`.
+ *
+ * The date filters and the page-size <select> previously had no rule at all, so
+ * they were drawn entirely by the user agent: a border in a colour this
+ * stylesheet never chose, unaudited and not following the theme. They are the
+ * controls most likely to be on screen at once — a filter nobody can see the
+ * edge of is a filter nobody finds.
+ *
+ * `:where()` rather than a list of `[type="…"]` selectors so an input with no
+ * `type` attribute is covered too, and so the whole rule sits at zero
+ * specificity: a component can still override the padding without needing
+ * `!important` or a heavier selector.
+ *
+ * `accent-color` themes the native checkbox, whose default is a hard-coded blue
+ * that matches neither palette's `--accent`. */
+:where(input:not([type="checkbox"]), select) {
+  padding: 0.45rem 0.6rem;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+}
+
 .gate-card input[type="password"] {
   padding: 0.6rem 0.7rem;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
   background: var(--bg);
-  color: var(--text);
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+input[type="date"] {
+  font-family: inherit;
+}
+
+input[type="checkbox"] {
+  accent-color: var(--accent);
 }
 
 .checkbox {
@@ -152,7 +375,8 @@ button {
   font: inherit;
   cursor: pointer;
   border-radius: var(--radius);
-  border: 1px solid var(--border);
+  /* A button is a control, so its edge is a control boundary: 1.4.11, 3:1. */
+  border: 1px solid var(--control-border);
   padding: 0.5rem 0.9rem;
   background: var(--surface);
   color: var(--text);
@@ -228,11 +452,98 @@ main {
   gap: 0.4rem;
 }
 
-.chip {
+.search {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+.search input {
+  min-width: 220px;
+}
+.search button {
+  padding: 0.3rem 0.55rem;
+  line-height: 1;
+  font-size: 1rem;
+}
+
+/* Focus is the primary affordance for a keyboard-first list, so it gets a ring
+   that survives both colour schemes rather than the browser default that
+   disappears against the dark surface. */
+.search input:focus-visible,
+.payments tbody tr:focus-visible,
+.row-active {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 1.4em;
+  padding: 0.1rem 0.35rem;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8em;
+  text-align: center;
+}
+.search button {
+  padding: 0.3rem 0.55rem;
+  line-height: 1;
+  font-size: 1rem;
+}
+
+/* Focus is the primary affordance for a keyboard-first list, so it gets a ring
+   that survives both colour schemes rather than the browser default that
+   disappears against the dark surface. */
+.search input:focus-visible,
+.payments tbody tr:focus-visible,
+.row-active {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
+kbd {
+  display: inline-block;
+  min-width: 1.4em;
+  padding: 0.1rem 0.35rem;
+  border: 1px solid var(--border);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.8em;
+  text-align: center;
+}
+
+.summary {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+  gap: 0.75rem;
+  margin-bottom: 1rem;
+}
+.summary-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 0.75rem;
+}
+.summary-card strong {
+  display: block;
+  font-size: 1.35rem;
+  line-height: 1.1;
+}
+
+.chip,
+.preset {
   padding: 0.35rem 0.75rem;
   font-size: 0.88rem;
 }
-.chip-on {
+.chip-on,
+.preset-on {
   background: var(--accent);
   border-color: var(--accent);
   color: var(--accent-text);
@@ -267,14 +578,80 @@ main {
 .payments tbody tr:hover {
   background: var(--bg);
 }
+/* The j/k highlight. Tinted rather than outlined so it stays distinguishable
+   from the focus ring when a row is both highlighted and focused. */
+.payments tbody tr.row-active {
+  background: var(--idle-bg);
+}
 .payments tbody tr:last-child td {
   border-bottom: none;
 }
+.payments .select-col {
+  width: 1%;
+}
 
+/* ── Empty state ──────────────────────────────────────────────────────── */
+
+/* #720: structured empty state with icon, message and optional retry */
+.empty-state {
+  padding: 2.5rem 1.5rem;
+  text-align: center;
+  color: var(--muted);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.empty-state-icon {
+  font-size: 2rem;
+  line-height: 1;
+  opacity: 0.5;
+}
+
+.empty-state-title {
+  font-weight: 600;
+  color: var(--text);
+  font-size: 0.95rem;
+}
+
+.empty-state-body {
+  font-size: 0.88rem;
+  max-width: 320px;
+}
+
+/* Legacy inline empty paragraph (kept for backward compat with id="empty") */
 .empty {
   padding: 2rem;
   text-align: center;
   color: var(--muted);
+}
+
+/* ── Error state ──────────────────────────────────────────────────────── */
+
+/* #720: structured error state with message and retry button */
+.error-state {
+  padding: 1.5rem;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 0.6rem;
+}
+
+.error-state-message {
+  color: var(--err);
+  background: var(--err-bg);
+  border-radius: var(--radius);
+  padding: 0.6rem 0.75rem;
+  font-size: 0.9rem;
+  max-width: 360px;
+  width: 100%;
+}
+
+.error-state button {
+  font-size: 0.88rem;
+  padding: 0.4rem 0.9rem;
 }
 
 .table-foot {
@@ -307,32 +684,142 @@ main {
   background: var(--idle-bg);
 }
 
+/* ── Skeleton loading rows (#719) ─────────────────────────────────────── */
+
+/* Skeleton placeholder block: a rounded rectangle filled with the base
+   colour. The shimmer keyframe is only applied inside the
+   prefers-reduced-motion: no-preference guard below, so users who request
+   reduced motion see a static placeholder instead (#719, #722). */
+.skeleton-cell {
+  display: inline-block;
+  height: 0.85em;
+  border-radius: 4px;
+  background: var(--skeleton-base);
+  vertical-align: middle;
+}
+
+.skeleton-row td {
+  border-bottom: 1px solid var(--border);
+}
+
+/* Widths for each column skeleton — keeps the placeholder proportions
+   plausible without showing real data. */
+.skeleton-row .sk-status  { width: 5rem; }
+.skeleton-row .sk-amount  { width: 6rem; }
+.skeleton-row .sk-memo    { width: 7rem; }
+.skeleton-row .sk-date    { width: 9rem; }
+.skeleton-row .sk-id      { width: 8rem; }
+.skeleton-row .sk-select  { width: 1rem; }
+
+/* Detail panel skeleton blocks */
+.skeleton-field {
+  height: 0.85em;
+  border-radius: 4px;
+  background: var(--skeleton-base);
+  display: block;
+}
+.skeleton-field-short { width: 60%; }
+.skeleton-field-long  { width: 90%; }
+.skeleton-field-full  { width: 100%; }
+
+/* #719 + #722: shimmer animation is gated behind the no-preference query
+   so users who opted into reduced motion see a static skeleton instead. */
+@keyframes skeleton-shimmer {
+  0%   { background-position: -400px 0; }
+  100% { background-position:  400px 0; }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .skeleton-cell,
+  .skeleton-field {
+    background: linear-gradient(
+      90deg,
+      var(--skeleton-base)  25%,
+      var(--skeleton-shine) 50%,
+      var(--skeleton-base)  75%
+    );
+    background-size: 800px 100%;
+    animation: skeleton-shimmer 1.6s ease-in-out infinite;
+  }
+}
+
 /* ── Detail panel ──────────────────────────────────────────────────────── */
 
+/* A real <dialog> (issue #715), so the user agent's own defaults are all wrong
+   for a right-hand drawer: it centres its box, sizes it to fit content, and
+   clamps it to `100% - 6px - 2em`. Every one of those is reset here before the
+   drawer geometry is stated. */
 .detail {
   position: fixed;
-  top: 0;
-  right: 0;
-  bottom: 0;
+  inset: 0 0 0 auto;
+  margin: 0;
   width: min(460px, 100%);
+  max-width: 100%;
+  height: 100%;
+  max-height: 100%;
   background: var(--surface);
+  color: var(--text);
+  border: none;
   border-left: 1px solid var(--border);
   padding: 1.25rem;
   overflow-y: auto;
   z-index: 5;
 }
 
+/* `showModal()` paints the ::backdrop itself, so the old `#scrim` div is gone.
+   The backdrop covers the whole viewport, which is also what makes a click on
+   it land on the dialog element (see `dismissOnBackdrop` in the script) rather
+   than on the page underneath. */
+.detail::backdrop {
+  background: rgba(0, 0, 0, 0.45);
+}
+
+/* The drawer container takes focus programmatically on open so a screen reader
+   announces it and its name (see `focusDetail`). It is not in the Tab ring, so
+   this focus is never something the user arrived at by tabbing — and a ring
+   around the whole panel would read as a rendering fault rather than as
+   "focus is here". Its controls are ordinary tab stops and ring normally. */
+.detail:focus,
+.detail:focus-visible {
+  outline: none;
+}
+
+/* #722: slide-in transition, wrapped in prefers-reduced-motion: no-preference
+   so the panel appears instantly for users who prefer reduced motion.
+
+   The closed state is `:not([open])` rather than `[hidden]`: a <dialog> has no
+   `hidden` attribute, and `display`/`overlay` are transitioned discretely so
+   the drawer stays in the top layer while it animates out. A browser without
+   `allow-discrete` support simply closes instantly, which is the same thing
+   the reduced-motion path does. */
+@media (prefers-reduced-motion: no-preference) {
+  .detail {
+    transition:
+      transform 0.25s ease,
+      overlay 0.25s allow-discrete,
+      display 0.25s allow-discrete;
+  }
+
+  .detail:not([open]) {
+    transform: translateX(100%);
+  }
+
+  .detail::backdrop {
+    transition:
+      opacity 0.2s ease,
+      overlay 0.2s allow-discrete,
+      display 0.2s allow-discrete;
+  }
+
+  .detail:not([open])::backdrop {
+    opacity: 0;
+  }
+}
+
 .detail-head {
   display: flex;
   align-items: center;
   justify-content: space-between;
-}
-
-.scrim {
-  position: fixed;
-  inset: 0;
-  background: rgba(0, 0, 0, 0.35);
-  z-index: 4;
 }
 
 .fields {
@@ -348,6 +835,11 @@ main {
 .fields dd {
   margin: 0;
   overflow-wrap: anywhere;
+}
+.fields .copy {
+  margin-left: 0.5rem;
+  padding: 0.15rem 0.45rem;
+  font-size: 0.75rem;
 }
 
 .deliveries {
@@ -384,11 +876,216 @@ main {
   font-size: 0.85rem;
 }
 
+/* ── Shortcut help overlay (#721) ──────────────────────────────────────── */
+
+.help {
+  position: fixed;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 1.5rem;
+  z-index: 6;
+}
+
+.help-panel {
+  width: 100%;
+  max-width: 420px;
+  padding: 1.25rem;
+  max-height: 85vh;
+  overflow-y: auto;
+}
+
+.help-list {
+  list-style: none;
+  margin: 1rem 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.help-row {
+  display: flex;
+  align-items: baseline;
+  gap: 0.75rem;
+}
+.help-row kbd {
+  flex: 0 0 3rem;
+}
+
+@media print {
+  @page {
+    margin: 0.5in;
+  }
+
+  html,
+  body {
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  .topbar,
+  .toolbar,
+  .summary,
+  #gate,
+  .detail,
+  .help,
+  .theme-toggle,
+  #sign-out,
+  #health,
+  #selection-count,
+  #export-selected,
+  #export-csv,
+  #refresh,
+  #new-payment-btn,
+  #help-open {
+    display: none !important;
+  }
+
+  #app {
+    display: block !important;
+    visibility: visible !important;
+  }
+
+  main {
+    max-width: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  .card {
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+  }
+
+  .payments {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    page-break-inside: auto;
+  }
+
+  .payments th,
+  .payments td {
+    color: #000 !important;
+    background: #fff !important;
+    border: 1px solid #666 !important;
+    padding: 0.35rem 0.4rem !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .payments tbody tr,
+  .payments tbody tr.row-active,
+  .payments tbody tr:hover {
+    background: #fff !important;
+    cursor: default;
+  }
+
+  .payments .select-col {
+    display: none !important;
+  }
+}
+
 @media (max-width: 720px) {
-  .payments th:nth-child(3),
-  .payments td:nth-child(3),
-  .payments th:nth-child(5),
-  .payments td:nth-child(5) {
+  .payments thead {
     display: none;
   }
+  .payments,
+  .payments tbody,
+  .payments tr,
+  .payments td {
+    display: block;
+    width: 100%;
+  }
+  .payments tr {
+    border-bottom: 1px solid var(--border);
+    padding: 0.65rem 0;
+  }
+  .payments td {
+    border-bottom: none;
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .payments td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+  }
+
+  /* Stack skeleton cells on mobile */
+  .skeleton-row td {
+    display: flex;
+    justify-content: flex-end;
+    padding: 0.65rem 0.9rem;
+  }
+}
+
+/* ── New-payment dialog (#758 / #759) ──────────────────────────────────── */
+
+dialog {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  padding: 0;
+  width: min(460px, calc(100vw - 2rem));
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+}
+
+dialog::backdrop {
+  background: rgba(0, 0, 0, 0.35);
+}
+
+#payment-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 1.5rem;
+}
+
+.dialog-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 0.75rem;
+}
+
+.dialog-head h2 {
+  margin: 0;
+}
+
+#payment-form label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-top: 0.5rem;
+}
+
+#payment-form input[type="text"],
+#payment-form input[type="url"] {
+  padding: 0.6rem 0.7rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+#payment-form input[aria-invalid="true"] {
+  border-color: var(--err);
+}
+
+.field-error {
+  color: var(--err);
+  font-size: 0.82rem;
+  margin: 0;
+}
+
+.dialog-foot {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 1rem;
 }

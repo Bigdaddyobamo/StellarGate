@@ -8,7 +8,7 @@
 //! our check and the actual connect — a DNS-rebinding attack — can't slip a
 //! blocked address past us: the pinned client never re-resolves the host.
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
@@ -73,6 +73,9 @@ pub async fn validate(url: &str, allow_private: bool) -> Result<SafeTarget> {
 pub fn pinned_client(target: &SafeTarget, timeout: Duration) -> reqwest::Result<reqwest::Client> {
     reqwest::Client::builder()
         .timeout(timeout)
+        // Redirects must be rejected rather than followed: the destination
+        // of a redirect has not passed the SSRF validation and pinning above.
+        .redirect(reqwest::redirect::Policy::none())
         .user_agent(concat!("StellarGate/", env!("CARGO_PKG_VERSION")))
         .resolve(&target.host, target.addr)
         .build()
@@ -102,17 +105,78 @@ fn is_blocked_ipv4(ip: Ipv4Addr) -> bool {
 }
 
 fn is_blocked_ipv6(ip: Ipv6Addr) -> bool {
+    let seg = ip.segments();
     ip.is_loopback()
         || ip.is_unspecified()
         || ip.is_multicast()
-        || (ip.segments()[0] & 0xfe00) == 0xfc00 // unique local, RFC 4193
-        || (ip.segments()[0] & 0xffc0) == 0xfe80 // link-local unicast, RFC 4291
+        || (seg[0] & 0xfe00) == 0xfc00 // unique local, RFC 4193
+        || (seg[0] & 0xffc0) == 0xfe80 // link-local unicast, RFC 4291
+        || (seg[0] & 0xffc0) == 0xfec0 // site-local (deprecated), RFC 3879
+        || (seg[0] == 0x2001 && seg[1] == 0x0db8) // documentation, RFC 3849
+        || (seg[0] == 0x0100 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0) // discard-only, RFC 6666
         || ip.to_ipv4_mapped().is_some_and(is_blocked_ipv4)
+        || embedded_ipv4(ip).is_some_and(is_blocked_ipv4)
+        || is_teredo(ip)
+}
+
+/// Extract the IPv4 address embedded in an IPv6 form that routes to or
+/// represents an IPv4 host: NAT64 (`64:ff9b::/96`, `64:ff9b:1::/48`), 6to4
+/// (`2002::/16`) and IPv4-compatible (`::/96`, deprecated). Returns `None` for
+/// addresses that don't embed an IPv4 host.
+fn embedded_ipv4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let seg = ip.segments();
+    // NAT64 well-known prefix 64:ff9b::/96 (RFC 6052 / 8215).
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+        return Some(Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        ));
+    }
+    // NAT64 local-use prefix 64:ff9b:1::/48 (RFC 8215). The embedded IPv4
+    // follows the /48 prefix; treat the trailing 32 bits as the IPv4 host.
+    if seg[0] == 0x0064 && seg[1] == 0xff9b && seg[2] == 0x0001 {
+        return Some(Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        ));
+    }
+    // 6to4 2002::/16: IPv4 in bits 16–47 (segments 1 and 2).
+    if seg[0] == 0x2002 {
+        return Some(Ipv4Addr::new(
+            (seg[1] >> 8) as u8,
+            seg[1] as u8,
+            (seg[2] >> 8) as u8,
+            seg[2] as u8,
+        ));
+    }
+    // IPv4-compatible ::/96 (deprecated, RFC 4291): first 96 bits zero and not
+    // loopback/unspecified (handled above).
+    if seg[0] == 0 && seg[1] == 0 && seg[2] == 0 && seg[3] == 0 && seg[4] == 0 && seg[5] == 0 {
+        return Some(Ipv4Addr::new(
+            (seg[6] >> 8) as u8,
+            seg[6] as u8,
+            (seg[7] >> 8) as u8,
+            seg[7] as u8,
+        ));
+    }
+    None
+}
+
+/// Teredo (`2001::/32`, RFC 4380) embeds an obfuscated IPv4 address; block it
+/// outright rather than trying to decode it.
+fn is_teredo(ip: Ipv6Addr) -> bool {
+    let seg = ip.segments();
+    seg[0] == 0x2001 && seg[1] == 0x0000
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn blocks_loopback_link_local_and_private_v4() {
@@ -124,7 +188,7 @@ mod tests {
             "192.168.1.1",
         ] {
             assert!(
-                is_blocked_ipv4(ip.parse().unwrap()),
+                is_blocked_ipv4(ip.parse().expect("private IPv4 fixture should parse")),
                 "{ip} should be blocked"
             );
         }
@@ -161,7 +225,7 @@ mod tests {
     fn blocks_loopback_link_local_and_unique_local_v6() {
         for ip in ["::1", "fe80::1", "fc00::1", "fd00::1"] {
             assert!(
-                is_blocked_ipv6(ip.parse().unwrap()),
+                is_blocked_ipv6(ip.parse().expect("private IPv6 fixture should parse")),
                 "{ip} should be blocked"
             );
         }
@@ -171,6 +235,31 @@ mod tests {
     fn blocks_ipv4_mapped_private_addresses() {
         assert!(is_blocked_ipv6("::ffff:127.0.0.1".parse().unwrap()));
         assert!(is_blocked_ipv6("::ffff:169.254.169.254".parse().unwrap()));
+    }
+
+    #[test]
+    fn blocks_ipv4_embedding_and_reserved_v6_ranges() {
+        // (address, why it must be blocked)
+        let cases = [
+            ("64:ff9b::7f00:1", "NAT64 -> 127.0.0.1"),
+            ("64:ff9b::a9fe:a9fe", "NAT64 -> 169.254.169.254"),
+            ("64:ff9b:1::7f00:1", "NAT64 local-use -> 127.0.0.1"),
+            ("64:ff9b:1::a9fe:a9fe", "NAT64 local-use -> 169.254.169.254"),
+            ("2002:7f00:1::", "6to4 -> 127.0.0.1"),
+            ("2002:a9fe:a9fe::", "6to4 -> 169.254.169.254"),
+            ("2001::1", "Teredo"),
+            ("::7f00:1", "IPv4-compatible -> 127.0.0.1"),
+            ("::a9fe:a9fe", "IPv4-compatible -> 169.254.169.254"),
+            ("fec0::1", "site-local"),
+            ("2001:db8::1", "documentation"),
+            ("100::1", "discard-only"),
+        ];
+        for (ip, why) in cases {
+            assert!(
+                is_blocked_ipv6(ip.parse().expect("IPv6 fixture should parse")),
+                "{ip} ({why}) should be blocked"
+            );
+        }
     }
 
     #[test]
@@ -197,5 +286,35 @@ mod tests {
         validate("http://127.0.0.1:1234/hook", true)
             .await
             .expect("loopback must be allowed when allow_private is set");
+    }
+
+    // ── #441 new tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn blocks_broadcast_address_explicitly() {
+        // ip.is_broadcast() path: 255.255.255.255
+        assert!(
+            is_blocked_ipv4("255.255.255.255".parse().unwrap()),
+            "broadcast 255.255.255.255 should be blocked"
+        );
+    }
+
+    #[test]
+    fn blocks_documentation_ranges_v4() {
+        // RFC 5737 TEST-NET ranges: 192.0.2.0/24, 198.51.100.0/24, 203.0.113.0/24
+        for ip in ["192.0.2.1", "198.51.100.1", "203.0.113.1"] {
+            assert!(
+                is_blocked_ipv4(ip.parse().unwrap()),
+                "{ip} (documentation range) should be blocked"
+            );
+        }
+    }
+
+    #[test]
+    fn blocks_multicast_v4() {
+        assert!(
+            is_blocked_ipv4("224.0.0.1".parse().unwrap()),
+            "multicast 224.0.0.1 should be blocked"
+        );
     }
 }

@@ -1,5 +1,6 @@
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use std::str::FromStr;
+use std::time::Duration;
 use stellargate::db;
 
 #[tokio::test]
@@ -97,7 +98,7 @@ async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
     db::migrate(&pool).await.unwrap();
 
     let (raw_key, prefix) = db::generate_api_key();
-    db::create_merchant(&pool, "m1", &raw_key, &prefix, None)
+    db::create_merchant(&pool, "m1", &raw_key, &prefix)
         .await
         .unwrap();
 
@@ -128,7 +129,9 @@ async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
     let mut seen = std::collections::HashSet::new();
     let mut offset = 0i64;
     loop {
-        let page = db::list_payments(&pool, "m1", None, page_size, offset)
+        // `None` for the status and the two date bounds: this walk is about
+        // pagination, not filtering.
+        let (page, _total) = db::list_payments(&pool, "m1", None, None, None, page_size, offset)
             .await
             .unwrap();
         if page.is_empty() {
@@ -150,4 +153,305 @@ async fn offset_pagination_returns_each_row_exactly_once_within_one_second() {
         25,
         "offset walk must return all 25 payments exactly once"
     );
+}
+
+/// API keys must never be persisted in a recoverable form (issue #462): the
+/// only representation stored in either `merchants.api_key_hash` (legacy) or
+/// `api_keys.key_hash` (current) is a SHA-256 digest of the raw key.
+#[tokio::test]
+async fn api_keys_are_stored_hashed_not_plaintext() {
+    let pool = SqlitePoolOptions::new()
+        .min_connections(1)
+        .connect_with(
+            SqliteConnectOptions::from_str("sqlite::memory:")
+                .unwrap()
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+
+    db::migrate(&pool).await.unwrap();
+
+    let (raw_key, prefix) = db::generate_api_key();
+    db::create_merchant(&pool, "m1", &raw_key, &prefix)
+        .await
+        .unwrap();
+
+    let expected_digest = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(raw_key.as_bytes()))
+    };
+
+    let merchant_hash: String =
+        sqlx::query_scalar("SELECT api_key_hash FROM merchants WHERE id = 'm1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(
+        merchant_hash, raw_key,
+        "merchants.api_key_hash must not store the raw key"
+    );
+    assert_eq!(merchant_hash, expected_digest);
+
+    let key_hash: String =
+        sqlx::query_scalar("SELECT key_hash FROM api_keys WHERE merchant_id = 'm1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_ne!(
+        key_hash, raw_key,
+        "api_keys.key_hash must not store the raw key"
+    );
+    assert_eq!(key_hash, expected_digest);
+}
+
+// ── foreign key enforcement (issue #271) ─────────────────────────────────────
+
+/// A fresh in-memory pool with foreign-key enforcement explicitly enabled, as
+/// `db::open_pool` does for production connections.
+async fn fk_pool() -> sqlx::SqlitePool {
+    SqlitePoolOptions::new()
+        .min_connections(1)
+        .connect_with(
+            SqliteConnectOptions::from_str("sqlite::memory:")
+                .unwrap()
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap()
+}
+
+/// Insert a merchant and a payment so child rows have a valid parent.
+async fn seed_payment(pool: &sqlx::SqlitePool, payment_id: &str) {
+    let (raw_key, prefix) = db::generate_api_key();
+    db::create_merchant(pool, "m1", &raw_key, &prefix)
+        .await
+        .unwrap();
+
+    let ts = "2026-01-01T00:00:00Z";
+    sqlx::query(
+        "INSERT INTO payments
+            (id, merchant_id, destination_address, memo, amount, asset, status,
+             created_at, updated_at, expires_at)
+         VALUES (?, 'm1', 'GDEST', ?, '1', 'XLM', 'pending', ?, ?, ?)",
+    )
+    .bind(payment_id)
+    .bind(format!("MEMO-{payment_id}"))
+    .bind(ts)
+    .bind(ts)
+    .bind("2026-01-01T01:00:00Z")
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// A child row pointing at a nonexistent payment must be rejected by the
+/// declared foreign key rather than silently persisted as an orphan.
+#[tokio::test]
+async fn orphan_insert_is_rejected_by_foreign_key() {
+    let pool = fk_pool().await;
+    db::migrate(&pool).await.unwrap();
+
+    let err = sqlx::query(
+        "INSERT INTO webhook_deliveries
+            (payment_id, url, payload, status, attempts, next_attempt_at, created_at)
+         VALUES ('does-not-exist', 'https://example.com/hook', '{}', 'pending', 0,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect_err("inserting a delivery for a nonexistent payment must fail");
+
+    match err {
+        sqlx::Error::Database(db_err) => assert!(
+            db_err.message().contains("FOREIGN KEY constraint failed"),
+            "unexpected database error: {}",
+            db_err.message()
+        ),
+        other => panic!("expected a database error, got {other:?}"),
+    }
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "the orphan row must not have been persisted");
+}
+
+/// The same insert succeeds once the referenced payment exists.
+#[tokio::test]
+async fn child_insert_succeeds_with_existing_parent() {
+    let pool = fk_pool().await;
+    db::migrate(&pool).await.unwrap();
+    seed_payment(&pool, "payment-1").await;
+
+    sqlx::query(
+        "INSERT INTO webhook_deliveries
+            (payment_id, url, payload, status, attempts, next_attempt_at, created_at)
+         VALUES ('payment-1', 'https://example.com/hook', '{}', 'pending', 0,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .expect("a delivery for an existing payment must be accepted");
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 1);
+}
+
+/// Deleting a payment must cascade to its dependent rows.
+#[tokio::test]
+async fn deleting_payment_cascades_to_children() {
+    let pool = fk_pool().await;
+    db::migrate(&pool).await.unwrap();
+    seed_payment(&pool, "payment-1").await;
+
+    sqlx::query(
+        "INSERT INTO webhook_deliveries
+            (payment_id, url, payload, status, attempts, next_attempt_at, created_at)
+         VALUES ('payment-1', 'https://example.com/hook', '{}', 'pending', 0,
+                 '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query("DELETE FROM payments WHERE id = 'payment-1'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 0, "deleting the payment must cascade to webhook_deliveries");
+}
+
+// ── production pool settings (issue #642) ────────────────────────────────────
+
+/// A throwaway on-disk database URL. WAL needs a real file: an in-memory
+/// database silently keeps `journal_mode = memory` whatever is requested.
+fn temp_db_url() -> (std::path::PathBuf, String) {
+    let dir = std::env::temp_dir().join(format!("stellargate-pool-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let url = format!("sqlite://{}", dir.join("pool.db").display());
+    (dir, url)
+}
+
+/// `db::open_pool` must leave every pooled connection in WAL mode with
+/// `synchronous = NORMAL`, the configured busy timeout and foreign keys on.
+/// Two connections are held at once so the PRAGMAs are checked on more than
+/// the first connection the pool happens to open: all but `journal_mode` are
+/// per-connection settings.
+#[tokio::test]
+async fn open_pool_applies_production_pragmas_to_every_connection() {
+    let (dir, url) = temp_db_url();
+    let pool = db::open_pool(&url, 2, Duration::from_millis(1234))
+        .await
+        .unwrap();
+
+    let mut conns = vec![pool.acquire().await.unwrap(), pool.acquire().await.unwrap()];
+    for conn in &mut conns {
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(&mut **conn)
+            .await
+            .unwrap();
+        assert_eq!(journal_mode, "wal");
+
+        // 0 = OFF, 1 = NORMAL, 2 = FULL, 3 = EXTRA.
+        let synchronous: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(&mut **conn)
+            .await
+            .unwrap();
+        assert_eq!(synchronous, 1, "synchronous must be NORMAL");
+
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(&mut **conn)
+            .await
+            .unwrap();
+        assert_eq!(busy_timeout, 1234);
+
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(&mut **conn)
+            .await
+            .unwrap();
+        assert_eq!(foreign_keys, 1, "sqlx enables foreign keys by default");
+    }
+
+    drop(conns);
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `create_if_missing` must still be honoured: a fresh deployment points
+/// `DATABASE_URL` at a file that does not exist yet.
+#[tokio::test]
+async fn open_pool_creates_a_missing_database_file() {
+    let (dir, url) = temp_db_url();
+    let path = dir.join("pool.db");
+    assert!(!path.exists());
+
+    let pool = db::open_pool(&url, 1, Duration::from_millis(5000))
+        .await
+        .unwrap();
+    db::migrate(&pool).await.unwrap();
+    assert!(path.exists());
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two writers contending for SQLite's single write lock must wait out the
+/// busy timeout rather than fail with `SQLITE_BUSY` the moment the lock is
+/// taken. One connection holds an open write transaction while the other
+/// tries to write, then the first commits well inside the timeout.
+#[tokio::test]
+async fn open_pool_busy_timeout_lets_a_contending_writer_wait() {
+    let (dir, url) = temp_db_url();
+    let pool = db::open_pool(&url, 2, Duration::from_millis(5000))
+        .await
+        .unwrap();
+    db::migrate(&pool).await.unwrap();
+
+    let mut holder = pool.acquire().await.unwrap();
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO kv_state (key, value) VALUES ('a', '1')")
+        .execute(&mut *holder)
+        .await
+        .unwrap();
+
+    let waiter = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            sqlx::query("INSERT INTO kv_state (key, value) VALUES ('b', '2')")
+                .execute(&pool)
+                .await
+        })
+    };
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    sqlx::query("COMMIT").execute(&mut *holder).await.unwrap();
+    drop(holder);
+
+    waiter
+        .await
+        .unwrap()
+        .expect("the second writer must wait for the lock, not fail with SQLITE_BUSY");
+
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kv_state WHERE key IN ('a', 'b')")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&dir);
 }

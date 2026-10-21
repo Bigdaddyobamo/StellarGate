@@ -27,9 +27,9 @@ use std::collections::BTreeSet;
 use std::str::FromStr;
 use std::sync::Arc;
 use stellargate::{
-    api,
+    AppState, api,
     config::{Config, ListenerMode},
-    db, AppState,
+    db,
 };
 
 const TEST_ADMIN_SECRET: &str = "test-admin-secret";
@@ -42,12 +42,13 @@ fn make_config() -> Config {
         port: 0,
         database_url: "sqlite::memory:".into(),
         network: "testnet".into(),
-        horizon_url: String::new(),
+        horizon_url: "https://horizon.invalid".into(),
         gateway_public: "UNCONFIGURED".into(),
         accepted_assets: stellargate::config::AcceptedAsset::default_list(),
         webhook_secret: String::new(),
         webhook_retry_attempts: 1,
         webhook_retry_delay_ms: 0,
+        webhook_retry_max_delay_ms: 60_000,
         allowed_webhook_schemes: vec!["https".into(), "http".into()],
         webhook_timeout_secs: 10,
         webhook_redrive_interval_secs: 30,
@@ -60,9 +61,8 @@ fn make_config() -> Config {
         webhook_delivery_retention_days: 30,
         idempotency_retention_days: 7,
         poll_interval_secs: 10,
-        cursor_staleness_multiple: 3,
+        poll_max_pages_per_cycle: 50,
         payment_ttl_secs: 3600,
-        expiry_batch_size: 500,
         rate_limit_requests_per_sec: 1000,
         db_pool_max_connections: 10,
         db_busy_timeout_ms: 5000,
@@ -70,7 +70,9 @@ fn make_config() -> Config {
         listener_mode: ListenerMode::Poll,
         webhook_allow_private_targets: false,
         admin_provisioning_secret: TEST_ADMIN_SECRET.into(),
+        metrics_token: String::new(),
         request_timeout_secs: 30,
+        stream_idle_timeout_secs: 30,
         trusted_proxy_cidrs: vec![],
     }
 }
@@ -93,10 +95,14 @@ async fn test_server() -> TestServer {
         webhook_http: reqwest::Client::new(),
         webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
         auth_metrics: stellargate::metrics::AuthMetrics::new(),
+        horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
+        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
+        http_metrics: stellargate::metrics::HttpMetrics::new(),
+        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
         task_health: stellargate::TaskHealth::new(),
     }))
     .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    TestServer::new(router).unwrap()
+    TestServer::new(router)
 }
 
 /// One documented operation, with concrete ids substituted so it can be probed
@@ -190,10 +196,10 @@ fn documented_paths(spec: &str) -> BTreeSet<String> {
         if let Some(rest) = line.strip_prefix("  ") {
             // Exactly two-space indent -> a path key. Deeper keys start with a
             // space here and are skipped; comments don't start with '/'.
-            if rest.starts_with('/') {
-                if let Some(key) = rest.strip_suffix(':') {
-                    out.insert(key.trim_end().to_string());
-                }
+            if rest.starts_with('/')
+                && let Some(key) = rest.strip_suffix(':')
+            {
+                out.insert(key.trim_end().to_string());
             }
         }
     }
@@ -280,7 +286,13 @@ async fn openapi_documents_exactly_the_intended_paths() {
     let documented = documented_paths(&read_spec());
 
     let expected: BTreeSet<String> = [
+        // Operational endpoints. Infrastructure rather than contract (they
+        // don't move between API versions), but still documented so a reader
+        // of the spec sees the whole surface the service answers on.
+        "/",
         "/health",
+        "/ready",
+        "/metrics",
         // Operator / merchant management.
         "/merchants",
         "/merchants/{id}/keys",

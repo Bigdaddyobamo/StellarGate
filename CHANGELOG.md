@@ -9,6 +9,295 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`main` did not compile, and its newest tests did not pass.** This is not a
+  behaviour change; it is the minimum needed to get to a green baseline. None
+  of it is mine — every item below landed on `main` in the last few merges.
+
+  - **`src/api/payments.rs` had no `axum` imports at all.** The commit that
+    removed the duplicated `use` block deleted the whole item, leaving
+    `use axum::{Json};` and 73 errors across the file. Deduped, not removed.
+  - **`HorizonPayment::operation_index()` ignored the field of the same name.**
+    It read only the paging token and parsed it as an integer, so any record
+    whose token is not numeric fell back to `0` — which puts every operation of
+    that transaction on one `processed_transactions` row, discards the second
+    as already-seen, and leaves the intent `underpaid`. That is precisely the
+    bug #613 reported, still reachable through an ordinary Horizon response,
+    and it is what made the new `multi_op_credit_tests` fail. The field Horizon
+    sends directly now wins when present; a zero still falls through to the
+    token, because `#[serde(default)]` makes "absent" indistinguishable from
+    zero, and that keeps pre-#616 rows addressed as they already were.
+  - **`test_wrong_method_on_known_path_returns_405` (#635) failed.** The
+    credential layers were attached with `Router::route_layer`, which protects
+    the *router's* 404 but not the inner `MethodRouter`'s 405, so an
+    unauthenticated `PUT /v1/payments` returned `401` instead of `405`. The
+    layers now attach per `MethodRouter`, which is what that API is documented
+    for. No handler becomes reachable without a credential; only the status for
+    an unimplemented method changes.
+  - **`rate_limit_headers_track_quota_before_and_after_exhaustion` had its API
+    key literal replaced with `******`** by a secret-scrubbing pass, so it
+    asserted on a `401`. It provisions a merchant and uses that key.
+  - **`database_file_from_current_release_upgrades_cleanly` replayed the schema
+    snapshot in file order**, which is SQLite's `(type, name)` order — every
+    `CREATE INDEX` ahead of every `CREATE TABLE` — so the replay died on
+    `no such table: main.api_keys`. The replay hoists the `CREATE TABLE`s; the
+    textual comparison is unchanged.
+  - **Two `multi_op_transaction_tests` (#613) asserted a contract the gateway
+    has not had since underpayment events landed** — that a half-payment
+    neither updates the row nor fires a webhook. `reconcile_payment` reports
+    whether the row was *updated*, and an underpayment is an update that fires
+    the documented `payment.underpaid` event. They now assert the status
+    transition and the exact event sequence
+    `["payment.underpaid", "payment.completed"]`, which is stricter than the
+    request count they replaced: it would no longer pass on two
+    `payment.completed` deliveries.
+  - **Three error responses in `openapi.yaml` referenced a schema that does not
+    exist.** They `$ref`'d `components/schemas/Error`; the schema in the file
+    is `ErrorResponse`, and the other 28 references already said so.
+    `redocly lint` failed on `no-unresolved-refs`, so the spec could not be
+    used to generate a client for the `400`/`409` responses on
+    `POST …/redeliver`.
+
+### Added
+
+- **A manual light/dark override (issue #713).** The dashboard followed the OS
+  palette with no way to disagree with it. A toggle now sets `data-theme` on
+  `<html>` and remembers the choice in `localStorage` under
+  `stellargate.theme`. It is on both the sign-in card and the top bar, since
+  whichever panel is on screen should offer it, and both are bound by
+  `data-theme-toggle` so they stay in step from one handler.
+
+  Three details that a plain two-state toggle gets wrong:
+
+  - **The preference is tri-state.** No stored value means no `data-theme`
+    attribute at all, so the CSS falls through to `prefers-color-scheme` and a
+    later OS change is still picked up. Pinning whatever was on screen at first
+    paint would turn "follow the OS" into a permanent override nobody asked
+    for. An unrecognised stored value is treated as no preference rather than
+    pinning the page to a half-understood theme.
+  - **It is applied before the first paint.** The choice is read by a small
+    classic script in `<head>` (`static/dashboard-theme.js`, served at
+    `/dashboard/theme.js`), because `app.js` is a module and a module is
+    deferred by definition — folding the bootstrap in would mean the page
+    paints once in the OS palette and then repaints, flashing on every load. It
+    is a separate file rather than an inline block because the dashboard CSP is
+    `script-src 'self'` with no `unsafe-inline`.
+  - **It sets `color-scheme` as well as the tokens.** Without it the date
+    pickers, the `<select>` and the scrollbar keep the OS palette on a page
+    that has changed. The default declares `color-scheme: light dark`, and each
+    override pins one.
+
+  The bootstrap reads and writes only that one preference — it is deliberately
+  not a second reader of the API key, which lives in the same origin's storage.
+
+- **Every dashboard colour pair audited against WCAG 2.1 AA, in both themes
+  (issue #718).** Four real failures, all of them the kind that survives review
+  because they look fine to the person looking:
+
+  - **There was no focus ring.** Nothing in the stylesheet styled
+    `:focus`/`:focus-visible`, so keyboard focus was whatever hairline the
+    browser drew, in a colour this stylesheet never chose and no audit covered —
+    2.4.7 Focus Visible, in the AA range. There is now a real ring in a
+    `--focus` token per theme, drawn with `outline` (which follows
+    `border-radius` and is not clipped by an ancestor's `overflow`) at a 2px
+    `outline-offset`, with an inset variant for table rows because Safari draws
+    row outlines inconsistently.
+
+  - **Control boundaries were at 1.25:1.** One `--border` token did two jobs: a
+    decorative separator *and* the edge of every button and input. WCAG 1.4.11
+    requires 3:1 for the boundary of a user-interface component, so the two are
+    now separate tokens — `--border` still draws table rules and card edges,
+    where a 3:1 line would put a heavy rule through every row of the payments
+    table, and the new `--control-border` draws what the user has to be able to
+    see to click. Worth naming which failure this was: it is invisible to
+    someone with normal vision on a good monitor, which is precisely why it
+    needs a number rather than an opinion.
+
+  - **The date filters and the page-size `<select>` had no rule at all.** They
+    were drawn entirely by the user agent, so their borders were in a colour
+    this stylesheet never picked, followed neither theme, and were never
+    audited. They are the controls most likely to be on screen at once.
+
+  - **Two status pills missed 4.5:1, by 0.02 and 0.03.** `--ok` on `--ok-bg`
+    was 4.48:1 and `--warn` on `--warn-bg` 4.47:1. Both are darkened
+    (`#17803d` → `#146c34`, `#9a6700` → `#946100`), which is also the
+    direction that helps: on a tinted background a darker foreground can only
+    get better.
+
+  The audit is a file rather than a claim:
+  `scripts/check-dashboard-contrast.mjs` implements the WCAG sRGB → linear →
+  relative-luminance → contrast maths dependency-free, reads the real
+  `static/dashboard.css` block by block, and checks 96 pairs across all four
+  theme blocks. It self-tests its own maths against the published WCAG worked
+  examples, because a contrast checker that computes the wrong ratio is worse
+  than no checker — it reports a green tick on colours nobody can read. It runs
+  in the dashboard CI job. Every theme must declare the same tokens, so a
+  colour edited in one palette and not the other fails rather than silently
+  resolving to another theme's value — which is also what catches a new token
+  like #719's `--skeleton-*` being added to `:root` and forgotten in the dark
+  blocks.
+
+- **The payment detail drawer traps keyboard focus and gives it back (issue
+  #714).** Opening a payment moved nothing: focus stayed on the row behind the
+  panel, so a keyboard user tabbed straight back out into the payment table
+  while reading the drawer, with no cue that a panel was open at all. Closing
+  it dropped focus to `<body>`, so the next Tab restarted from the top of the
+  document and the table had to be re-tabbed to get back to the row they were
+  on. The drawer now takes focus on open, wraps Tab in both directions, pulls
+  focus back if it lands outside by any other route (a click on the page behind
+  it), and returns focus to the originating row on close — guarded on
+  `isConnected`, since a refresh between open and close replaces the row and
+  focusing a detached node drops focus to `<body>`, which is the loss this
+  exists to prevent.
+
+- Dashboard maintenance CI now runs a dependency-free JavaScript syntax check
+  and static accessibility smoke check for `static/dashboard.*`, so the
+  embedded dashboard keeps a small quality gate without introducing an npm
+  build step.
+
+### Changed
+
+- **The payment detail drawer is a real modal `<dialog>` (issue #715).** It was
+  an `<aside>` under a separate `#scrim` div, which is only *visually* on top:
+  `Tab`, the address bar and the accessibility tree all still reach the page
+  behind it, because nothing marks that content as inert. `showModal()` puts the
+  dialog in the top layer, so the page behind is genuinely unreachable, and it
+  brings the `::backdrop` (replacing the hand-rolled scrim) plus Escape and
+  `cancel` handling from the user agent. `aria-modal="true"` and
+  `aria-labelledby` on the heading name it for assistive tech, so a screen
+  reader announces "Payment, dialog" on entry rather than a bare "dialog".
+
+  The explicit focus trap from #714 stays: a modal dialog does not wrap `Tab`
+  at the ends in any current browser. Focus is restored from the dialog's
+  `close` event rather than from `closeDetail`, so it also runs for the routes
+  that bypass it — Escape, and a re-open on another row — and the
+  document-level Escape handler is gone, since a modal dialog already handles
+  it and a second `close()` could only ever be a no-op.
+
+  #722's slide-in transition now keys off `:not([open])` instead of `[hidden]`,
+  because a `<dialog>` has no `hidden` attribute, and `display`/`overlay` are
+  transitioned discretely so the drawer stays in the top layer while it
+  animates out. A browser without `allow-discrete` support closes instantly,
+  which is what the reduced-motion path does anyway.
+
+- **Rust edition 2021 → 2024 (issue #662).** No `/v1` API change. `cargo fix
+  --edition` only required wrapping the test-only `env::set_var`/`remove_var`
+  calls in `unsafe` (they are unsafe in 2024). It also flagged `tokio::select!`
+  / `if let` temporary drop-order changes in `expiry`, `horizon` and
+  `retention`; none change behaviour here. Nested `if let` chains were folded
+  with let-chains, and the tree was reformatted with the 2024 `rustfmt` style.
+- **Dockerfile base images are pinned by `@sha256` digest (issue #664)**
+  (`rust:1.94-bookworm`, `debian:bookworm-slim`), matching the 1.94 MSRV.
+- Clippy is clean under `-D warnings` again (issue #663): unused test-only
+  helpers are explicitly allowed with a reason, and case-insensitive
+  comparisons use `eq_ignore_ascii_case`.
+
+- **`reqwest` 0.12 → 0.13 (issue #645).** The `rustls-tls` feature is now
+  `rustls`, which uses the `aws-lc-rs` crypto provider and verifies server
+  certificates against the **operating system's trust store**
+  (`rustls-platform-verifier`) instead of the Mozilla roots bundled into the
+  binary (`webpki-roots`). The Docker runtime image already installs
+  `ca-certificates`. A bare-metal or custom-image deployment must have a
+  system CA bundle, or outbound Horizon and webhook requests fail TLS
+  verification. Building now needs a C compiler for `aws-lc-sys` (already
+  present in `rust:*-bookworm`).
+
+### Fixed
+
+- **`GET /metrics` is no longer reachable anonymously.** It was registered on
+  the public router with no authentication, exposing webhook delivery volume,
+  latency, and — most usefully to an attacker — auth outcome counters
+  (`stellargate_auth_attempts_total{outcome="failure",reason="invalid_key"}`
+  let a credential-stuffing attempt watch its own progress). The endpoint is
+  now gated behind `Authorization: Bearer <METRICS_TOKEN>`; unset (the
+  default) disables it entirely, returning `401` for every request rather
+  than falling back to an open default. `deploy/Caddyfile` also blocks the
+  path at the edge by default (issue #250).
+
+- **API hardening review of the remaining unauthenticated/admin-gated
+  surface, prompted by the `/metrics` finding above.** Each route was
+  inspected against the concern its issue raised; none needed a behavior
+  change, and each conclusion now has a regression test so a future change
+  can't silently regress it:
+  - `GET /dashboard`, `/dashboard/app.css`, `/dashboard/app.js` (issue #460):
+    confirmed safe to serve unauthenticated. The three handlers take no
+    `State`/DB parameter — they return `include_str!`-embedded static assets
+    baked in at compile time — so the shell cannot leak per-request or
+    merchant data by construction. Every figure the dashboard displays is
+    fetched client-side from the same authenticated endpoints a merchant
+    would call directly, using an API key the operator supplies in the
+    browser; already covered by `test_dashboard_assets_served_unauthenticated`
+    and `test_dashboard_data_endpoints_reject_missing_key`.
+  - `POST /merchants` (`provision_merchant`, issue #461): confirmed it can't
+    be used to mass-create merchant records. The handler takes no request
+    body to validate, and the route already sits in the base-rate
+    `"merchants"` rate-limit bucket (1×), not the 5× read bucket — same
+    quota as any other write, on top of requiring
+    `ADMIN_PROVISIONING_SECRET`. Added
+    `test_provision_merchant_rate_limit_exceeded_returns_429`, which the
+    existing test suite was missing (every other write route had one).
+  - `POST /merchants/:id/keys` and `GET /merchants/:id/keys` (issue #462):
+    confirmed a raw key is returned exactly once, at issuance, and never
+    again — `list_api_keys` projects only `key_id`/`prefix`/`label`/
+    timestamps/`active`, never the key material — and that only a SHA-256
+    digest is ever persisted (`hash_api_key`, `db.rs`). Added
+    `api_keys_are_stored_hashed_not_plaintext`, asserting the stored
+    `api_keys.key_hash` and legacy `merchants.api_key_hash` columns differ
+    from the raw key and equal its digest; listing-side coverage already
+    existed in `test_listing_keys_never_returns_the_secret`.
+
+- **Restored a batch of previously-shipped fixes that a bad merge had
+  silently reverted from `main`, discovered while landing the fix above** (a
+  base-branch build failure led to auditing the rest of `main` for the same
+  pattern — several PRs' worth of work had the same fate). Each of the
+  following was already implemented, tested, and merged at some point; this
+  restores the code, not just the behavior:
+  - Baseline security headers (`X-Content-Type-Options`, `Referrer-Policy`,
+    `Cache-Control`, and `Strict-Transport-Security` on `public`) on every API
+    response, not only the dashboard's static assets (issues #251–#254).
+  - The Horizon SSE stream listener bounds every read with
+    `STREAM_IDLE_TIMEOUT_SECS`, so a half-open connection (dropped by a NAT or
+    load balancer without `RST`) is detected and reconnected instead of
+    parking the listener forever (issue #312).
+  - The Horizon poller backs off on failure — honoring `Retry-After` on a
+    `429`/`503` exactly, and falling back to an equal-jitter exponential
+    schedule otherwise — instead of retrying every cycle at the fixed poll
+    interval regardless of why the previous one failed (issue #313).
+  - First-run cursor baselining walks backward with overlap instead of
+    adopting the account's single most recent payment as the floor, which
+    silently skipped a still-open intent's payment on a reused account or a
+    startup race (issue #311).
+  - The periodic trustline checker (`run_trustline_checker`) is wired into
+    the process again — trustlines are re-verified on `RETENTION_INTERVAL_SECS`
+    for as long as a gateway is configured, not only once at boot.
+  - Inline webhook retries grow exponentially with jitter
+    (`WEBHOOK_RETRY_DELAY_MS` doubling up to `WEBHOOK_RETRY_MAX_DELAY_MS`)
+    instead of sleeping a constant delay between attempts, which retried an
+    entire failed settlement burst in lockstep against a receiver that was
+    already struggling (issue #318). Boot now also refuses a
+    `WEBHOOK_REDRIVE_GRACE_SECS` shorter than the worst-case inline delivery
+    time, closing a window where the redrive worker could double-send a
+    delivery whose inline attempt was still in flight (issue #238).
+  - `POST /merchants` and `POST /payments` emit the same structured audit
+    event (`audit=true`, `action`, `actor`, `outcome`, `source_ip`,
+    `request_id`) the key-lifecycle routes already had (issue #305).
+  - The strict CORS layer permits `DELETE` (key revocation),
+    `Idempotency-Key` and `X-Admin-Secret` request headers, and exposes
+    `X-Request-Id`/`Deprecation`/`Link` to browser clients — all four were
+    silently dropped from the allow-list despite the routes needing them
+    (issue #281).
+  - `db::migrate` now runs inside a transaction, so a failure partway through
+    (a corrupt row a backfill can't touch, a disk error) rolls back instead of
+    leaving the schema half-migrated.
+  - `GET /metrics`'s database gauges (`stellargate_db_file_size_bytes`) are
+    populated from the actual SQLite file sizes instead of always reporting
+    absent.
+  - A partial composite index on `payments(status, expires_at)` for the
+    watchable-status queries (`list_pending`, `expire_overdue`,
+    `find_pending_by_memo`) that run on every poll/sweep cycle (issue #270).
+  - Horizon paging cursors are properly percent-encoded when built into a
+    request URL; an opaque cursor containing `&` or `#` used to corrupt the
+    query string it was interpolated into.
+
 - **Unknown query parameters on the listing endpoints are now rejected
   instead of ignored.** `GET /payments`, `GET /payments/:id/webhooks`, and
   `GET /payments/webhooks` deserialized the parameters they knew and discarded
@@ -324,6 +613,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`payments.asset_issuer`.** An intent recorded only the asset *code*, so
+  which USDC it was priced in lived in process configuration and changed
+  retroactively whenever `ACCEPTED_ASSETS` was edited — historical rows could
+  not be audited or reconciled against an external ledger, and a webhook saying
+  `"asset": "USDC"` did not tell the receiver which USDC. The issuer is now
+  persisted alongside the code and exposed in `GET /payments/:id` and every
+  webhook payload (`null` for the native asset). Settlement matches against the
+  issuer recorded on the intent rather than today's configuration. Rows created
+  before the column existed are backfilled once from the configured allow-list,
+  best-effort — the issuer they were priced in was never recorded (issue #223).
+- **`POLL_MAX_PAGES_PER_CYCLE`.** Bounds how many Horizon pages one poll cycle
+  walks before yielding to the next tick, so a large catch-up cannot monopolise
+  the poller task indefinitely. `0` restores the previous unlimited behaviour
+  (issue #226).
+- Prometheus counter `stellargate_horizon_records_skipped_total`, tracking
+  Horizon records the reconciler refused to credit (issue #224).
 - **`GET /payments/:id/webhooks` now paginates like the payments listing.**
   The endpoint previously serialised every delivery row for a payment with no
   `LIMIT`, so a payment with unbounded delivery activity (see issue #233) grew
@@ -414,6 +719,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Horizon records with no `transaction_hash` are no longer credited.** A
+  missing hash was defaulted to the empty string and used as half of the
+  `processed_transactions` primary key, so two different unhashed transactions
+  looked like the same one and the second was silently discarded as "already
+  credited" — money on chain, never credited to the merchant. Such a record is
+  now skipped, counted and logged instead; the poller re-sees it on the next
+  cycle, so skipping is self-healing. The schema rejects an empty `tx_hash`
+  outright, and rows written before the fix are reported at startup rather than
+  deleted (issue #224).
+- **The poller observes shutdown mid-catch-up.** `poll_once` looped over
+  Horizon pages until caught up without ever checking the shutdown signal, so
+  `SIGTERM` during a long backlog drain was ignored until the backlog finished
+  or the 30 s shutdown grace killed the task mid-page — which replayed that page
+  on the next boot and made the next shutdown worse. The signal is now checked
+  at every page boundary, immediately after the cursor is checkpointed
+  (issue #226).
+- **The stream listener resumes from a persisted cursor.** It hard-coded
+  `cursor=now` on every process start, so payments that landed while the
+  process was down were invisible to the stream and recoverable only by the
+  poller — whose own catch-up is slower, and which is disabled entirely in a
+  poll-less configuration. The stream now resumes from its own persisted cursor
+  (falling back to the poller's, then to the live edge), under a separate
+  `kv_state` key so the two cursors never overwrite one another (issue #228).
 - **`GET /payments` offset pages now order rows exactly like cursor pages.**
   The offset query sorted by `created_at DESC` alone while the keyset query
   broke whole-second `created_at` ties on `id DESC`, so a `next_cursor` minted

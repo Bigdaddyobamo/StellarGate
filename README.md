@@ -3,7 +3,7 @@
 
 [![CI](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org)
 
 A payment gateway API built on [Stellar](https://stellar.org) for accepting, verifying, and settling payments in XLM, USDC, and any other Stellar asset you configure.
 
@@ -86,7 +86,7 @@ A payment is matched on three independent attributes — **memo**, **destination
 | API key lifecycle | ✅ | CSPRNG keys, rotation with overlap, instant revocation |
 | Data retention | ✅ | Background pruning of aged delivery rows and idempotency keys |
 | API versioning | ✅ | `/v1` prefix with a documented deprecation policy |
-| Prometheus metrics | ✅ | `GET /metrics` |
+| Prometheus metrics | ✅ | `GET /metrics`, gated behind `METRICS_TOKEN` (unset — disabled by default) |
 | Dashboard UI | ✅ | Served at `/dashboard`; no build step or separate deploy |
 
 ## Architecture
@@ -118,11 +118,15 @@ tests/             Integration tests (API, concurrency, rate limits, webhooks, t
 
 **Two independent listeners** run concurrently. The SSE stream gives near-real-time settlement; the interval poller re-scans from a persisted cursor and acts as a reconciler for anything missed during a reconnect. Both converge on the same idempotent settlement path, so a payment observed twice settles once.
 
+**Both listeners resume from a persisted cursor across restarts**, under separate `kv_state` keys (`horizon_stream_cursor` and `horizon_payment_cursor`) so neither drags the other backwards. A deploy therefore does not cost the stream its ~1 s settlement latency: it reconnects from the last event it handled and works forward through whatever landed while the process was down, rather than re-baselining at the live edge and leaving the gap to the poller. Only a genuinely fresh database — no cursor under either key — starts at the live edge. Re-seeing records the other listener already handled is harmless; settlement is idempotent through `processed_transactions`.
+
+**Shutdown is observed mid-catch-up.** A poll cycle checks the shutdown signal at every page boundary, right after it checkpoints its cursor, so `SIGTERM` during a long backlog drain is honoured in one page rather than after the whole backlog (or, worse, by being killed mid-page once the 30 s shutdown grace expires). `POLL_MAX_PAGES_PER_CYCLE` bounds a single cycle for the same reason.
+
 ### Tech Stack
 
 | Layer | Choice |
 |---|---|
-| Language | Rust (2021 edition, 1.88+) |
+| Language | Rust (2024 edition, 1.94+) |
 | HTTP | [axum](https://github.com/tokio-rs/axum) + [tower-http](https://github.com/tower-rs/tower-http) |
 | Database | SQLite via [sqlx](https://github.com/launchbadge/sqlx) (WAL mode) |
 | Async runtime | [tokio](https://tokio.rs) |
@@ -135,7 +139,7 @@ tests/             Integration tests (API, concurrency, rate limits, webhooks, t
 
 ### Prerequisites
 
-- **Rust 1.88 or newer** — [install via rustup](https://rustup.rs)
+- **Rust 1.94 or newer** — [install via rustup](https://rustup.rs)
 - A Stellar account public key to receive payments (testnet keys: [Stellar Laboratory](https://laboratory.stellar.org/#account-creator))
 
 ### Install and Run
@@ -193,17 +197,39 @@ deploy. Sign in with any merchant API key.
 
 | View | What it does |
 |---|---|
-| Payments | Table of the merchant's payments, filterable by status, paged with the keyset cursor |
+| Payments | Table of the merchant's payments, filterable by one or more statuses, paged with the keyset cursor |
 | Payment detail | Full record — amounts, memo, destination, transaction hash, timestamps |
 | Webhook deliveries | Every attempt for a payment, with a one-click **Redeliver** |
 | Health | Live `/ready` indicator, polled every 30s |
+
+The detail panel is a modal `<dialog>`: opened with `showModal()`, so the rest
+of the page is inert rather than merely covered, and it is a keyboard trap
+while open — it takes focus when it opens, `Tab` and `Shift+Tab` cycle inside
+it (a modal dialog does not wrap at the ends in any current browser), `Escape`
+or a click outside closes it, and focus goes back to the row you opened it
+from. Without all that, a keyboard user tabs straight out into the payment
+table behind the panel and, on close, lands on `<body>` with the next `Tab`
+restarting from the top of the document.
+
+The page follows the OS light/dark preference, and a toggle on the sign-in card
+and in the top bar overrides it. The choice is remembered in `localStorage`
+under `stellargate.theme` and applied before the first paint, so it never
+flashes; with nothing stored, the page keeps following the OS.
+
+**Accessibility.** The detail panel is a real modal `<dialog>` with a focus
+trap and a focus ring of its own, and the light and dark palettes are both held
+to WCAG 2.1 AA. `scripts/check-dashboard-contrast.mjs` re-checks every colour
+pair in CI, reading the real stylesheet, so a token cannot drift out of the
+standard unnoticed.
 
 **How it's built.** The page is plain HTML, CSS, and dependency-free
 JavaScript, compiled into the binary with `include_str!`. There is no npm, no
 bundler, and no `node_modules`: the deployable artifact stays a single Rust
 binary, and the dashboard cannot drift out of sync with the API it ships
-alongside. It is also a plain client of the documented REST API — it uses no
-private endpoints, so anything it displays you can fetch yourself.
+alongside. CI still runs `node --check static/dashboard.js` and a small static
+accessibility smoke check so dashboard changes get fast feedback without adding
+a frontend toolchain. It is also a plain client of the documented REST API —
+it uses no private endpoints, so anything it displays you can fetch yourself.
 
 **Security.**
 
@@ -280,8 +306,14 @@ Current trustline state is on `GET /metrics`, so it's alertable rather than
 grep-only:
 
 ```
-# a confirmed-missing trustline
+# a confirmed-missing or unauthorized trustline
 stellargate_missing_trustlines{asset="USDC"} 1
+
+# trustline exists but is_authorized=false (issuer revoked authorization)
+stellargate_trustline_unauthorized{asset="USDC"} 1
+
+# remaining capacity in stroops (limit - balance); alert when near your typical payment size
+stellargate_trustline_headroom_stroops{asset="USDC"} 9223372036854775807
 
 # how many checks have failed to reach Horizon at all — distinct from a
 # confirmed-absent trustline, which only ever comes from a check that
@@ -293,6 +325,20 @@ stellargate_trustline_check_failures_total 0
 # until this is nonzero
 stellargate_trustline_check_last_success_timestamp_seconds 1732000000
 ```
+
+`stellargate_missing_trustlines=1` covers two distinct cases — both cause payments
+to bounce on-chain:
+
+- **No trustline** — the account has no balance line for this asset. Add one with `changeTrust`.
+- **Unauthorized trustline** — the balance line exists but `is_authorized=false`. The issuer uses
+  `AUTH_REQUIRED` and has not yet granted (or has revoked) authorization. Contact the issuer.
+
+`stellargate_trustline_unauthorized` distinguishes the second case from the first, so an alert can
+recommend the right action.
+
+`stellargate_trustline_headroom_stroops` is the remaining capacity (`limit - balance`). A payment
+that would push the balance past `limit` fails on-chain just like a missing trustline. Alert when
+this approaches your typical payment size.
 
 A Horizon outage during a check only increments
 `stellargate_trustline_check_failures_total`; it leaves the last confirmed
@@ -348,6 +394,7 @@ XLM free to cover one per asset.
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
 | `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
+| `POLL_MAX_PAGES_PER_CYCLE` | Maximum Horizon pages (200 records each) one poll cycle walks before yielding to the next tick. Bounds how long a catch-up can monopolise the poller; the cursor is checkpointed at every page boundary, so the next cycle resumes exactly where this one stopped. `0` = unlimited. | `50` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
 | `EXPIRY_BATCH_SIZE` | Maximum overdue intents the expiry sweeper transitions per sweep | `500` |
 
@@ -484,6 +531,7 @@ until it finished; a backlog drains over several cycles instead.
 | Variable | Description | Default |
 |---|---|---|
 | `ADMIN_PROVISIONING_SECRET` | Required via `X-Admin-Secret` to call `POST /merchants`. Unset disables provisioning entirely (always `401`). | _(unset — disabled)_ |
+| `METRICS_TOKEN` | Required via `Authorization: Bearer <token>` to call `GET /metrics`. Unset disables scraping entirely (always `401`) — the endpoint exposes auth outcome counters and webhook delivery volume, so it must not be reachable anonymously by default (issue #250). | _(unset — disabled)_ |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated origins. **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Base per-IP limit. Write routes get this rate; read-only routes get 5×. Must be `> 0` — boot fails otherwise; there is no "disabled" value. | `10` |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
@@ -713,6 +761,7 @@ later would silently change the behaviour of requests that appeared to work.
 | `invalid_label` | `400` | Key label exceeds 100 characters |
 | `delivery_not_found` | `404` | No such delivery for that payment |
 | `webhook_target_blocked` | `400` | Redelivery target rejected by the SSRF guard |
+| `already_delivered` | `409` | Delivery was already successfully delivered; pass `?force=true` to redeliver anyway |
 | `webhook_delivery_failed` | `502` | Receiver returned a non-success response |
 | `rate_limit_exceeded` | `429` | Per-IP bucket limit exceeded |
 | `idempotency_conflict` | `409` | Concurrent creates raced on one idempotency key; retry |
@@ -868,7 +917,7 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
 | Field | Type | Required | Constraints |
 |---|---|---|---|
 | `amount` | string | ✅ | Positive decimal, ≤ 7 decimal places |
-| `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. |
+| `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. The issuer configured for that code is resolved at creation time and returned as `asset_issuer`; it is not accepted in the request. |
 | `webhook_url` | string | ❌ | ≤ 2048 chars; scheme must be allowed; HTTPS required on `public`; SSRF-checked |
 
 Any other field is rejected with `400` `unknown_field` — see [Error
@@ -1275,7 +1324,7 @@ Readiness probe. Runs `SELECT 1` against the database, probes Horizon (3 s timeo
 
 ### `GET /metrics`
 
-Prometheus exposition format. See [Observability](#observability).
+Prometheus exposition format. Requires `Authorization: Bearer <METRICS_TOKEN>`; unset `METRICS_TOKEN` disables the endpoint entirely (always `401`). See [Observability](#observability).
 
 ### `GET /dashboard`
 
@@ -1296,6 +1345,7 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 | Top-up reaching exactly the total | `completed` | `payment.completed` | — |
 | Top-up exceeding the total | `completed` | `payment.overpaid` | cumulative excess |
 | TTL elapsed, unpaid | `expired` | `payment.expired` | — |
+| Payment after `completed` or `expired` | unchanged | `payment.unexpected` | unexpected amount to refund |
 
 **Overpayment** fulfils the intent. The `delta` field carries the excess; refunding it is the merchant's responsibility — the gateway cannot send funds.
 
@@ -1304,8 +1354,7 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 **Limitations to be aware of:**
 
 - Only a **single** top-up is tracked per underpaid intent. If more is needed, the payer should send the full remaining `delta` in one transaction.
-- Once an intent is `completed`, further payments to the same address and memo are **not** tracked and fire no webhooks.
-- Failed on-chain transactions are ignored entirely.
+- Once an intent is `completed`, further payments to the same address and memo fire a `payment.unexpected` webhook so the merchant can refund them, but the intent's `completed` status is not changed.
 
 ---
 
@@ -1321,6 +1370,7 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
 | `payment.overpaid` | Cumulative received exceeds it (`delta` = excess, `full` detail only) |
 | `payment.underpaid` | Payment received but short (`delta` = shortfall, `full` detail only) |
 | `payment.expired` | TTL elapsed with no payment |
+| `payment.unexpected` | Payment received after intent is already `completed` or `expired` (`delta` = the unexpected amount the merchant must refund) |
 
 ### Payload detail
 
@@ -1475,7 +1525,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Observability
 
-`GET /metrics` exposes Prometheus metrics:
+`GET /metrics` exposes Prometheus metrics, gated behind `Authorization: Bearer <METRICS_TOKEN>` (issue #250). Unset (the default), the endpoint is disabled entirely — every scrape gets `401` rather than exposing auth outcome counters and webhook delivery volume to anonymous callers. Set `METRICS_TOKEN` to a strong random value (`openssl rand -hex 32`) to enable scraping, and configure Prometheus's `authorization` scrape option with the same value. `deploy/Caddyfile` also blocks the path at the edge by default (see [Deployment](DEPLOYMENT.md#operating)) — remove that block only if you intend to scrape from outside the Docker network.
 
 | Metric | Type | Description |
 |---|---|---|
@@ -1502,6 +1552,11 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_db_pool_connections` | gauge | SQLite connection pool size, labelled by `state` (`idle`, `in_use`) |
 | `stellargate_db_pool_max_connections` | gauge | Configured maximum pool size |
 | `stellargate_db_file_size_bytes` | gauge | On-disk size of the SQLite database files, labelled by `file` (`main`, `wal`, `shm`); absent for an in-memory database |
+| `stellargate_missing_trustlines` | gauge | `1` if the gateway account has no usable trustline for this asset (absent or unauthorized); `0` if confirmed usable |
+| `stellargate_trustline_unauthorized` | gauge | `1` if the trustline exists but `is_authorized=false` (issuer revoked/has not granted authorization) |
+| `stellargate_trustline_headroom_stroops` | gauge | Remaining trustline capacity in stroops (`limit - balance`); alert when near your typical payment size |
+| `stellargate_trustline_check_failures_total` | counter | Trustline checks that failed to reach Horizon (does not affect `stellargate_missing_trustlines`) |
+| `stellargate_trustline_check_last_success_timestamp_seconds` | gauge | Unix timestamp of the last confirmed trustline check; `0` until first success |
 
 **Alert on `stellargate_tasks_live < stellargate_tasks_expected`.** That
 comparison was not previously possible: `stellargate_tasks_stopped_total` was
@@ -1602,6 +1657,7 @@ Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), calle
 - Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
 - New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
 - A few one-time data backfills (populating `processed_transactions` from legacy rows, filling `asset_issuer` from `ACCEPTED_ASSETS`, normalising pre-RFC 3339 timestamps) run alongside them.
+- `payments.asset_issuer` is the one backfill that does *not* run on every boot: it reconstructs the issuer of pre-existing rows from the configured allow-list, so re-running it after an `ACCEPTED_ASSETS` edit would rewrite history a second time. It runs once per database, guarded by a `kv_state` marker, from `db::backfill_asset_issuers` — and rows created before it are best-effort by nature, since the issuer they were priced in was never recorded.
 
 Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
 
@@ -1627,7 +1683,7 @@ cargo fmt                   # format
 cargo clippy --all-targets -- -D warnings
 ```
 
-CI enforces all four on every pull request, plus a [`cargo audit`](https://github.com/rustsec/rustsec) RustSec advisory scan (also run weekly on a schedule) and an [OpenAPI lint](https://redocly.com/docs/cli) of `openapi.yaml`. The test suite additionally cross-checks the spec's documented paths against the live router (`tests/openapi_contract.rs`), so a route added without a matching spec change — or a spec change with no route — fails the build. The test suite runs on both the minimum supported Rust version (1.88) and stable; `cargo fmt` and `cargo clippy` currently run on stable only, which can differ from the pinned toolchain you get locally (#294).
+CI enforces all four on every pull request, plus a [`cargo audit`](https://github.com/rustsec/rustsec) RustSec advisory scan (also run weekly on a schedule) and an [OpenAPI lint](https://redocly.com/docs/cli) of `openapi.yaml`. The test suite additionally cross-checks the spec's documented paths against the live router (`tests/openapi_contract.rs`), so a route added without a matching spec change — or a spec change with no route — fails the build. The test suite runs on both the minimum supported Rust version (1.94) and stable; `cargo fmt` and `cargo clippy` currently run on stable only, which can differ from the pinned toolchain you get locally (#294).
 
 `deny.toml` is present but no workflow runs `cargo deny` yet, so its license, ban, and duplicate-version policy is not currently enforced (#293).
 
@@ -1668,3 +1724,14 @@ Release history is kept in [CHANGELOG.md](CHANGELOG.md).
 ## License
 
 Released under the [MIT License](LICENSE).
+
+## Handsoff notes
+
+<!-- handsoff-issue-680 -->
+- #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-285 -->
+- #285: No tracing spans carry `merchant_id` or `payment_id` through the settlement path
+
+<!-- handsoff-issue-301 -->
+- #301: `settle()` awaits webhook delivery inline, so one slow receiver stalls settlement for every other intent
