@@ -55,3 +55,24 @@ export function setError(node, message) {
     node.hidden = true;
   }
 }
+
+/**
+ * Report a sign-in failure accessibly: link the error to the input via
+ * `aria-describedby`, mark the input `aria-invalid`, and return focus to it.
+ * The error element gets a stable id so assistive tech can reference it.
+ */
+export function setFieldError(input, errorNode, message, id = "signin-error") {
+  if (errorNode) {
+    if (!errorNode.id) errorNode.id = id;
+    setError(errorNode, message);
+  }
+  if (!input) return;
+  if (message) {
+    if (errorNode && errorNode.id) input.setAttribute("aria-describedby", errorNode.id);
+    input.setAttribute("aria-invalid", "true");
+    if (typeof input.focus === "function") input.focus();
+  } else {
+    input.removeAttribute("aria-describedby");
+    input.removeAttribute("aria-invalid");
+  }
+}

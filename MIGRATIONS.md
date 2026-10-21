@@ -79,6 +79,34 @@ the same silent-drift failure mode the old `migrations/` directory had.
    schema's exact text, ready to paste into `tests/schema_snapshot.sql`.
 4. Review and commit the snapshot diff alongside the `db.rs` change.
 
+### Adding a foreign key
+
+SQLite cannot add a `REFERENCES` clause to an existing table with `ALTER
+TABLE`. Adding a foreign key therefore requires a **table rebuild** inside
+`db::migrate`:
+
+1. `CREATE TABLE <name>_new (...)` with the full desired definition, including
+   the `REFERENCES payments(id) ON DELETE CASCADE` (or equivalent) clause.
+2. `INSERT INTO <name>_new SELECT ... FROM <name>` to copy the existing rows.
+3. `DROP TABLE <name>`.
+4. `ALTER TABLE <name>_new RENAME TO <name>`, then recreate any indexes the
+   original table had.
+
+Before rebuilding, `db::migrate` must audit the existing data: query each
+referencing table for ids that do not exist in the referenced table (for
+example, `SELECT DISTINCT payment_id FROM webhook_deliveries WHERE payment_id
+NOT IN (SELECT id FROM payments)`) and log every offending id with
+`tracing::warn!`. The audit is **report-only** — it never deletes or rewrites
+rows. This lets operators reconcile orphaned data manually before the
+constraint starts rejecting writes; the rebuild itself will fail if orphans
+remain and `PRAGMA foreign_keys` is on.
+
+Enforcement is per-connection in SQLite and is off by default, so
+`db::connect_options` sets `SqliteConnectOptions::foreign_keys(true)`. Every
+connection in the pool therefore has `PRAGMA foreign_keys = ON`, which is what
+makes the declared constraints (and the orphan audit above) meaningful.
+=======
+
 ## Rollback procedure
 
 Since there are no down migrations, rollback is:

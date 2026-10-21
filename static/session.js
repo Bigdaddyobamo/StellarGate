@@ -17,18 +17,17 @@ export var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
 /** How long a remembered key stays valid, in milliseconds (7 days). */
 var KEY_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
-/**
- * A tiny Map-backed Storage stand-in, used when neither sessionStorage nor
- * localStorage is available (private mode, tests, non-browser hosts).
- */
-export function memoryStorage() {
-  var map = new Map();
-  return {
-    getItem: function (key) { return map.has(key) ? map.get(key) : null; },
-    setItem: function (key, value) { map.set(key, String(value)); },
-    removeItem: function (key) { map.delete(key); },
-  };
-}
+// Storage keys used by the session store.
+export const KEY_NAME = "stellargate.apiKey";
+export const KEY_SAVED_AT = "stellargate.apiKeySavedAt";
+
+// How long a stored key's display window lasts, in milliseconds.
+const SESSION_TTL_MS = 30 * 60 * 1000;
+
+// In-memory storage for the API key. Deliberately not persisted anywhere so
+// the key can never leak through URLs, logs or console output.
+let storedKey = null;
+let storedKeyExpiresAt = 0;
 
 /** Read a key, swallowing storage errors (quota, disabled storage). */
 function safeGet(storage, key) {
@@ -54,6 +53,53 @@ function safeRemove(storage, key) {
     if (storage) storage.removeItem(key);
   } catch (e) {
     /* non-fatal */
+  }
+}
+
+// Drops the in-memory key.
+export function forgetKey() {
+  storedKey = null;
+  storedKeyExpiresAt = 0;
+}
+
+// A minimal in-memory Storage stand-in used when no storage area is supplied.
+function memoryStorage() {
+  var data = {};
+  return {
+    getItem: function (k) {
+      return Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null;
+    },
+    setItem: function (k, v) {
+      data[k] = String(v);
+    },
+    removeItem: function (k) {
+      delete data[k];
+    },
+  };
+}
+
+function safeGet(area, key) {
+  try {
+    return area.getItem(key);
+  } catch (e) {
+    return null;
+  }
+}
+
+function safeSet(area, key, value) {
+  try {
+    area.setItem(key, value);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function safeRemove(area, key) {
+  try {
+    area.removeItem(key);
+  } catch (e) {
+    /* ignore */
   }
 }
 

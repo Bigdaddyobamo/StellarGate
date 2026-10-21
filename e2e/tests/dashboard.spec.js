@@ -221,3 +221,90 @@ test.describe("dashboard smoke", () => {
     await expect(link).toHaveAttribute("rel", /noopener/);
   });
 });
+
+/* Visual regression coverage (issue #826).
+ *
+ * CSS refactors (#685, #686) can quietly change the layout, so the gate, the
+ * table, the drawer and the empty states are snapshotted in light and dark at
+ * desktop and mobile widths. Baselines live under `e2e/tests/__screenshots__`
+ * and are committed; a diff above `maxDiffPixelRatio` fails CI.
+ *
+ * The API key is only ever typed into the gate input and sent as an
+ * Authorization header — never placed in a URL, log line or console output.
+ * The gate snapshot is taken before any key is entered, and the signed-in
+ * snapshots mask the key field so a credential cannot leak into a baseline.
+ */
+
+const THEMES = ["light", "dark"];
+const VIEWPORTS = [
+  { name: "desktop", width: 1280, height: 800 },
+  { name: "mobile", width: 390, height: 844 },
+];
+
+// A small tolerance absorbs sub-pixel font rasterisation differences between
+// Chrome, Firefox and Safari without hiding a real layout change.
+const SNAPSHOT_OPTIONS = { maxDiffPixelRatio: 0.02, animations: "disabled" };
+
+async function applyTheme(page, theme) {
+  await page.emulateMedia({ colorScheme: theme });
+  await page.evaluate((t) => {
+    document.documentElement.dataset.theme = t;
+  }, theme);
+}
+
+async function signIn(page, seedData) {
+  await page.getByLabel("API key").fill(seedData.apiKey);
+  await page.getByRole("button", { name: "Sign in" }).click();
+  await expect(page.locator("#app")).toBeVisible();
+  await expect(page.locator("#rows tr").first()).toBeVisible();
+}
+
+test.describe("dashboard visual regression", () => {
+  for (const viewport of VIEWPORTS) {
+    for (const theme of THEMES) {
+      test(`gate, table, drawer and empty states — ${viewport.name} ${theme}`, async ({
+        page,
+        seedData,
+      }) => {
+        await page.setViewportSize({
+          width: viewport.width,
+          height: viewport.height,
+        });
+        await page.goto("/dashboard");
+        await applyTheme(page, theme);
+
+        // Gate: the sign-in form, before any credential is entered.
+        await expect(page.locator("#gate")).toBeVisible();
+        await expect(page.locator("#gate")).toHaveScreenshot(
+          `gate-${viewport.name}-${theme}.png`,
+          SNAPSHOT_OPTIONS,
+        );
+
+        await signIn(page, seedData);
+
+        // Table: the populated list. Mask the key field so a credential can
+        // never end up baked into a committed baseline.
+        await expect(page.locator("#app")).toHaveScreenshot(
+          `table-${viewport.name}-${theme}.png`,
+          { ...SNAPSHOT_OPTIONS, mask: [page.getByLabel("API key")] },
+        );
+
+        // Drawer: the detail panel for a single payment.
+        await rowWithMemo(page, "e2e-order-alpha").click();
+        await expect(page.locator("#detail")).toBeVisible();
+        await expect(page.locator("#detail")).toHaveScreenshot(
+          `drawer-${viewport.name}-${theme}.png`,
+          SNAPSHOT_OPTIONS,
+        );
+
+        // Empty state: a search that matches nothing.
+        await page.getByLabel("Search payments").fill("no-such-payment-xyz");
+        await expect(page.locator("#rows tr")).toHaveCount(0);
+        await expect(page.locator("#app")).toHaveScreenshot(
+          `empty-${viewport.name}-${theme}.png`,
+          { ...SNAPSHOT_OPTIONS, mask: [page.getByLabel("API key")] },
+        );
+      });
+    }
+  }
+});
