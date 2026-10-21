@@ -21,7 +21,13 @@ pub fn connect_options(database_url: &str, busy_timeout: Duration) -> Result<Sql
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
-        .busy_timeout(busy_timeout))
+        .busy_timeout(busy_timeout)
+        /* SQLite disables foreign-key enforcement per connection by default,
+        so declaring `REFERENCES` in the schema is not enough: without this
+        every pooled connection would happily accept an orphan row. Set it
+        explicitly rather than relying on a sqlx default that has changed
+        across majors (issue #271). */
+        .foreign_keys(true))
 }
 
 /// Open the SQLite pool with [`connect_options`].

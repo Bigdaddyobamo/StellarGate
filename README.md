@@ -1730,11 +1730,8 @@ Released under the [MIT License](LICENSE).
 <!-- handsoff-issue-680 -->
 - #680: Dashboard: convert promise chains to async/await
 
-<!-- handsoff-issue-883 -->
-- #883: Webhook delivery rows record only `status` and `attempts`, not the receiver's response, so a failed delivery can't be diagnosed
+<!-- handsoff-issue-285 -->
+- #285: No tracing spans carry `merchant_id` or `payment_id` through the settlement path
 
-<!-- handsoff-issue-884 -->
-- #884: Manual redelivery consumes the automatic retry budget again (regression of #235), and has no audit log, no metrics, and can overwrite a `delivered` record
-
-<!-- handsoff-issue-886 -->
-- #886: Failed `X-Admin-Secret` attempts are neither logged nor counted, and admin key listing gets the 5× read quota, so brute force goes unnoticed
+<!-- handsoff-issue-301 -->
+- #301: `settle()` awaits webhook delivery inline, so one slow receiver stalls settlement for every other intent
