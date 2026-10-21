@@ -5,6 +5,12 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>StellarGate Dashboard</title>
     <link rel="stylesheet" href="/dashboard/app.css" />
+    <!-- Applies the stored theme preference before the first paint. Must be a
+         classic script in <head>: a module is deferred, so it would run after
+         the page has already painted in the OS palette and flash. A separate
+         file rather than an inline block because the dashboard CSP is
+         `script-src 'self'` with no `unsafe-inline`. See #713. -->
+    <script src="/dashboard/theme.js"></script>
     <link
       rel="icon"
       href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='14' font-size='14'>&#9733;</text></svg>"
@@ -22,7 +28,24 @@
            the API key in the URL and the browser history. A POST lands the key
            in a request body that this route answers with 405. -->
       <form id="gate-form" class="card gate-card" method="post" autocomplete="off">
-        <h1>StellarGate</h1>
+        <div class="gate-head">
+          <h1>StellarGate</h1>
+          <!-- The theme control appears here and in the top bar because both
+               panels are individually visible states of the same page:
+               whichever one is on screen should offer the override.
+               `data-theme-toggle` is what the script binds, so both stay in
+               sync from one handler. -->
+          <button
+            type="button"
+            class="ghost theme-toggle"
+            data-theme-toggle
+            aria-pressed="false"
+            title="Switch to dark theme"
+          >
+            <span class="theme-icon" aria-hidden="true">&#9788;</span>
+            <span class="visually-hidden">Dark theme</span>
+          </button>
+        </div>
         <p class="muted">Sign in with a merchant API key to view payments.</p>
         <label for="api-key">API key</label>
         <input
@@ -38,7 +61,7 @@
           <span>Keep me signed in on this device</span>
         </label>
         <button type="submit" class="primary">Sign in</button>
-        <p id="gate-error" class="error" hidden></p>
+        <p id="gate-error" class="error" role="alert" hidden></p>
         <p class="muted small">
           The key is held in your browser only and sent as a bearer token
           directly to this gateway. It is never stored on the server.
@@ -55,67 +78,99 @@
           <span class="muted small" id="version"></span>
         </div>
         <div class="topbar-right">
+          <span id="session-expiry" class="muted small"></span>
           <span id="health" class="pill pill-idle" title="Gateway health">
             checking&hellip;
           </span>
+          <button
+            type="button"
+            class="ghost theme-toggle"
+            data-theme-toggle
+            aria-pressed="false"
+            title="Switch to dark theme"
+          >
+            <span class="theme-icon" aria-hidden="true">&#9788;</span>
+            <span class="visually-hidden">Dark theme</span>
+          </button>
           <button id="sign-out" class="ghost">Sign out</button>
         </div>
       </header>
 
       <main>
+        <div id="live-region" class="sr-only" aria-live="polite" aria-atomic="true"></div>
         <section class="toolbar">
-          <div class="filters" role="group" aria-label="Filter by status">
-            <button class="chip chip-on" data-status="">All</button>
-            <button class="chip" data-status="pending">Pending</button>
-            <button class="chip" data-status="completed">Completed</button>
-            <button class="chip" data-status="underpaid">Underpaid</button>
-            <button class="chip" data-status="expired">Expired</button>
+          <!-- aria-label overrides the visible <span> as the accessible name,
+               so "Search" identifies one control rather than a label and an
+               input with the same text. -->
+          <div class="search">
+            <label class="small muted" for="search">Search</label>
+            <input
+              id="search"
+              type="search"
+              aria-label="Search payments"
+              placeholder="Memo or payment ID"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button
+              id="search-clear"
+              class="ghost"
+              type="button"
+              aria-label="Clear search"
+              hidden
+            >
+              &times;
+            </button>
           </div>
+          <div class="filters" role="group" aria-label="Filter by status">
+            <button class="chip chip-on" data-status="" data-label="All" aria-pressed="true">All</button>
+            <button class="chip" data-status="pending" data-label="Pending" aria-pressed="false">Pending</button>
+            <button class="chip" data-status="completed" data-label="Completed" aria-pressed="false">Completed</button>
+            <button class="chip" data-status="underpaid" data-label="Underpaid" aria-pressed="false">Underpaid</button>
+            <button class="chip" data-status="expired" data-label="Expired" aria-pressed="false">Expired</button>
+          </div>
+          <div class="filters" role="group" aria-label="Filter by creation date">
+            <label class="small" for="created-after">From</label>
+            <input id="created-after" type="date" />
+            <label class="small" for="created-before">To</label>
+            <input id="created-before" type="date" />
+            <button class="ghost preset" type="button" data-days="1" aria-pressed="false">Today</button>
+            <button class="ghost preset" type="button" data-days="7" aria-pressed="false">Last 7 days</button>
+            <button class="ghost preset" type="button" data-days="30" aria-pressed="false">Last 30 days</button>
+          </div>
+          <label class="small checkbox" for="auto-refresh">
+            <input id="auto-refresh" type="checkbox" />
+            <span>Auto-refresh</span>
+          </label>
+          <label class="small" for="page-size">Page size</label>
+          <select id="page-size">
+            <option>10</option>
+            <option selected>25</option>
+            <option>50</option>
+            <option>100</option>
+          </select>
+          <button id="export-csv" class="ghost">Export CSV</button>
+          <span id="selection-count" class="muted small" hidden></span>
+          <button id="export-selected" class="ghost" hidden>Export selected</button>
           <button id="refresh" class="ghost">Refresh</button>
+          <button id="new-payment-btn" class="primary" aria-haspopup="dialog">New payment</button>
+          <button id="help-open" class="ghost" aria-haspopup="dialog">
+            Shortcuts&nbsp;<kbd>?</kbd>
+          </button>
         </section>
+
+        <!-- Rate-limit notice. Shown when the API answers 429 so the user is
+             told when to retry instead of a generic error. The refresh button
+             is disabled until the parsed `Retry-After` time elapses. -->
+        <p id="rate-limit" class="error" role="status" hidden></p>
+
+        <section id="summary" class="summary" aria-label="Payment summary"></section>
 
         <section class="card">
-          <table class="payments">
-            <caption id="payments-caption" class="sr-only">
-              Payments: all statuses
-            </caption>
+          <table class="payments" aria-label="Payments">
             <thead>
               <tr>
-                <th scope="col">Status</th>
-                <th scope="col">Amount</th>
-                <th scope="col">Memo</th>
-                <th scope="col">Created</th>
-                <th scope="col">Payment ID</th>
-              </tr>
-            </thead>
-            <tbody id="rows"></tbody>
-          </table>
-          <p id="empty" class="empty" hidden>No payments match this filter.</p>
-          <p id="list-error" class="error" hidden></p>
-          <div class="table-foot">
-            <button id="load-more" class="ghost" hidden>Load more</button>
-          </div>
-        </section>
-      </main>
+                <th class="select-col">
+                  <input id="select-all" type="checkbox" aria-label
 
-      <!-- Detail panel, opened by clicking a row. -->
-      <aside id="detail" class="detail" hidden aria-label="Payment detail">
-        <div class="detail-head">
-          <h2>Payment</h2>
-          <button id="detail-close" class="ghost" aria-label="Close">&times;</button>
-        </div>
-        <dl id="detail-fields" class="fields"></dl>
-
-        <h3>Webhook deliveries</h3>
-        <p id="deliveries-empty" class="muted small" hidden>
-          No delivery attempts recorded for this payment.
-        </p>
-        <p id="deliveries-error" class="error" hidden></p>
-        <ul id="deliveries" class="deliveries"></ul>
-      </aside>
-      <div id="scrim" class="scrim" hidden></div>
-    </div>
-
-    <script src="/dashboard/app.js"></script>
-  </body>
-</html>
+/* … truncated 5332 chars — edit only what you need near the top … */

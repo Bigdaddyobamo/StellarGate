@@ -3,7 +3,7 @@
 
 [![CI](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml/badge.svg)](https://github.com/StellarGateLabs/StellarGate/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.94%2B-orange.svg)](https://www.rust-lang.org)
 
 A payment gateway API built on [Stellar](https://stellar.org) for accepting, verifying, and settling payments in XLM, USDC, and any other Stellar asset you configure.
 
@@ -86,7 +86,7 @@ A payment is matched on three independent attributes — **memo**, **destination
 | API key lifecycle | ✅ | CSPRNG keys, rotation with overlap, instant revocation |
 | Data retention | ✅ | Background pruning of aged delivery rows and idempotency keys |
 | API versioning | ✅ | `/v1` prefix with a documented deprecation policy |
-| Prometheus metrics | ✅ | `GET /metrics` |
+| Prometheus metrics | ✅ | `GET /metrics`, gated behind `METRICS_TOKEN` (unset — disabled by default) |
 | Dashboard UI | ✅ | Served at `/dashboard`; no build step or separate deploy |
 
 ## Architecture
@@ -118,11 +118,15 @@ tests/             Integration tests (API, concurrency, rate limits, webhooks, t
 
 **Two independent listeners** run concurrently. The SSE stream gives near-real-time settlement; the interval poller re-scans from a persisted cursor and acts as a reconciler for anything missed during a reconnect. Both converge on the same idempotent settlement path, so a payment observed twice settles once.
 
+**Both listeners resume from a persisted cursor across restarts**, under separate `kv_state` keys (`horizon_stream_cursor` and `horizon_payment_cursor`) so neither drags the other backwards. A deploy therefore does not cost the stream its ~1 s settlement latency: it reconnects from the last event it handled and works forward through whatever landed while the process was down, rather than re-baselining at the live edge and leaving the gap to the poller. Only a genuinely fresh database — no cursor under either key — starts at the live edge. Re-seeing records the other listener already handled is harmless; settlement is idempotent through `processed_transactions`.
+
+**Shutdown is observed mid-catch-up.** A poll cycle checks the shutdown signal at every page boundary, right after it checkpoints its cursor, so `SIGTERM` during a long backlog drain is honoured in one page rather than after the whole backlog (or, worse, by being killed mid-page once the 30 s shutdown grace expires). `POLL_MAX_PAGES_PER_CYCLE` bounds a single cycle for the same reason.
+
 ### Tech Stack
 
 | Layer | Choice |
 |---|---|
-| Language | Rust (2021 edition, 1.88+) |
+| Language | Rust (2024 edition, 1.94+) |
 | HTTP | [axum](https://github.com/tokio-rs/axum) + [tower-http](https://github.com/tower-rs/tower-http) |
 | Database | SQLite via [sqlx](https://github.com/launchbadge/sqlx) (WAL mode) |
 | Async runtime | [tokio](https://tokio.rs) |
@@ -135,7 +139,7 @@ tests/             Integration tests (API, concurrency, rate limits, webhooks, t
 
 ### Prerequisites
 
-- **Rust 1.88 or newer** — [install via rustup](https://rustup.rs)
+- **Rust 1.94 or newer** — [install via rustup](https://rustup.rs)
 - A Stellar account public key to receive payments (testnet keys: [Stellar Laboratory](https://laboratory.stellar.org/#account-creator))
 
 ### Install and Run
@@ -193,17 +197,39 @@ deploy. Sign in with any merchant API key.
 
 | View | What it does |
 |---|---|
-| Payments | Table of the merchant's payments, filterable by status, paged with the keyset cursor |
+| Payments | Table of the merchant's payments, filterable by one or more statuses, paged with the keyset cursor |
 | Payment detail | Full record — amounts, memo, destination, transaction hash, timestamps |
 | Webhook deliveries | Every attempt for a payment, with a one-click **Redeliver** |
 | Health | Live `/ready` indicator, polled every 30s |
+
+The detail panel is a modal `<dialog>`: opened with `showModal()`, so the rest
+of the page is inert rather than merely covered, and it is a keyboard trap
+while open — it takes focus when it opens, `Tab` and `Shift+Tab` cycle inside
+it (a modal dialog does not wrap at the ends in any current browser), `Escape`
+or a click outside closes it, and focus goes back to the row you opened it
+from. Without all that, a keyboard user tabs straight out into the payment
+table behind the panel and, on close, lands on `<body>` with the next `Tab`
+restarting from the top of the document.
+
+The page follows the OS light/dark preference, and a toggle on the sign-in card
+and in the top bar overrides it. The choice is remembered in `localStorage`
+under `stellargate.theme` and applied before the first paint, so it never
+flashes; with nothing stored, the page keeps following the OS.
+
+**Accessibility.** The detail panel is a real modal `<dialog>` with a focus
+trap and a focus ring of its own, and the light and dark palettes are both held
+to WCAG 2.1 AA. `scripts/check-dashboard-contrast.mjs` re-checks every colour
+pair in CI, reading the real stylesheet, so a token cannot drift out of the
+standard unnoticed.
 
 **How it's built.** The page is plain HTML, CSS, and dependency-free
 JavaScript, compiled into the binary with `include_str!`. There is no npm, no
 bundler, and no `node_modules`: the deployable artifact stays a single Rust
 binary, and the dashboard cannot drift out of sync with the API it ships
-alongside. It is also a plain client of the documented REST API — it uses no
-private endpoints, so anything it displays you can fetch yourself.
+alongside. CI still runs `node --check static/dashboard.js` and a small static
+accessibility smoke check so dashboard changes get fast feedback without adding
+a frontend toolchain. It is also a plain client of the documented REST API —
+it uses no private endpoints, so anything it displays you can fetch yourself.
 
 **Security.**
 
@@ -280,8 +306,14 @@ Current trustline state is on `GET /metrics`, so it's alertable rather than
 grep-only:
 
 ```
-# a confirmed-missing trustline
+# a confirmed-missing or unauthorized trustline
 stellargate_missing_trustlines{asset="USDC"} 1
+
+# trustline exists but is_authorized=false (issuer revoked authorization)
+stellargate_trustline_unauthorized{asset="USDC"} 1
+
+# remaining capacity in stroops (limit - balance); alert when near your typical payment size
+stellargate_trustline_headroom_stroops{asset="USDC"} 9223372036854775807
 
 # how many checks have failed to reach Horizon at all — distinct from a
 # confirmed-absent trustline, which only ever comes from a check that
@@ -293,6 +325,20 @@ stellargate_trustline_check_failures_total 0
 # until this is nonzero
 stellargate_trustline_check_last_success_timestamp_seconds 1732000000
 ```
+
+`stellargate_missing_trustlines=1` covers two distinct cases — both cause payments
+to bounce on-chain:
+
+- **No trustline** — the account has no balance line for this asset. Add one with `changeTrust`.
+- **Unauthorized trustline** — the balance line exists but `is_authorized=false`. The issuer uses
+  `AUTH_REQUIRED` and has not yet granted (or has revoked) authorization. Contact the issuer.
+
+`stellargate_trustline_unauthorized` distinguishes the second case from the first, so an alert can
+recommend the right action.
+
+`stellargate_trustline_headroom_stroops` is the remaining capacity (`limit - balance`). A payment
+that would push the balance past `limit` fails on-chain just like a missing trustline. Alert when
+this approaches your typical payment size.
 
 A Horizon outage during a check only increments
 `stellargate_trustline_check_failures_total`; it leaves the last confirmed
@@ -348,6 +394,7 @@ XLM free to cover one per asset.
 | `STELLAR_LISTENER_MODE` | `stream` (SSE + poller reconciler) or `poll` (interval only) | `stream` |
 | `POLL_INTERVAL_SECS` | How often the poller reconciles | `10` |
 | `CURSOR_STALENESS_MULTIPLE` | Multiplier on `POLL_INTERVAL_SECS` that may elapse without a successful poll/stream event before `/ready` reports the detection cursor stale (`503`). A healthy poller cycles on the poll interval, so this only trips when the poller died or the stream wedged. | `3` |
+| `POLL_MAX_PAGES_PER_CYCLE` | Maximum Horizon pages (200 records each) one poll cycle walks before yielding to the next tick. Bounds how long a catch-up can monopolise the poller; the cursor is checkpointed at every page boundary, so the next cycle resumes exactly where this one stopped. `0` = unlimited. | `50` |
 | `PAYMENT_TTL_SECS` | How long an intent stays `pending` before expiring, from `created_at` | `3600` |
 | `EXPIRY_BATCH_SIZE` | Maximum overdue intents the expiry sweeper transitions per sweep | `500` |
 
@@ -443,10 +490,10 @@ Recovers deliveries left `pending`/`failed` by a process that exited mid-send or
 | `WEBHOOK_REDRIVE_INTERVAL_SECS` | Scan frequency | `30` |
 | `WEBHOOK_REDRIVE_CONCURRENCY` | Max redrive requests in flight | `4` |
 | `WEBHOOK_REDRIVE_MAX_ATTEMPTS` | Total attempts (inline + redrive) before a delivery is left permanently `failed` | `8` |
-| `WEBHOOK_REDRIVE_GRACE_SECS` | Idle time required before the worker touches a row, so it never races an in-flight inline delivery. Also the floor under the backoff. | `60` |
-| `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Exponential backoff base: `initial × 2^(attempts−1)`. A row never attempted is exempt and gated only by the grace window. `0` disables growth. | `30` |
-| `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Backoff ceiling. Must be `≥` the initial value. | `900` |
-| `WEBHOOK_REDRIVE_JITTER_SECS` | Random extra delay (0–N seconds, drawn per row) on top of the window above. `0` disables. | `30` |
+| `WEBHOOK_REDRIVE_GRACE_SECS` | Idle time required before the worker touches a row, so it never races an in-flight inline delivery. Also the floor under the backoff. Must be `1..=86,400`. | `60` |
+| `WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS` | Exponential backoff base: `initial × 2^(attempts−1)`. A row never attempted is exempt and gated only by the grace window. Must be `0..=86,400`; `0` disables growth. | `30` |
+| `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS` | Backoff ceiling. Must be `1..=86,400` and `≥` the initial value. | `900` |
+| `WEBHOOK_REDRIVE_JITTER_SECS` | Random extra delay (0–N seconds, drawn per row) on top of the window above. Must be `0..=86,400`; `0` disables. | `30` |
 
 The jitter is what actually decorrelates a batch. Rows that failed together
 share an `attempts` value and a near-identical `last_attempt`, so
@@ -484,6 +531,7 @@ until it finished; a backlog drains over several cycles instead.
 | Variable | Description | Default |
 |---|---|---|
 | `ADMIN_PROVISIONING_SECRET` | Required via `X-Admin-Secret` to call `POST /merchants`. Unset disables provisioning entirely (always `401`). | _(unset — disabled)_ |
+| `METRICS_TOKEN` | Required via `Authorization: Bearer <token>` to call `GET /metrics`. Unset disables scraping entirely (always `401`) — the endpoint exposes auth outcome counters and webhook delivery volume, so it must not be reachable anonymously by default (issue #250). | _(unset — disabled)_ |
 | `CORS_ALLOWED_ORIGINS` | Comma-separated origins. **Required** on `public`; omitting on testnet falls back to permissive with a warning. | _(unset)_ |
 | `RATE_LIMIT_REQUESTS_PER_SEC` | Base per-IP limit. Write routes get this rate; read-only routes get 5×. Must be `> 0` — boot fails otherwise; there is no "disabled" value. | `10` |
 | `TRUSTED_PROXY_CIDRS` | Comma-separated CIDR blocks whose `X-Forwarded-For`/`X-Real-IP` headers are honored for rate-limit bucketing and auth-log attribution. Every other peer is attributed by its own address and its headers are ignored — the safe default. | _(unset — headers ignored)_ |
@@ -567,6 +615,11 @@ GET  /v1/payments/:id
 POST /v1/merchants
 ```
 
+The bundled dashboard uses this same canonical prefix through one shared API
+base, so all of its authenticated requests track the current API version.
+Operational requests such as `/` and `/ready` remain unversioned as described
+below.
+
 Unversioned paths (`/payments`, `/merchants`) still work and serve the same
 data, so nothing breaks today. They respond with headers pointing at their
 replacement:
@@ -580,6 +633,12 @@ Operational endpoints — `/health`, `/ready`, `/metrics`, `/dashboard` and `/` 
 are **not** versioned. They are infrastructure rather than contract; moving a
 liveness probe with every API revision would break probes and scrape configs
 for no benefit.
+
+The full request/response contract — the `Idempotency-Key` request header and
+the `Deprecation`, `Link` and `x-request-id` response headers included — is
+described in [`openapi.yaml`](openapi.yaml). CI lints that spec and
+cross-checks its documented paths against the live router, so it cannot quietly
+drift from what the service actually serves.
 
 #### Deprecation policy
 
@@ -654,17 +713,47 @@ edge: earlier revisions of `openapi.yaml` advertised it, but the handler has
 always taken the merchant from the API key, so a client that sent it believed
 it was choosing the tenant and was not.
 
+**Query strings are closed too.** The listing endpoints accept exactly the
+parameters documented for them, and anything else is rejected with `400`
+`unknown_parameter` naming the offending key:
+
+```bash
+curl "http://localhost:3000/v1/payments?stauts=completed" \
+  -H "Authorization: Bearer $API_KEY"
+```
+
+```json
+{
+  "error": "invalid query string: Failed to deserialize query string: unknown field `stauts`, expected one of `status`, `limit`, `offset`, `cursor`, `include_total`",
+  "code": "unknown_parameter"
+}
+```
+
+The cost of the old behaviour was the same as for bodies, and quieter: a
+discarded filter is an unfiltered page returned as `200 OK`, so
+`?stauts=completed` listed every payment including pending ones and a
+reconciliation script that filtered server-side read unpaid intents as paid.
+`?page` and `?per_page` are the other common shapes of this — plausible
+pagination names that this API has never used. Closing the parameter set also
+keeps it evolvable: while unknown parameters were ignored, adding a real `page`
+later would silently change the behaviour of requests that appeared to work.
+
 | Code | HTTP | Meaning |
 |---|---|---|
 | `unauthorized` | `401` | Missing/invalid API key or admin secret |
 | `invalid_request` | `400` | Malformed JSON or a deserialization failure |
 | `unknown_field` | `400` | Request body contained a field the endpoint does not accept |
+| `unknown_parameter` | `400` | Query string contained a parameter the endpoint does not accept |
+| `invalid_query` | `400` | Query string could not be deserialized (e.g. a non-numeric `limit`) |
 | `unsupported_media_type` | `415` | `Content-Type` is not `application/json` |
+| `payload_too_large` | `413` | Request body exceeds the configured maximum size (`MAX_BODY_BYTES`) |
 | `unsupported_asset` | `400` | Asset is not in `ACCEPTED_ASSETS` |
 | `invalid_amount` | `400` | Not a positive decimal with ≤ 7 decimal places |
 | `invalid_webhook_url` | `400` | Malformed, disallowed scheme, over 2048 chars, or SSRF-rejected |
 | `invalid_status` | `400` | `status` filter is not a recognized value |
 | `invalid_cursor` | `400` | `cursor` could not be decoded |
+| `conflicting_pagination` | `400` | `cursor` and `offset` were sent together |
+| `invalid_limit` | `400` | `limit` is outside `1..=PAGINATION_MAX_LIMIT` |
 | `payment_not_found` | `404` | No such payment, or it belongs to another merchant |
 | `merchant_not_found` | `404` | No merchant with that id |
 | `key_not_found` | `404` | No active key with that id for this merchant |
@@ -672,11 +761,22 @@ it was choosing the tenant and was not.
 | `invalid_label` | `400` | Key label exceeds 100 characters |
 | `delivery_not_found` | `404` | No such delivery for that payment |
 | `webhook_target_blocked` | `400` | Redelivery target rejected by the SSRF guard |
+| `already_delivered` | `409` | Delivery was already successfully delivered; pass `?force=true` to redeliver anyway |
 | `webhook_delivery_failed` | `502` | Receiver returned a non-success response |
 | `rate_limit_exceeded` | `429` | Per-IP bucket limit exceeded |
-| `idempotency_conflict` | `500` | Concurrent creates raced on one idempotency key |
+| `idempotency_conflict` | `409` | Concurrent creates raced on one idempotency key; retry |
 | `not_found` | `404` | No matching route |
+| `method_not_allowed` | `405` | Path exists, but not for this HTTP method |
+| `request_timeout` | `408` | Request exceeded `REQUEST_TIMEOUT_SECS` |
 | `internal_error` | `500` | Unexpected server-side failure |
+
+`405`, `413`, and `408` are otherwise generated by axum and `tower_http`
+themselves — before this, they carried an empty body rather than the envelope
+above, so a client parsing the documented contract got a JSON decode failure
+instead of an error it could act on. A response-rewriting middleware
+(`json_error_envelope_middleware` in `src/api/mod.rs`) fills in the envelope
+for these three cases wherever nothing downstream has already answered with
+one.
 
 ---
 
@@ -730,7 +830,22 @@ curl -X POST http://localhost:3000/merchants/$MERCHANT_ID/keys \
 ### `GET /merchants/:id/keys`
 
 List a merchant's keys, including revoked ones so the history stays visible.
-Admin only.
+Admin only. Keyset (cursor) paginated with the same conventions as
+[`GET /payments`](#get-payments) — revoked keys are never deleted, so a
+merchant that rotates regularly accumulates rows without bound, and this
+endpoint used to return every one of them in a single unbounded response
+(issue #262).
+
+| Param | Default | Notes |
+|---|---|---|
+| `limit` | 20 (max 100) | Page size. Rejected with `400 invalid_limit` outside `1..=100`, not silently clamped. |
+| `cursor` | _(unset)_ | Opaque cursor from a previous response's `next_cursor`. Omit for the first page. |
+| `active` | _(unset — both)_ | `true` returns only usable keys, `false` only revoked ones. Omitted returns both. |
+
+```bash
+curl "http://localhost:3000/merchants/$MERCHANT_ID/keys?limit=20&active=true" \
+  -H "X-Admin-Secret: $ADMIN_PROVISIONING_SECRET"
+```
 
 **`200 OK`**
 
@@ -747,7 +862,9 @@ Admin only.
       "revoked_at": null,
       "active": true
     }
-  ]
+  ],
+  "limit": 20,
+  "next_cursor": null
 }
 ```
 
@@ -757,6 +874,12 @@ deciding which to revoke. `last_used_at` is refreshed at most once a minute per
 key: it runs on every authenticated request, and SQLite takes a write lock per
 update, so touching it unconditionally would put a write in the path of every
 read.
+
+A full page (`keys.len() == limit`) mints `next_cursor` from its last row; pass
+it back as `cursor` to fetch the next page. A short page (or an empty one)
+returns `next_cursor: null`, meaning there is nothing more. `active=true` lets
+an operator looking for currently-usable keys skip straight past the revoked
+history instead of paging through it to find them.
 
 ---
 
@@ -794,7 +917,7 @@ Create a payment intent. Requires a merchant API key; the merchant is taken from
 | Field | Type | Required | Constraints |
 |---|---|---|---|
 | `amount` | string | ✅ | Positive decimal, ≤ 7 decimal places |
-| `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. |
+| `asset` | string | ❌ | Must be in `ACCEPTED_ASSETS`. Defaults to `XLM`. The issuer configured for that code is resolved at creation time and returned as `asset_issuer`; it is not accepted in the request. |
 | `webhook_url` | string | ❌ | ≤ 2048 chars; scheme must be allowed; HTTPS required on `public`; SSRF-checked |
 
 Any other field is rejected with `400` `unknown_field` — see [Error
@@ -904,12 +1027,12 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 | Param | Description | Default |
 |---|---|---|
 | `status` | Filter by `pending`, `completed`, `underpaid`, or `expired` | all |
-| `limit` | Page size, 1–100 | `20` |
-| `cursor` | Keyset cursor from a previous `next_cursor` | — |
-| `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. | `0` |
+| `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
+| `cursor` | Keyset cursor from a previous `next_cursor`. Mutually exclusive with `offset`. | — |
+| `offset` | Rows to skip (legacy; prefer `cursor`). Capped at `10000` — above that, `400 invalid_offset`. Mutually exclusive with `cursor`. | `0` |
 | `include_total` | Offset mode only. Compute and return `total`. | `false` |
 
-**`200 OK`** — cursor mode (no `cursor` parameter on the first request)
+**`200 OK`** — cursor mode (`cursor` set)
 
 ```json
 {
@@ -919,7 +1042,7 @@ List the authenticated merchant's payments, newest first. Supports **cursor**
 }
 ```
 
-**`200 OK`** — offset mode (no `cursor` parameter, `offset` set)
+**`200 OK`** — offset mode (no `cursor` parameter; `offset` set, or neither set)
 
 ```json
 {
@@ -934,6 +1057,16 @@ Both modes order rows identically (`created_at DESC`, then `id DESC` to break
 the whole-second `created_at` ties), so a `next_cursor` returned by an offset
 page resumes cleanly in cursor mode. `next_cursor` is `null` on the final page
 of either mode. Offset mode additionally returns `offset`.
+
+**Pick one mode per request.** Sending `cursor` and `offset` together is `400
+conflicting_pagination`. The two modes answer from different queries and return
+different bodies, so there is no reading of "both" that is not a guess: the
+request would be served from the cursor, `offset` silently discarded, and the
+`offset` field absent from the response. That matters most during the very
+migration the `next_cursor` above exists to encourage, which is when a client is
+most likely to still be sending its old `offset`. Presence is what counts, not
+the value, so `?cursor=...&offset=0` is rejected too. Drop `offset` from the
+request once you start passing `cursor`.
 
 > **`total` is opt-in (`?include_total=true`), not sent by default.** SQLite
 > has no cached row count, so computing `total` is a full `COUNT(*)` scan over
@@ -983,8 +1116,11 @@ List delivery attempts for a payment, newest first. Requires the owning merchant
 | Query param | Description | Default |
 |---|---|---|
 | `status` | Filter by delivery status: `pending`, `delivered`, or `failed` | — |
-| `limit` | Page size (clamped to `1..=100`) | `20` |
+| `limit` | Page size, 1–100. Outside that range: `400 invalid_limit`. | `20` |
 | `cursor` | Keyset cursor from a previous `next_cursor` | — |
+
+Any other query parameter is rejected with `400` `unknown_parameter` — see
+[Error Envelope](#error-envelope).
 
 `next_cursor` is `null` on the final page. To page through the history, start with a
 request that carries **no** `cursor`, then pass the previous response's `next_cursor`
@@ -1030,8 +1166,12 @@ look.
 | Query | Default | Notes |
 |---|---|---|
 | `status` | `failed` | One of `failed`, `pending`, `delivered` |
-| `limit` | `20` | 1–100 |
+| `limit` | `20` | 1–100; outside that range: `400 invalid_limit` |
 | `cursor` | — | Opaque keyset cursor, same convention as `GET /payments` |
+
+Any other query parameter is rejected with `400` `unknown_parameter`. It matters
+most here, where `status` defaults to `failed`: a typo'd filter would otherwise
+answer with the dead-letter list and look entirely plausible.
 
 ```bash
 curl "http://localhost:3000/v1/payments/webhooks?status=failed&limit=50" \
@@ -1184,7 +1324,7 @@ Readiness probe. Runs `SELECT 1` against the database, probes Horizon (3 s timeo
 
 ### `GET /metrics`
 
-Prometheus exposition format. See [Observability](#observability).
+Prometheus exposition format. Requires `Authorization: Bearer <METRICS_TOKEN>`; unset `METRICS_TOKEN` disables the endpoint entirely (always `401`). See [Observability](#observability).
 
 ### `GET /dashboard`
 
@@ -1205,6 +1345,7 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 | Top-up reaching exactly the total | `completed` | `payment.completed` | — |
 | Top-up exceeding the total | `completed` | `payment.overpaid` | cumulative excess |
 | TTL elapsed, unpaid | `expired` | `payment.expired` | — |
+| Payment after `completed` or `expired` | unchanged | `payment.unexpected` | unexpected amount to refund |
 
 **Overpayment** fulfils the intent. The `delta` field carries the excess; refunding it is the merchant's responsibility — the gateway cannot send funds.
 
@@ -1213,8 +1354,7 @@ Every on-chain payment matched by memo, destination, and asset resolves as follo
 **Limitations to be aware of:**
 
 - Only a **single** top-up is tracked per underpaid intent. If more is needed, the payer should send the full remaining `delta` in one transaction.
-- Once an intent is `completed`, further payments to the same address and memo are **not** tracked and fire no webhooks.
-- Failed on-chain transactions are ignored entirely.
+- Once an intent is `completed`, further payments to the same address and memo fire a `payment.unexpected` webhook so the merchant can refund them, but the intent's `completed` status is not changed.
 
 ---
 
@@ -1230,6 +1370,7 @@ When a payment reaches a terminal state, StellarGate POSTs a signed JSON event t
 | `payment.overpaid` | Cumulative received exceeds it (`delta` = excess, `full` detail only) |
 | `payment.underpaid` | Payment received but short (`delta` = shortfall, `full` detail only) |
 | `payment.expired` | TTL elapsed with no payment |
+| `payment.unexpected` | Payment received after intent is already `completed` or `expired` (`delta` = the unexpected amount the merchant must refund) |
 
 ### Payload detail
 
@@ -1384,7 +1525,7 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## Observability
 
-`GET /metrics` exposes Prometheus metrics:
+`GET /metrics` exposes Prometheus metrics, gated behind `Authorization: Bearer <METRICS_TOKEN>` (issue #250). Unset (the default), the endpoint is disabled entirely — every scrape gets `401` rather than exposing auth outcome counters and webhook delivery volume to anonymous callers. Set `METRICS_TOKEN` to a strong random value (`openssl rand -hex 32`) to enable scraping, and configure Prometheus's `authorization` scrape option with the same value. `deploy/Caddyfile` also blocks the path at the edge by default (see [Deployment](DEPLOYMENT.md#operating)) — remove that block only if you intend to scrape from outside the Docker network.
 
 | Metric | Type | Description |
 |---|---|---|
@@ -1411,6 +1552,11 @@ To report a vulnerability, see [SECURITY.md](SECURITY.md).
 | `stellargate_db_pool_connections` | gauge | SQLite connection pool size, labelled by `state` (`idle`, `in_use`) |
 | `stellargate_db_pool_max_connections` | gauge | Configured maximum pool size |
 | `stellargate_db_file_size_bytes` | gauge | On-disk size of the SQLite database files, labelled by `file` (`main`, `wal`, `shm`); absent for an in-memory database |
+| `stellargate_missing_trustlines` | gauge | `1` if the gateway account has no usable trustline for this asset (absent or unauthorized); `0` if confirmed usable |
+| `stellargate_trustline_unauthorized` | gauge | `1` if the trustline exists but `is_authorized=false` (issuer revoked/has not granted authorization) |
+| `stellargate_trustline_headroom_stroops` | gauge | Remaining trustline capacity in stroops (`limit - balance`); alert when near your typical payment size |
+| `stellargate_trustline_check_failures_total` | counter | Trustline checks that failed to reach Horizon (does not affect `stellargate_missing_trustlines`) |
+| `stellargate_trustline_check_last_success_timestamp_seconds` | gauge | Unix timestamp of the last confirmed trustline check; `0` until first success |
 
 **Alert on `stellargate_tasks_live < stellargate_tasks_expected`.** That
 comparison was not previously possible: `stellargate_tasks_stopped_total` was
@@ -1420,7 +1566,17 @@ compare it against. `stellargate_task_disabled` is what separates "switched off
 on purpose" from "not running", which `stellargate_task_running` alone reports
 identically.
 
-Structured logs (via `tracing`) carry an `x-request-id` on every request, propagated to responses. Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
+Structured logs (via `tracing`) carry a `request_id` field on every request span, matching the `x-request-id` response header returned to clients. Every log line emitted during a request — including internal errors (`AppError`), audit events, and auth denials — inherits `request_id` automatically from the span context. Operators can search logs directly using the request ID returned in response headers:
+
+```bash
+# Filter JSON logs by request ID quoted by a client:
+jq 'select(.request_id == "7f3a...")' /var/log/stellargate.log
+
+# Grep structured text logs by request ID:
+grep 'request_id=7f3a...' /var/log/stellargate.log
+```
+
+Settlement logs include `settlement_latency_secs`, and both listeners log `cursor_age_secs` so poller lag is visible before a merchant notices.
 
 Control verbosity with `RUST_LOG`, e.g. `RUST_LOG=stellargate=debug,tower_http=debug`.
 
@@ -1501,21 +1657,20 @@ Schema is applied at startup by `db::migrate` in [`src/db.rs`](src/db.rs), calle
 - Tables and indexes are created with `CREATE TABLE IF NOT EXISTS` / `CREATE INDEX IF NOT EXISTS`.
 - New columns on existing tables are added by probing `pragma_table_info(...)` first, then `ALTER TABLE ... ADD COLUMN`.
 - A few one-time data backfills (populating `processed_transactions` from legacy rows, filling `asset_issuer` from `ACCEPTED_ASSETS`, normalising pre-RFC 3339 timestamps) run alongside them.
+- `payments.asset_issuer` is the one backfill that does *not* run on every boot: it reconstructs the issuer of pre-existing rows from the configured allow-list, so re-running it after an `ACCEPTED_ASSETS` edit would rewrite history a second time. It runs once per database, guarded by a `kv_state` marker, from `db::backfill_asset_issuers` — and rows created before it are best-effort by nature, since the issuer they were priced in was never recorded.
 
 Every statement is written to be safe to re-run, because **all of them run on every boot**. There is no version table, nothing is recorded as applied, and the whole sequence is not wrapped in a transaction.
 
-> [!IMPORTANT]
-> The `migrations/` directory is **not read at runtime.** Nothing in the codebase calls `sqlx::migrate!`, and the SQL in that directory has drifted from the live schema — it is missing `merchants`, `api_keys`, `processed_transactions`, and the `webhook_deliveries.event_type` column. Treat `db::migrate` as the only source of schema truth until this is resolved.
->
-> Tracked in #92 (this documentation), #93 (the two diverging sources), and #268 (adopting a recorded schema version).
+`db::migrate` is **the only schema definition in this repository.** There used to be a second, hand-synchronised one — a `migrations/` directory of numbered `.sql` files that nothing ever executed (no `sqlx::migrate!` call anywhere in the codebase) and that had silently drifted to the point of missing `merchants`, `api_keys`, `processed_transactions`, and the `webhook_deliveries.event_type` column: a database built from those files could not authenticate a request or record a settlement. It looked authoritative — numbered, in the conventional location — which made it actively misleading rather than merely unused, so it was removed rather than left as a second definition a future change could drift from again (issue #308). `tests/schema_snapshot_test.rs` now keeps `db::migrate` itself honest: it asserts a freshly migrated database matches the checked-in `tests/schema_snapshot.sql` exactly, so a schema change that isn't reflected there fails CI instead of drifting silently — the same failure mode the old `migrations/` directory had, closed by making the live schema self-verifying instead of hand-copied.
 
 **Changing the schema**
 
 1. Add the statement to `db::migrate` in `src/db.rs`, keeping it idempotent — it will run on every startup of every existing deployment.
 2. For a new column on an existing table, follow the `pragma_table_info` probe pattern already used for `expires_at` and `event_type`. SQLite rejects a non-constant `DEFAULT` on `ALTER TABLE ... ADD COLUMN`, so add the column nullable and backfill it in a second statement.
-3. Run `cargo test` — the suite calls `db::migrate` against an in-memory database, so syntax errors surface immediately.
+3. Run `cargo test` — the suite calls `db::migrate` against an in-memory database, so syntax errors surface immediately, and `tests/schema_snapshot_test.rs` will fail with the new schema's exact text, ready to paste into `tests/schema_snapshot.sql`.
+4. Review the snapshot diff like any other schema change, and update this section's tables/docs if you added something a reader would need to know about.
 
-Because there is no version tracking, a change that is *not* safe to re-run cannot currently be expressed. If you need one, resolve #268 first rather than working around it.
+Because there is no version tracking, a change that is *not* safe to re-run cannot currently be expressed. If you need one, resolve #268 (adopting `sqlx::migrate!` with a recorded schema version) first rather than working around it — that is the bigger, separate change this snapshot test deliberately does not attempt to replace.
 
 ---
 
@@ -1528,7 +1683,7 @@ cargo fmt                   # format
 cargo clippy --all-targets -- -D warnings
 ```
 
-CI enforces all four on every pull request, plus a [`cargo audit`](https://github.com/rustsec/rustsec) RustSec advisory scan (also run weekly on a schedule). The test suite runs on both the minimum supported Rust version (1.88) and stable; `cargo fmt` and `cargo clippy` currently run on stable only, which can differ from the pinned toolchain you get locally (#294).
+CI enforces all four on every pull request, plus a [`cargo audit`](https://github.com/rustsec/rustsec) RustSec advisory scan (also run weekly on a schedule) and an [OpenAPI lint](https://redocly.com/docs/cli) of `openapi.yaml`. The test suite additionally cross-checks the spec's documented paths against the live router (`tests/openapi_contract.rs`), so a route added without a matching spec change — or a spec change with no route — fails the build. The test suite runs on both the minimum supported Rust version (1.94) and stable; `cargo fmt` and `cargo clippy` currently run on stable only, which can differ from the pinned toolchain you get locally (#294).
 
 `deny.toml` is present but no workflow runs `cargo deny` yet, so its license, ban, and duplicate-version policy is not currently enforced (#293).
 
@@ -1541,7 +1696,7 @@ CI enforces all four on every pull request, plus a [`cargo audit`](https://githu
 | `tests/rate_limit_tests.rs` | Per-bucket limiting |
 | `tests/webhook_dispatch_tests.rs` | Signing, retries, redrive |
 | `tests/trustline_tests.rs` | Asset trustline checks |
-| `tests/db_shared_memory_tests.rs` | Proves the shared-cache in-memory SQLite fixture (below) is actually shared across pooled connections |
+| `tests/openapi_contract.rs` | `openapi.yaml` ↔ router: paths resolve, deprecation headers, path-set parity |
 
 Integration tests run against an in-memory SQLite database and a [wiremock](https://github.com/LukeMathWalker/wiremock-rs) HTTP server — no network access or external services required.
 
@@ -1569,3 +1724,14 @@ Release history is kept in [CHANGELOG.md](CHANGELOG.md).
 ## License
 
 Released under the [MIT License](LICENSE).
+
+## Handsoff notes
+
+<!-- handsoff-issue-680 -->
+- #680: Dashboard: convert promise chains to async/await
+
+<!-- handsoff-issue-285 -->
+- #285: No tracing spans carry `merchant_id` or `payment_id` through the settlement path
+
+<!-- handsoff-issue-301 -->
+- #301: `settle()` awaits webhook delivery inline, so one slow receiver stalls settlement for every other intent

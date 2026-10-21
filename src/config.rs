@@ -1,6 +1,5 @@
 use anyhow::Result;
 use ipnet::IpNet;
-use std::collections::HashSet;
 
 /// How the service detects incoming on-chain payments.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,47 +10,6 @@ pub enum ListenerMode {
     Stream,
     /// Only run the interval poller; no streaming connection is opened.
     Poll,
-}
-
-/// How much detail an outbound webhook payload carries.
-///
-/// `Minimal` (the default) sends just `event`, `payment_id`, `status`, and
-/// `updated_at`. `Full` additionally sends `merchant_id`, `amount`,
-/// `paid_amount`, `asset`, `asset_issuer`, `tx_hash`, and `delta`.
-///
-/// The receiver already knows its own `merchant_id` — it's *their* id — so
-/// including it adds nothing for a legitimate recipient while making an
-/// intercepted or misdirected payload immediately attributable, and the same
-/// reasoning applies to the amounts. HMAC signing proves authenticity, not
-/// confidentiality, and on any network other than `public`,
-/// `ALLOWED_WEBHOOK_SCHEMES` may still include `http` — so a rich payload can
-/// transit in cleartext. A receiver that needs the detail can fetch it over
-/// the authenticated `GET /v1/payments/:id` channel instead (issue #306).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WebhookPayloadDetail {
-    Minimal,
-    Full,
-}
-
-impl WebhookPayloadDetail {
-    /// Parse `WEBHOOK_PAYLOAD_DETAIL` from a raw env-var value.
-    ///
-    /// - Empty / unset → defaults to `Minimal` (no error).
-    /// - `"minimal"` or `"full"` (case-insensitive) → the chosen level.
-    /// - Any other non-empty value → `Err`, which aborts boot with a clear
-    ///   message rather than silently falling back to a different level.
-    fn parse(raw: &str) -> Result<Self> {
-        match raw.trim().to_ascii_lowercase().as_str() {
-            "" => Ok(Self::Minimal),
-            "minimal" => Ok(Self::Minimal),
-            "full" => Ok(Self::Full),
-            other => Err(anyhow::anyhow!(
-                "WEBHOOK_PAYLOAD_DETAIL={other:?} is not a recognised value. \
-                 Valid values are \"minimal\" or \"full\". \
-                 Fix the environment variable or remove it to use the default (\"minimal\")."
-            )),
-        }
-    }
 }
 
 impl ListenerMode {
@@ -79,8 +37,7 @@ impl ListenerMode {
 ///
 /// `issuer` is `None` for the native XLM asset; all other assets require an
 /// issuer address. Configure via `ACCEPTED_ASSETS` as comma-separated entries
-/// of the form `CODE` (native XLM only) or `CODE:ISSUER`. A non-native code
-/// without an issuer is rejected at boot (issue #221).
+/// of the form `CODE` (native) or `CODE:ISSUER`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AcceptedAsset {
     pub code: String,
@@ -122,80 +79,6 @@ impl AcceptedAsset {
     }
 }
 
-/// A configured payment-amount bound (`MAX_PAYMENT_AMOUNT` / `MIN_PAYMENT_AMOUNT`),
-/// stored in stroops. Parsed like `ACCEPTED_ASSETS`: comma-separated entries
-/// of either a bare amount (the default applied to every asset without its
-/// own entry) or `CODE:AMOUNT` pinning a bound to one specific asset code,
-/// which always wins over the default. Unset (the empty string, the default)
-/// means no bound at all — the previous behaviour, where the only ceiling was
-/// `i64` overflow in `parse_stroops` (issue #310).
-///
-/// `MAX_PAYMENT_AMOUNT=100000,USDC:50000` caps every asset at 100,000 units
-/// except USDC, which is capped at 50,000.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AmountLimit {
-    default_stroops: Option<i64>,
-    per_asset_stroops: std::collections::HashMap<String, i64>,
-}
-
-impl AmountLimit {
-    /// Parse a raw `MAX_PAYMENT_AMOUNT`/`MIN_PAYMENT_AMOUNT` value. `pub` (not
-    /// `pub(crate)`) so integration tests can build a specific bound directly,
-    /// the same way they build other `Config` fields without going through
-    /// `Config::from_env`.
-    pub fn parse(raw: &str, var_name: &str) -> Result<Self> {
-        let mut default_stroops = None;
-        let mut per_asset_stroops = std::collections::HashMap::new();
-
-        for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-            let (code, amount_str) = match entry.split_once(':') {
-                Some((c, a)) => (Some(c.trim().to_uppercase()), a.trim()),
-                None => (None, entry),
-            };
-            let stroops = crate::money::parse_stroops(amount_str).ok_or_else(|| {
-                anyhow::anyhow!(
-                    "{var_name} entry {entry:?} is not a valid positive amount with at \
-                     most 7 decimal places."
-                )
-            })?;
-            match code {
-                Some(code) => {
-                    if per_asset_stroops.insert(code.clone(), stroops).is_some() {
-                        return Err(anyhow::anyhow!(
-                            "{var_name} has more than one entry for asset {code}. \
-                             Keep exactly one per code."
-                        ));
-                    }
-                }
-                None => {
-                    if default_stroops.replace(stroops).is_some() {
-                        return Err(anyhow::anyhow!(
-                            "{var_name} has more than one bare (default) entry — \
-                             only a single default applies to every asset without its \
-                             own CODE:AMOUNT entry."
-                        ));
-                    }
-                }
-            }
-        }
-
-        Ok(Self {
-            default_stroops,
-            per_asset_stroops,
-        })
-    }
-
-    /// The bound in stroops that applies to `asset_code`, if any: the
-    /// asset-specific entry when present, else the bare default entry, else
-    /// no bound at all.
-    pub fn for_asset(&self, asset_code: &str) -> Option<i64> {
-        self.per_asset_stroops
-            .get(&asset_code.to_ascii_uppercase())
-            .copied()
-            .or(self.default_stroops)
-    }
-}
-
 #[derive(Clone)]
 pub struct Config {
     pub port: u16,
@@ -203,10 +86,8 @@ pub struct Config {
     pub network: String,
     pub horizon_url: String,
     pub gateway_public: String,
-    /// Assets the gateway will accept, validated on POST /payments.
-    /// Duplicate codes are rejected at boot (issue #222). Non-native entries
-    /// without an issuer are also refused (issue #221). Configure via
-    /// `ACCEPTED_ASSETS=XLM,USDC:GISSUER` (comma-separated).
+    /// Assets the gateway will accept, validated on POST /payments and in verify().
+    /// Configure via ACCEPTED_ASSETS=XLM,USDC:GISSUER (comma-separated).
     pub accepted_assets: Vec<AcceptedAsset>,
     pub webhook_secret: String,
     pub webhook_retry_attempts: u32,
@@ -223,10 +104,6 @@ pub struct Config {
     /// arbitrarily far out and keep a settlement waiting on it.
     pub webhook_retry_max_delay_ms: u64,
     pub allowed_webhook_schemes: Vec<String>,
-    /// Controls how much detail `webhook::build_payload` includes. See
-    /// [`WebhookPayloadDetail`]. Configure via `WEBHOOK_PAYLOAD_DETAIL`
-    /// (`"minimal"`, the default, or `"full"`).
-    pub webhook_payload_detail: WebhookPayloadDetail,
     /// Per-attempt timeout for outbound webhook POSTs, in seconds. Each
     /// delivery attempt is bounded independently, so a slow receiver can't
     /// hold up the retry loop (or the reconciler) for more than this value.
@@ -245,14 +122,11 @@ pub struct Config {
     /// permanently.
     pub webhook_redrive_max_attempts: u32,
     /// How long (seconds) a delivery must sit idle since its last attempt (or
-    /// creation) before the redrive worker will touch it. Must exceed the
-    /// worst-case inline delivery time so the worker never races a `dispatch()`
-    /// call that is still in flight for the same row — see
-    /// [`Self::worst_case_inline_delivery_secs`], which is checked at boot
-    /// (issue #238). That bound used to be
-    /// `attempts * (timeout + delay)`; now that the inline delay is
-    /// exponential rather than constant, the delays are summed across the
-    /// actual schedule. Acts as a hard floor under the exponential backoff
+    /// creation) before the redrive worker will touch it. Must comfortably
+    /// exceed the worst-case inline delivery time
+    /// (`webhook_retry_attempts * (webhook_timeout_secs + webhook_retry_delay_ms)`)
+    /// so the worker never races a `dispatch()` call that is still in flight
+    /// for the same row. Acts as a hard floor under the exponential backoff
     /// below — a row is never touched sooner than this, even on its very
     /// first redrive attempt.
     pub webhook_redrive_grace_secs: i64,
@@ -268,17 +142,6 @@ pub struct Config {
     /// that has failed many times still gets retried at a bounded cadence
     /// rather than being pushed further and further out.
     pub webhook_redrive_backoff_max_secs: i64,
-    /// Width (seconds) of the random offset added to each row's redrive
-    /// eligibility, `0` to disable.
-    ///
-    /// Exponential backoff alone does not desynchronise a co-failing batch:
-    /// rows that failed together share an `attempts` value and a near-identical
-    /// `last_attempt`, so `initial * 2^(attempts-1)` schedules their next
-    /// attempts at the same instant, and the worker — which computes
-    /// eligibility in SQL from `last_attempt` — re-clusters them on every
-    /// subsequent pass. A per-row random offset is what actually breaks the
-    /// batch apart (issue #318).
-    pub webhook_redrive_jitter_secs: i64,
     /// How often the retention worker prunes rows that have outlived their
     /// usefulness. Both tables below grow monotonically without it, so on a
     /// long-running deployment the disk is the only thing that stops them.
@@ -291,21 +154,16 @@ pub struct Config {
     /// pruning.
     pub idempotency_retention_days: i64,
     pub poll_interval_secs: u64,
-    /// How many `POLL_INTERVAL_SECS` may elapse without a successful Horizon
-    /// poll (or stream event) before `/ready` reports the payment-detection
-    /// cursor as stale and returns `503`. A healthy poller cycles on the poll
-    /// interval, so the default of 3 tolerates a couple of missed cycles
-    /// (transient Horizon errors) while still catching a permanently dead
-    /// poller or a wedged stream (issue #315).
-    pub cursor_staleness_multiple: u32,
+    /// Maximum number of Horizon pages a single poll cycle will walk before it
+    /// yields and waits for the next tick. Bounds how long one cycle can
+    /// monopolise the poller task while catching up on a large backlog; the
+    /// cursor is checkpointed at every page boundary, so the next cycle picks
+    /// up exactly where this one stopped. `0` means unlimited — one cycle runs
+    /// until it is fully caught up (issue #226).
+    pub poll_max_pages_per_cycle: u32,
     /// How long a payment intent stays `pending` before the expiry sweeper
     /// transitions it to `expired`. Counted from the intent's `created_at`.
     pub payment_ttl_secs: u64,
-    /// Maximum number of overdue intents the expiry sweeper transitions in one
-    /// sweep. Batching keeps each sweeper write short — SQLite has a single
-    /// writer, so one unbounded sweep over a large backlog would stall payment
-    /// writes until it finished (issue #323).
-    pub expiry_batch_size: i64,
     /// Maximum number of requests per second allowed per client IP before the
     /// rate-limit middleware responds with `429 Too Many Requests`.
     pub rate_limit_requests_per_sec: u32,
@@ -329,6 +187,11 @@ pub struct Config {
     /// `POST /merchants`. Empty disables provisioning entirely — the endpoint
     /// rejects every request rather than falling back to an open default.
     pub admin_provisioning_secret: String,
+    /// Shared bearer token required (via `Authorization: Bearer <token>`) to
+    /// call `GET /metrics`. Empty disables scraping entirely — the endpoint
+    /// rejects every request rather than exposing webhook/auth counters to
+    /// anonymous callers by default (issue #250).
+    pub metrics_token: String,
     /// Per-request timeout for the whole API, in seconds. A request whose
     /// handler hasn't produced a response within this window is aborted with
     /// `408 Request Timeout`, so a slow client or a stuck handler can't tie up
@@ -353,69 +216,6 @@ pub struct Config {
     /// means no proxy is trusted and the headers are always ignored — the
     /// safe default for a directly-exposed gateway.
     pub trusted_proxy_cidrs: Vec<IpNet>,
-    /// Maximum amount (in the asset's own units) `POST /payments` will accept,
-    /// optionally per asset. Configure via `MAX_PAYMENT_AMOUNT` — a bare
-    /// number applies to every asset, `CODE:AMOUNT` pins a bound to one asset
-    /// specifically, and a comma-separated mix of both is allowed. Unset (the
-    /// default) means no bound; the only ceiling is `i64` overflow in
-    /// `parse_stroops` (issue #310).
-    pub max_payment_amount: AmountLimit,
-    /// Minimum amount `POST /payments` will accept, configured the same way
-    /// as [`Self::max_payment_amount`]. Unset means no bound beyond
-    /// `parse_stroops` already rejecting non-positive amounts.
-    pub min_payment_amount: AmountLimit,
-    /// Reject request bodies larger than this many bytes before they reach a
-    /// handler. Defaults to 256 KiB, generous for the current API; an
-    /// operator who wants a tighter DoS ceiling can lower it without a
-    /// rebuild (issue #279).
-    pub max_body_bytes: usize,
-    /// Maximum number of distinct IP+bucket rate-limiter keys tracked at
-    /// once, across both the IP limiter and the per-merchant limiter. Once
-    /// reached, the least-recently-used entry is evicted, bounding resident
-    /// memory regardless of key cardinality. Behind a proxy fronting many
-    /// client IPs the default of 10,000 can evict constantly, losing limiter
-    /// state; behind a single proxy IP it is mostly wasted slots — both are
-    /// deployment-shaped, not a design invariant (issue #279).
-    pub rate_limiter_max_keys: u64,
-    /// How long (seconds) a per-key rate limiter is retained after its last
-    /// access before being reclaimed. Defaults to 60.
-    pub rate_limiter_idle_ttl_secs: u64,
-    /// Default page size for offset- and cursor-paginated list endpoints
-    /// (`GET /payments`, `/webhook_deliveries`, …) when the caller does not
-    /// pass `limit`. Defaults to 20.
-    pub pagination_default_limit: i64,
-    /// Upper bound `limit` is clamped to on those same endpoints, regardless
-    /// of what the caller requests. Defaults to 100.
-    pub pagination_max_limit: i64,
-    /// How long (seconds) shutdown waits for background tasks (poller,
-    /// sweeper, redrive, retention, trustline checker, stream) to drain
-    /// before forcing exit. Defaults to 30.
-    ///
-    /// Must exceed the orchestrator's own termination grace period to be
-    /// meaningful: Kubernetes' `terminationGracePeriodSeconds` defaults to
-    /// 30s too, so with both left at their defaults the orchestrator can
-    /// SIGKILL the process at the same instant this budget expires, cutting a
-    /// still-draining task off mid-work rather than letting it finish.
-    /// Docker Compose's `stop_grace_period` defaults lower, to 10s, so it
-    /// undercuts this value even sooner unless raised to match. See
-    /// "Shutdown grace" in
-    /// DEPLOYMENT.md.
-    pub shutdown_grace_secs: u64,
-    /// How many payment records to request per Horizon page, both while
-    /// catching up and during steady-state polling. Directly controls how
-    /// long an uninterruptible poll cycle runs. Defaults to 200.
-    pub horizon_page_limit: u32,
-    /// Rows removed (or compacted) per retention `DELETE`/`UPDATE`
-    /// statement. Deleting in batches keeps each write lock short — SQLite
-    /// has a single writer, so one unbounded statement over a large table
-    /// would stall payment writes until it finished. Defaults to 500.
-    pub db_prune_batch_size: i64,
-    /// Upper bound on rows removed per table per retention cycle. Without
-    /// this, the first run against a large backlog would delete
-    /// indefinitely, monopolising the single writer; whatever is left is
-    /// picked up next cycle, so a backlog drains over several passes instead
-    /// of one long stall. Defaults to 50,000.
-    pub retention_max_rows_per_cycle: u64,
 }
 
 impl Config {
@@ -439,23 +239,16 @@ impl Config {
         };
 
         /* Independent of network: HTTPS is enforced unconditionally on
-        `public` regardless of this list (see `api::payments::create`), but on
-        any other network an operator who has widened this allow-list to
-        include `http` is choosing to let webhook payloads — which may carry
-        tenant and financial detail, see `WebhookPayloadDetail` — transit in
-        cleartext. That should never be silent (issue #306). */
+        `public` regardless of this list, but on any other network an
+        operator who has widened this allow-list to include `http` is
+        choosing to let webhook payloads transit in cleartext. That should
+        never be silent (issue #306). */
         if allowed_webhook_schemes.iter().any(|s| s == "http") {
             tracing::warn!(
                 "ALLOWED_WEBHOOK_SCHEMES includes \"http\": webhook deliveries to a \
-                 plaintext endpoint are not encrypted in transit. See the \"Webhook \
-                 payload exposure\" section of SECURITY.md for what a webhook body \
-                 can expose to a network observer."
+                 plaintext endpoint are not encrypted in transit."
             );
         }
-
-        let webhook_payload_detail = WebhookPayloadDetail::parse(
-            &std::env::var("WEBHOOK_PAYLOAD_DETAIL").unwrap_or_default(),
-        )?;
 
         let cors_allowed_origins: Vec<String> = {
             let raw_origins: Vec<String> = std::env::var("CORS_ALLOWED_ORIGINS")
@@ -487,6 +280,42 @@ impl Config {
             ));
         }
 
+        let webhook_allow_private_targets: bool =
+            parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?;
+
+        // Refuse to boot on a public-network deployment with the SSRF guard
+        // disabled. With WEBHOOK_ALLOW_PRIVATE_TARGETS=true any authenticated
+        // merchant can craft a webhook_url that reaches cloud instance-metadata
+        // endpoints (169.254.169.254), services bound to loopback, or hosts on
+        // the internal network — and get a response oracle back through
+        // GET /payments/:id/webhooks (issue #246).
+        if network == "public" && webhook_allow_private_targets {
+            return Err(anyhow::anyhow!(
+                "WEBHOOK_ALLOW_PRIVATE_TARGETS must not be enabled when \
+                 STELLAR_NETWORK=public. It disables the SSRF guard, letting any \
+                 merchant's webhook_url reach cloud metadata endpoints \
+                 (169.254.169.254) and internal services. This flag is only for \
+                 local development and tests — remove it before deploying to \
+                 production."
+            ));
+        }
+
+        // Warn on any network so the flag cannot be left on unnoticed on a
+        // staging or development host that shares configuration with production
+        // (issue #246).
+        if webhook_allow_private_targets {
+            tracing::warn!(
+                "WEBHOOK_ALLOW_PRIVATE_TARGETS=true: the SSRF guard is disabled. \
+                 Webhook targets may reach loopback, link-local, and private-range \
+                 addresses. This flag is only for local development and tests — \
+                 never enable it in a deployment that handles real payments."
+            );
+        }
+
+        let admin_provisioning_secret =
+            Self::validate_admin_secret(std::env::var("ADMIN_PROVISIONING_SECRET"))?;
+        let metrics_token = Self::validate_metrics_token(std::env::var("METRICS_TOKEN"))?;
+
         let config = Self {
             port: parse_env("PORT", 3000)?,
             database_url,
@@ -503,7 +332,6 @@ impl Config {
             },
             webhook_secret,
             allowed_webhook_schemes,
-            webhook_payload_detail,
             webhook_retry_attempts: parse_env("WEBHOOK_RETRY_ATTEMPTS", 3)?,
             webhook_retry_delay_ms: parse_env("WEBHOOK_RETRY_DELAY_MS", 5000)?,
             webhook_retry_max_delay_ms: parse_env("WEBHOOK_RETRY_MAX_DELAY_MS", 60_000)?,
@@ -517,14 +345,12 @@ impl Config {
                 30,
             )?,
             webhook_redrive_backoff_max_secs: parse_env("WEBHOOK_REDRIVE_BACKOFF_MAX_SECS", 900)?,
-            webhook_redrive_jitter_secs: parse_env("WEBHOOK_REDRIVE_JITTER_SECS", 30)?,
             retention_interval_secs: parse_env("RETENTION_INTERVAL_SECS", 3600)?,
             webhook_delivery_retention_days: parse_env("WEBHOOK_DELIVERY_RETENTION_DAYS", 30)?,
             idempotency_retention_days: parse_env("IDEMPOTENCY_RETENTION_DAYS", 7)?,
             poll_interval_secs: parse_env("POLL_INTERVAL_SECS", 10)?,
-            cursor_staleness_multiple: parse_env("CURSOR_STALENESS_MULTIPLE", 3)?,
+            poll_max_pages_per_cycle: parse_env("POLL_MAX_PAGES_PER_CYCLE", 50)?,
             payment_ttl_secs: parse_env("PAYMENT_TTL_SECS", 3600)?,
-            expiry_batch_size: parse_env("EXPIRY_BATCH_SIZE", 500)?,
             rate_limit_requests_per_sec: parse_env("RATE_LIMIT_REQUESTS_PER_SEC", 10)?,
             db_pool_max_connections: parse_env("DB_POOL_MAX_CONNECTIONS", 10)?,
             db_busy_timeout_ms: parse_env("DB_BUSY_TIMEOUT_MS", 5000)?,
@@ -532,35 +358,17 @@ impl Config {
             listener_mode: ListenerMode::parse(
                 &std::env::var("STELLAR_LISTENER_MODE").unwrap_or_default(),
             )?,
-            webhook_allow_private_targets: parse_env("WEBHOOK_ALLOW_PRIVATE_TARGETS", false)?,
-            admin_provisioning_secret: env_or("ADMIN_PROVISIONING_SECRET", ""),
+            webhook_allow_private_targets,
+            admin_provisioning_secret,
+            metrics_token,
             request_timeout_secs: parse_env("REQUEST_TIMEOUT_SECS", 30)?,
             stream_idle_timeout_secs: parse_env("STREAM_IDLE_TIMEOUT_SECS", 30)?,
             trusted_proxy_cidrs: parse_cidrs(
                 &std::env::var("TRUSTED_PROXY_CIDRS").unwrap_or_default(),
             )?,
-            max_payment_amount: AmountLimit::parse(
-                &std::env::var("MAX_PAYMENT_AMOUNT").unwrap_or_default(),
-                "MAX_PAYMENT_AMOUNT",
-            )?,
-            min_payment_amount: AmountLimit::parse(
-                &std::env::var("MIN_PAYMENT_AMOUNT").unwrap_or_default(),
-                "MIN_PAYMENT_AMOUNT",
-            )?,
-            max_body_bytes: parse_env("MAX_BODY_BYTES", 256 * 1024)?,
-            rate_limiter_max_keys: parse_env("RATE_LIMITER_MAX_KEYS", 10_000)?,
-            rate_limiter_idle_ttl_secs: parse_env("RATE_LIMITER_IDLE_TTL_SECS", 60)?,
-            pagination_default_limit: parse_env("PAGINATION_DEFAULT_LIMIT", 20)?,
-            pagination_max_limit: parse_env("PAGINATION_MAX_LIMIT", 100)?,
-            shutdown_grace_secs: parse_env("SHUTDOWN_GRACE_SECS", 30)?,
-            horizon_page_limit: parse_env("HORIZON_PAGE_LIMIT", 200)?,
-            db_prune_batch_size: parse_env("DB_PRUNE_BATCH_SIZE", 500)?,
-            retention_max_rows_per_cycle: parse_env("RETENTION_MAX_ROWS_PER_CYCLE", 50_000)?,
         };
         config.validate_addresses()?;
         config.validate_timing()?;
-        config.validate_amount_limits()?;
-        config.validate_limits()?;
         Ok(config)
     }
 
@@ -592,137 +400,8 @@ impl Config {
                         issuer
                     )
                 })?;
-            } else if !asset.code.eq_ignore_ascii_case("XLM") {
-                /* `issuer: None` is how parse_list represents native XLM. A bare
-                `USDC` entry used to produce the same shape, and `verify()` then
-                treated any native XLM payment as settling that USDC intent
-                (issue #221). */
-                return Err(anyhow::anyhow!(
-                    "ACCEPTED_ASSETS entry \"{}\" has no issuer. Only the native asset (XLM) \
-                     may be written without one; every other asset must be given as CODE:ISSUER.",
-                    asset.code
-                ));
             }
         }
-        /* Stellar asset codes are not unique — anyone can issue `USDC`. Two
-        allow-list entries sharing a code made `verify()` accept a payment from
-        either issuer against an intent that stored only the code (issue #222). */
-        let mut seen_codes = HashSet::new();
-        for asset in &self.accepted_assets {
-            let code = asset.code.to_ascii_uppercase();
-            if !seen_codes.insert(code.clone()) {
-                return Err(anyhow::anyhow!(
-                    "ACCEPTED_ASSETS has duplicate code {code}. Stellar asset codes are not \
-                     unique across issuers; pin each code to a single issuer."
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// Reject a configured `MIN_PAYMENT_AMOUNT` that is greater than the
-    /// effective `MAX_PAYMENT_AMOUNT` for the same asset — such a bound pair
-    /// would make every amount for that asset invalid, which is never the
-    /// intent of a min/max pair (issue #310). Checked over every accepted
-    /// asset's code, since that is the set of codes `POST /payments` can
-    /// actually be asked to validate against; an entry naming a code that
-    /// isn't accepted is inert and not checked here.
-    fn validate_amount_limits(&self) -> Result<()> {
-        for asset in &self.accepted_assets {
-            let max = self.max_payment_amount.for_asset(&asset.code);
-            let min = self.min_payment_amount.for_asset(&asset.code);
-            if let (Some(max), Some(min)) = (max, min) {
-                if min > max {
-                    return Err(anyhow::anyhow!(
-                        "MIN_PAYMENT_AMOUNT ({}) is greater than MAX_PAYMENT_AMOUNT ({}) for \
-                         asset {}. Every amount would be rejected as out of range.",
-                        crate::money::stroops_to_string(min),
-                        crate::money::stroops_to_string(max),
-                        asset.code,
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Validate the deployment-tunable limits promoted from compile-time
-    /// constants (issue #279): each must be a value the code that consumes it
-    /// can actually act on, so a misconfiguration aborts boot with a clear
-    /// message instead of silently degenerating into a no-op or a tight loop.
-    fn validate_limits(&self) -> Result<()> {
-        if self.max_body_bytes == 0 {
-            return Err(anyhow::anyhow!(
-                "MAX_BODY_BYTES must be > 0 (got 0). \
-                 A zero limit would reject every request body outright."
-            ));
-        }
-
-        if self.rate_limiter_max_keys == 0 {
-            return Err(anyhow::anyhow!(
-                "RATE_LIMITER_MAX_KEYS must be > 0 (got 0). \
-                 A zero capacity would evict every rate-limiter entry immediately, \
-                 making the limit ineffective."
-            ));
-        }
-
-        if self.rate_limiter_idle_ttl_secs == 0 {
-            return Err(anyhow::anyhow!(
-                "RATE_LIMITER_IDLE_TTL_SECS must be > 0 (got 0). \
-                 A zero TTL would evict a rate-limiter entry before the next \
-                 request could ever reuse it."
-            ));
-        }
-
-        if self.pagination_default_limit <= 0 {
-            return Err(anyhow::anyhow!(
-                "PAGINATION_DEFAULT_LIMIT must be > 0 (got {}). \
-                 A zero or negative default page size would return nothing.",
-                self.pagination_default_limit
-            ));
-        }
-
-        if self.pagination_max_limit < self.pagination_default_limit {
-            return Err(anyhow::anyhow!(
-                "PAGINATION_MAX_LIMIT ({}) must be >= PAGINATION_DEFAULT_LIMIT ({}). \
-                 With the current settings the default page size would already \
-                 exceed the ceiling it is clamped to.",
-                self.pagination_max_limit,
-                self.pagination_default_limit
-            ));
-        }
-
-        if self.shutdown_grace_secs == 0 {
-            return Err(anyhow::anyhow!(
-                "SHUTDOWN_GRACE_SECS must be > 0 (got 0). \
-                 A zero grace period would force-exit before any background \
-                 task got a chance to drain."
-            ));
-        }
-
-        if self.horizon_page_limit == 0 {
-            return Err(anyhow::anyhow!(
-                "HORIZON_PAGE_LIMIT must be > 0 (got 0). \
-                 A zero page size would make the Horizon poller request nothing \
-                 on every page, forever."
-            ));
-        }
-
-        if self.db_prune_batch_size <= 0 {
-            return Err(anyhow::anyhow!(
-                "DB_PRUNE_BATCH_SIZE must be > 0 (got {}). \
-                 A zero or negative batch would make retention pruning a no-op.",
-                self.db_prune_batch_size
-            ));
-        }
-
-        if self.retention_max_rows_per_cycle == 0 {
-            return Err(anyhow::anyhow!(
-                "RETENTION_MAX_ROWS_PER_CYCLE must be > 0 (got 0). \
-                 A zero per-cycle cap would make retention pruning a no-op."
-            ));
-        }
-
         Ok(())
     }
 
@@ -733,14 +412,10 @@ impl Config {
     /// - `PAYMENT_TTL_SECS == 0` → every intent expires the moment it is created
     /// - `PAYMENT_TTL_SECS < POLL_INTERVAL_SECS` → intents expire before the
     ///   poller ever scans them, so payments land but are never matched
-    /// - `EXPIRY_BATCH_SIZE <= 0` → the expiry sweeper never transitions anything
     /// - `WEBHOOK_RETRY_ATTEMPTS == 0` → webhooks are never delivered
     /// - `WEBHOOK_RETRY_DELAY_MS == 0` with retries > 1 → retries hammer the
     ///   target endpoint with no back-off
     /// - `REQUEST_TIMEOUT_SECS == 0` → every request is aborted immediately
-    /// - `RATE_LIMIT_REQUESTS_PER_SEC == 0` → silently clamped up to 1 req/sec
-    ///   by `RateLimitState::new`, the most aggressive limit available, rather
-    ///   than disabling the limiter as an operator setting `0` likely intends
     /// - `WEBHOOK_REDRIVE_BACKOFF_MAX_SECS < WEBHOOK_REDRIVE_BACKOFF_INITIAL_SECS`
     ///   → the cap would silently override the starting delay, so backoff
     ///   never actually grows
@@ -749,14 +424,6 @@ impl Config {
             return Err(anyhow::anyhow!(
                 "POLL_INTERVAL_SECS must be > 0 (got 0). \
                  A zero interval creates a tight polling loop at 100% CPU."
-            ));
-        }
-
-        if self.cursor_staleness_multiple == 0 {
-            return Err(anyhow::anyhow!(
-                "CURSOR_STALENESS_MULTIPLE must be > 0 (got 0). \
-                 A zero window would make /ready report a stale cursor the \
-                 moment the poller finishes a cycle."
             ));
         }
 
@@ -774,14 +441,6 @@ impl Config {
                  the poller ever gets a chance to detect it.",
                 self.payment_ttl_secs,
                 self.poll_interval_secs
-            ));
-        }
-
-        if self.expiry_batch_size <= 0 {
-            return Err(anyhow::anyhow!(
-                "EXPIRY_BATCH_SIZE must be > 0 (got {}). \
-                 A zero or negative batch would make the expiry sweeper a no-op.",
-                self.expiry_batch_size
             ));
         }
 
@@ -833,27 +492,10 @@ impl Config {
             ));
         }
 
-        if self.webhook_redrive_jitter_secs < 0 {
-            return Err(anyhow::anyhow!(
-                "WEBHOOK_REDRIVE_JITTER_SECS must be >= 0 (got {}). \
-                 A negative jitter would pull deliveries forward past their backoff.",
-                self.webhook_redrive_jitter_secs
-            ));
-        }
-
         if self.request_timeout_secs == 0 {
             return Err(anyhow::anyhow!(
                 "REQUEST_TIMEOUT_SECS must be > 0 (got 0). \
                  A zero timeout would abort every request immediately."
-            ));
-        }
-
-        if self.rate_limit_requests_per_sec == 0 {
-            return Err(anyhow::anyhow!(
-                "RATE_LIMIT_REQUESTS_PER_SEC must be > 0 (got 0). \
-                 `RateLimitState::new` used to silently clamp a zero configured rate up to \
-                 1 request/sec — the single most aggressive limit the system can apply, not \
-                 the disabled limiter an operator setting 0 most likely intended."
             ));
         }
 
@@ -915,7 +557,7 @@ impl Config {
             Err(_) => {
                 return Err(anyhow::anyhow!(
                     "WEBHOOK_SECRET environment variable is missing"
-                ))
+                ));
             }
         };
 
@@ -948,6 +590,121 @@ impl Config {
         }
 
         Ok(secret)
+    }
+
+    /// Validate `ADMIN_PROVISIONING_SECRET` (issue #245).
+    ///
+    /// * Empty / absent → provisioning disabled; log at `info` and return `""`.
+    /// * Non-empty but short (< 32 chars) → abort boot.
+    /// * Non-empty but a known placeholder → abort boot.
+    /// * Otherwise → return the secret unchanged.
+    ///
+    /// The asymmetry with `validate_webhook_secret` (which requires the
+    /// variable to be present) is intentional: an empty `ADMIN_PROVISIONING_SECRET`
+    /// is a valid configuration choice that disables the `POST /merchants`
+    /// endpoint entirely. A non-empty but weak value is always a mistake,
+    /// because `require_admin_secret` guards merchant provisioning and the
+    /// whole API-key lifecycle.
+    fn validate_admin_secret(raw_secret: Result<String, std::env::VarError>) -> Result<String> {
+        // Absent is treated the same as empty: provisioning disabled.
+        let secret = raw_secret.unwrap_or_default();
+
+        if secret.is_empty() {
+            tracing::info!(
+                "ADMIN_PROVISIONING_SECRET is not set — \
+                 merchant provisioning is disabled (POST /merchants returns 401). \
+                 Set the variable to a strong random value to enable it."
+            );
+            return Ok(String::new());
+        }
+
+        // Reject placeholder values that an operator might copy from documentation
+        // or a template without changing.
+        const ADMIN_PLACEHOLDERS: &[&str] = &[
+            "admin",
+            "secret",
+            "changeme",
+            "password",
+            "test",
+            "admin123",
+            "your_admin_provisioning_secret",
+            "REPLACE_ME_admin_provisioning_secret",
+        ];
+        if ADMIN_PLACEHOLDERS.contains(&secret.as_str())
+            || secret.starts_with("REPLACE_ME_")
+            || secret.eq_ignore_ascii_case("admin")
+            || secret.eq_ignore_ascii_case("secret")
+            || secret.eq_ignore_ascii_case("changeme")
+        {
+            return Err(anyhow::anyhow!(
+                "ADMIN_PROVISIONING_SECRET is set to a known placeholder value. \
+                 Replace it with a strong, randomly-generated secret \
+                 (e.g. `openssl rand -hex 32`)."
+            ));
+        }
+
+        if secret.len() < 32 {
+            return Err(anyhow::anyhow!(
+                "ADMIN_PROVISIONING_SECRET must be at least 32 characters long \
+                 (got {}). Use a randomly-generated value \
+                 (e.g. `openssl rand -hex 32`).",
+                secret.len()
+            ));
+        }
+
+        Ok(secret)
+    }
+
+    /// Validate `METRICS_TOKEN`. Mirrors [`Self::validate_admin_secret`]: an
+    /// unset/empty value disables `GET /metrics` entirely (every scrape gets
+    /// `401`) rather than falling back to the previously-open default
+    /// (issue #250) — an operator must opt in to exposing the endpoint.
+    fn validate_metrics_token(raw_token: Result<String, std::env::VarError>) -> Result<String> {
+        // Absent is treated the same as empty: scraping disabled.
+        let token = raw_token.unwrap_or_default();
+
+        if token.is_empty() {
+            tracing::info!(
+                "METRICS_TOKEN is not set — GET /metrics is disabled (returns 401). \
+                 Set the variable to a strong random value to enable scraping."
+            );
+            return Ok(String::new());
+        }
+
+        // Reject placeholder values that an operator might copy from documentation
+        // or a template without changing.
+        const METRICS_PLACEHOLDERS: &[&str] = &[
+            "metrics",
+            "secret",
+            "changeme",
+            "password",
+            "test",
+            "your_metrics_token",
+            "REPLACE_ME_metrics_token",
+        ];
+        if METRICS_PLACEHOLDERS.contains(&token.as_str())
+            || token.starts_with("REPLACE_ME_")
+            || token.eq_ignore_ascii_case("metrics")
+            || token.eq_ignore_ascii_case("secret")
+            || token.eq_ignore_ascii_case("changeme")
+        {
+            return Err(anyhow::anyhow!(
+                "METRICS_TOKEN is set to a known placeholder value. \
+                 Replace it with a strong, randomly-generated secret \
+                 (e.g. `openssl rand -hex 32`)."
+            ));
+        }
+
+        if token.len() < 32 {
+            return Err(anyhow::anyhow!(
+                "METRICS_TOKEN must be at least 32 characters long \
+                 (got {}). Use a randomly-generated value \
+                 (e.g. `openssl rand -hex 32`).",
+                token.len()
+            ));
+        }
+
+        Ok(token)
     }
 }
 
@@ -992,14 +749,9 @@ impl std::fmt::Debug for Config {
                 "webhook_redrive_backoff_max_secs",
                 &self.webhook_redrive_backoff_max_secs,
             )
-            .field(
-                "webhook_redrive_jitter_secs",
-                &self.webhook_redrive_jitter_secs,
-            )
             .field("poll_interval_secs", &self.poll_interval_secs)
-            .field("cursor_staleness_multiple", &self.cursor_staleness_multiple)
+            .field("poll_max_pages_per_cycle", &self.poll_max_pages_per_cycle)
             .field("payment_ttl_secs", &self.payment_ttl_secs)
-            .field("expiry_batch_size", &self.expiry_batch_size)
             .field(
                 "rate_limit_requests_per_sec",
                 &self.rate_limit_requests_per_sec,
@@ -1013,32 +765,12 @@ impl std::fmt::Debug for Config {
                 &self.webhook_allow_private_targets,
             )
             .field("admin_provisioning_secret", &"***")
+            .field("metrics_token", &"***")
             .field("request_timeout_secs", &self.request_timeout_secs)
             .field("stream_idle_timeout_secs", &self.stream_idle_timeout_secs)
             .field("trusted_proxy_cidrs", &self.trusted_proxy_cidrs)
-            .field("max_payment_amount", &self.max_payment_amount)
-            .field("min_payment_amount", &self.min_payment_amount)
-            .field("max_body_bytes", &self.max_body_bytes)
-            .field("rate_limiter_max_keys", &self.rate_limiter_max_keys)
-            .field(
-                "rate_limiter_idle_ttl_secs",
-                &self.rate_limiter_idle_ttl_secs,
-            )
-            .field("pagination_default_limit", &self.pagination_default_limit)
-            .field("pagination_max_limit", &self.pagination_max_limit)
-            .field("shutdown_grace_secs", &self.shutdown_grace_secs)
-            .field("horizon_page_limit", &self.horizon_page_limit)
-            .field("db_prune_batch_size", &self.db_prune_batch_size)
-            .field(
-                "retention_max_rows_per_cycle",
-                &self.retention_max_rows_per_cycle,
-            )
             .finish()
     }
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key).unwrap_or_else(|_| default.to_string())
 }
 
 /// Parse `TRUSTED_PROXY_CIDRS`: a comma-separated list of CIDR blocks (IPv4 or
@@ -1103,7 +835,6 @@ mod tests {
             webhook_retry_delay_ms: 5000,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
-            webhook_payload_detail: WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -1111,14 +842,12 @@ mod tests {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 30,
             webhook_redrive_backoff_max_secs: 900,
-            webhook_redrive_jitter_secs: 30,
             retention_interval_secs: 3600,
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
-            cursor_staleness_multiple: 3,
+            poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
-            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 10,
             db_pool_max_connections: 10,
             db_busy_timeout_ms: 5000,
@@ -1126,20 +855,10 @@ mod tests {
             listener_mode: ListenerMode::Stream,
             webhook_allow_private_targets: false,
             admin_provisioning_secret: "admin-super-secret".into(),
+            metrics_token: "metrics-super-secret".into(),
             request_timeout_secs: 30,
             stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
-            max_payment_amount: AmountLimit::default(),
-            min_payment_amount: AmountLimit::default(),
-            max_body_bytes: 256 * 1024,
-            rate_limiter_max_keys: 10_000,
-            rate_limiter_idle_ttl_secs: 60,
-            pagination_default_limit: 20,
-            pagination_max_limit: 100,
-            shutdown_grace_secs: 30,
-            horizon_page_limit: 200,
-            db_prune_batch_size: 500,
-            retention_max_rows_per_cycle: 50_000,
         };
         let output = format!("{cfg:?}");
         assert!(
@@ -1149,6 +868,10 @@ mod tests {
         assert!(
             !output.contains("admin-super-secret"),
             "admin_provisioning_secret must not appear in Debug output"
+        );
+        assert!(
+            !output.contains("metrics-super-secret"),
+            "metrics_token must not appear in Debug output"
         );
         assert!(
             output.contains("***"),
@@ -1196,7 +919,6 @@ mod tests {
             webhook_retry_delay_ms: 5000,
             webhook_retry_max_delay_ms: 60_000,
             allowed_webhook_schemes: vec!["https".into()],
-            webhook_payload_detail: WebhookPayloadDetail::Minimal,
             webhook_timeout_secs: 10,
             webhook_redrive_interval_secs: 30,
             webhook_redrive_concurrency: 4,
@@ -1204,14 +926,12 @@ mod tests {
             webhook_redrive_grace_secs: 60,
             webhook_redrive_backoff_initial_secs: 30,
             webhook_redrive_backoff_max_secs: 900,
-            webhook_redrive_jitter_secs: 30,
             retention_interval_secs: 3600,
             webhook_delivery_retention_days: 30,
             idempotency_retention_days: 7,
             poll_interval_secs: 10,
-            cursor_staleness_multiple: 3,
+            poll_max_pages_per_cycle: 50,
             payment_ttl_secs: 3600,
-            expiry_batch_size: 500,
             rate_limit_requests_per_sec: 10,
             db_pool_max_connections: 10,
             db_busy_timeout_ms: 5000,
@@ -1219,20 +939,10 @@ mod tests {
             listener_mode: ListenerMode::Stream,
             webhook_allow_private_targets: false,
             admin_provisioning_secret: String::new(),
+            metrics_token: String::new(),
             request_timeout_secs: 30,
             stream_idle_timeout_secs: 30,
             trusted_proxy_cidrs: vec![],
-            max_payment_amount: AmountLimit::default(),
-            min_payment_amount: AmountLimit::default(),
-            max_body_bytes: 256 * 1024,
-            rate_limiter_max_keys: 10_000,
-            rate_limiter_idle_ttl_secs: 60,
-            pagination_default_limit: 20,
-            pagination_max_limit: 100,
-            shutdown_grace_secs: 30,
-            horizon_page_limit: 200,
-            db_prune_batch_size: 500,
-            retention_max_rows_per_cycle: 50_000,
         }
     }
 
@@ -1266,185 +976,6 @@ mod tests {
             issuer: Some("GNOTAREALISSUER".into()),
         }];
         let err = cfg.validate_addresses().unwrap_err().to_string();
-        assert!(err.contains("USDC"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_addresses_rejects_issuer_less_non_native() {
-        let mut cfg = sample_config();
-        cfg.accepted_assets = vec![
-            AcceptedAsset {
-                code: "XLM".into(),
-                issuer: None,
-            },
-            AcceptedAsset {
-                code: "USDC".into(),
-                issuer: None,
-            },
-        ];
-        let err = cfg.validate_addresses().unwrap_err().to_string();
-        assert!(err.contains("no issuer"), "got: {err}");
-        assert!(err.contains("USDC"), "got: {err}");
-        assert!(err.contains("CODE:ISSUER"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_addresses_accepts_native_without_issuer() {
-        let mut cfg = sample_config();
-        cfg.accepted_assets = vec![AcceptedAsset {
-            code: "XLM".into(),
-            issuer: None,
-        }];
-        cfg.validate_addresses().unwrap();
-    }
-
-    #[test]
-    fn validate_addresses_rejects_duplicate_asset_codes() {
-        let mut cfg = sample_config();
-        cfg.accepted_assets = vec![
-            AcceptedAsset {
-                code: "USDC".into(),
-                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
-            },
-            AcceptedAsset {
-                code: "USDC".into(),
-                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
-            },
-        ];
-        let err = cfg.validate_addresses().unwrap_err().to_string();
-        assert!(err.contains("duplicate code"), "got: {err}");
-        assert!(err.contains("USDC"), "got: {err}");
-    }
-
-    // ── AmountLimit / MAX_PAYMENT_AMOUNT / MIN_PAYMENT_AMOUNT (issue #310) ──
-
-    #[test]
-    fn amount_limit_empty_string_has_no_bound() {
-        let limit = AmountLimit::parse("", "MAX_PAYMENT_AMOUNT").unwrap();
-        assert_eq!(limit.for_asset("XLM"), None);
-    }
-
-    #[test]
-    fn amount_limit_bare_entry_is_the_default_for_every_asset() {
-        let limit = AmountLimit::parse("100", "MAX_PAYMENT_AMOUNT").unwrap();
-        assert_eq!(limit.for_asset("XLM"), Some(1_000_000_000));
-        assert_eq!(limit.for_asset("USDC"), Some(1_000_000_000));
-    }
-
-    #[test]
-    fn amount_limit_per_asset_entry_overrides_the_default() {
-        let limit = AmountLimit::parse("100,USDC:50", "MAX_PAYMENT_AMOUNT").unwrap();
-        assert_eq!(limit.for_asset("USDC"), Some(500_000_000));
-        assert_eq!(limit.for_asset("XLM"), Some(1_000_000_000));
-    }
-
-    #[test]
-    fn amount_limit_per_asset_entry_without_a_default_bounds_only_that_asset() {
-        let limit = AmountLimit::parse("USDC:50", "MAX_PAYMENT_AMOUNT").unwrap();
-        assert_eq!(limit.for_asset("USDC"), Some(500_000_000));
-        assert_eq!(limit.for_asset("XLM"), None);
-    }
-
-    #[test]
-    fn amount_limit_asset_code_is_case_insensitive() {
-        let limit = AmountLimit::parse("usdc:50", "MAX_PAYMENT_AMOUNT").unwrap();
-        assert_eq!(limit.for_asset("USDC"), Some(500_000_000));
-    }
-
-    #[test]
-    fn amount_limit_rejects_a_malformed_amount() {
-        let err = AmountLimit::parse("abc", "MAX_PAYMENT_AMOUNT")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("MAX_PAYMENT_AMOUNT"), "got: {err}");
-        assert!(err.contains("abc"), "got: {err}");
-    }
-
-    #[test]
-    fn amount_limit_rejects_a_zero_amount() {
-        // parse_stroops rejects non-positive amounts — a zero-amount bound is
-        // meaningless (it would reject every payment) and caught the same way
-        // a malformed value is.
-        assert!(AmountLimit::parse("0", "MAX_PAYMENT_AMOUNT").is_err());
-    }
-
-    #[test]
-    fn amount_limit_rejects_duplicate_entries_for_the_same_asset() {
-        let err = AmountLimit::parse("USDC:50,USDC:60", "MAX_PAYMENT_AMOUNT")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("USDC"), "got: {err}");
-    }
-
-    #[test]
-    fn amount_limit_rejects_more_than_one_default_entry() {
-        let err = AmountLimit::parse("100,200", "MAX_PAYMENT_AMOUNT")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("default"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_amount_limits_passes_when_min_is_below_max() {
-        let mut cfg = sample_config();
-        cfg.accepted_assets = vec![AcceptedAsset {
-            code: "XLM".into(),
-            issuer: None,
-        }];
-        cfg.max_payment_amount = AmountLimit::parse("100", "MAX_PAYMENT_AMOUNT").unwrap();
-        cfg.min_payment_amount = AmountLimit::parse("1", "MIN_PAYMENT_AMOUNT").unwrap();
-        assert!(cfg.validate_amount_limits().is_ok());
-    }
-
-    #[test]
-    fn validate_amount_limits_rejects_min_greater_than_max() {
-        let mut cfg = sample_config();
-        cfg.accepted_assets = vec![AcceptedAsset {
-            code: "XLM".into(),
-            issuer: None,
-        }];
-        cfg.max_payment_amount = AmountLimit::parse("10", "MAX_PAYMENT_AMOUNT").unwrap();
-        cfg.min_payment_amount = AmountLimit::parse("20", "MIN_PAYMENT_AMOUNT").unwrap();
-        let err = cfg.validate_amount_limits().unwrap_err().to_string();
-        assert!(err.contains("MIN_PAYMENT_AMOUNT"), "got: {err}");
-        assert!(err.contains("MAX_PAYMENT_AMOUNT"), "got: {err}");
-        assert!(err.contains("XLM"), "got: {err}");
-    }
-
-    #[test]
-    fn validate_amount_limits_checks_per_asset_bounds_independently() {
-        // XLM has a max but no min; USDC has a min but no max. Neither asset
-        // has both bounds set, so there is nothing to compare and no error —
-        // only a same-asset min > max is rejected.
-        let mut cfg = sample_config();
-        cfg.accepted_assets = vec![
-            AcceptedAsset {
-                code: "XLM".into(),
-                issuer: None,
-            },
-            AcceptedAsset {
-                code: "USDC".into(),
-                issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
-            },
-        ];
-        cfg.max_payment_amount = AmountLimit::parse("XLM:10", "MAX_PAYMENT_AMOUNT").unwrap();
-        cfg.min_payment_amount = AmountLimit::parse("USDC:20", "MIN_PAYMENT_AMOUNT").unwrap();
-        assert!(cfg.validate_amount_limits().is_ok());
-    }
-
-    #[test]
-    fn validate_amount_limits_applies_the_default_max_to_an_asset_without_its_own_entry() {
-        // USDC has no entry of its own in MAX_PAYMENT_AMOUNT, so it inherits
-        // the bare default (10) — and that conflicts with its specific,
-        // higher min (20), exactly as if USDC had been given "10" directly.
-        let mut cfg = sample_config();
-        cfg.accepted_assets = vec![AcceptedAsset {
-            code: "USDC".into(),
-            issuer: Some("GBBD47IF6LWK7P7MDEVSCWR7DPUWV3NY3DTQEVFL4NAT4AQH3ZLLFLA5".into()),
-        }];
-        cfg.max_payment_amount = AmountLimit::parse("10", "MAX_PAYMENT_AMOUNT").unwrap();
-        cfg.min_payment_amount = AmountLimit::parse("USDC:20", "MIN_PAYMENT_AMOUNT").unwrap();
-        let err = cfg.validate_amount_limits().unwrap_err().to_string();
         assert!(err.contains("USDC"), "got: {err}");
     }
 
@@ -1521,9 +1052,11 @@ mod tests {
         // Set new values
         for &(key, val) in env_vars {
             if let Some(v) = val {
-                std::env::set_var(key, v);
+                // SAFETY: test-only; callers serialise env access behind a lock.
+                unsafe { std::env::set_var(key, v) };
             } else {
-                std::env::remove_var(key);
+                // SAFETY: test-only; callers serialise env access behind a lock.
+                unsafe { std::env::remove_var(key) };
             }
         }
 
@@ -1533,9 +1066,11 @@ mod tests {
         // Restore backups
         for (key, val) in backups {
             if let Some(v) = val {
-                std::env::set_var(key, v);
+                // SAFETY: test-only; callers serialise env access behind a lock.
+                unsafe { std::env::set_var(key, v) };
             } else {
-                std::env::remove_var(key);
+                // SAFETY: test-only; callers serialise env access behind a lock.
+                unsafe { std::env::remove_var(key) };
             }
         }
 
@@ -1594,26 +1129,6 @@ mod tests {
     }
 
     #[test]
-    fn startup_fails_when_accepted_assets_omits_a_non_native_issuer() {
-        run_with_env(
-            &[
-                ("STELLAR_NETWORK", Some("testnet")),
-                (
-                    "WEBHOOK_SECRET",
-                    Some("a-very-long-and-secure-webhook-signing-secret-32-chars"),
-                ),
-                ("DATABASE_URL", Some("sqlite::memory:")),
-                ("ACCEPTED_ASSETS", Some("XLM,USDC")),
-            ],
-            || {
-                let err = Config::from_env().unwrap_err().to_string();
-                assert!(err.contains("no issuer"), "got: {err}");
-                assert!(err.contains("USDC"), "got: {err}");
-            },
-        );
-    }
-
-    #[test]
     fn startup_fails_on_public_without_cors_allowed_origins() {
         run_with_env(
             &[
@@ -1659,58 +1174,6 @@ mod tests {
     #[test]
     fn timing_valid_defaults_pass() {
         assert!(timing_config().validate_timing().is_ok());
-    }
-
-    #[test]
-    fn timing_rejects_zero_cursor_staleness_multiple() {
-        let mut cfg = timing_config();
-        cfg.cursor_staleness_multiple = 0;
-        let err = cfg.validate_timing().unwrap_err().to_string();
-        assert!(err.contains("CURSOR_STALENESS_MULTIPLE"), "got: {err}");
-    }
-
-    #[test]
-    fn timing_rejects_zero_poll_interval() {
-        let mut cfg = timing_config();
-        cfg.poll_interval_secs = 0;
-        let err = cfg.validate_timing().unwrap_err().to_string();
-        assert!(err.contains("POLL_INTERVAL_SECS"), "got: {err}");
-    }
-
-    #[test]
-    fn timing_rejects_zero_stream_idle_timeout() {
-        let mut cfg = timing_config();
-        cfg.stream_idle_timeout_secs = 0;
-        let err = cfg.validate_timing().unwrap_err().to_string();
-        assert!(err.contains("STREAM_IDLE_TIMEOUT_SECS"), "got: {err}");
-    }
-
-    #[test]
-    fn timing_rejects_zero_ttl() {
-        let mut cfg = timing_config();
-        cfg.payment_ttl_secs = 0;
-        let err = cfg.validate_timing().unwrap_err().to_string();
-        assert!(err.contains("PAYMENT_TTL_SECS"), "got: {err}");
-    }
-
-    #[test]
-    fn timing_rejects_ttl_shorter_than_poll_interval() {
-        let mut cfg = timing_config();
-        cfg.poll_interval_secs = 60;
-        cfg.payment_ttl_secs = 30; // < poll interval
-        let err = cfg.validate_timing().unwrap_err().to_string();
-        assert!(
-            err.contains("PAYMENT_TTL_SECS") && err.contains("POLL_INTERVAL_SECS"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn timing_allows_ttl_equal_to_poll_interval() {
-        let mut cfg = timing_config();
-        cfg.poll_interval_secs = 60;
-        cfg.payment_ttl_secs = 60; // equal is fine
-        assert!(cfg.validate_timing().is_ok());
     }
 
     // ── Retry schedule and grace-window validation (issues #318, #238) ───────
@@ -1768,13 +1231,6 @@ mod tests {
     }
 
     #[test]
-    fn timing_accepts_the_default_grace_window() {
-        // Defaults: 3 attempts × 10s, plus 5s and 10s gaps = 45s, under 60s.
-        let cfg = timing_config();
-        assert!(cfg.validate_timing().is_ok());
-    }
-
-    #[test]
     fn timing_rejects_a_retry_cap_below_the_base_delay() {
         let mut cfg = timing_config();
         cfg.webhook_retry_delay_ms = 5_000;
@@ -1784,11 +1240,47 @@ mod tests {
     }
 
     #[test]
-    fn timing_rejects_negative_redrive_jitter() {
+    fn timing_rejects_zero_poll_interval() {
         let mut cfg = timing_config();
-        cfg.webhook_redrive_jitter_secs = -1;
+        cfg.poll_interval_secs = 0;
         let err = cfg.validate_timing().unwrap_err().to_string();
-        assert!(err.contains("WEBHOOK_REDRIVE_JITTER_SECS"), "got: {err}");
+        assert!(err.contains("POLL_INTERVAL_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_zero_stream_idle_timeout() {
+        let mut cfg = timing_config();
+        cfg.stream_idle_timeout_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("STREAM_IDLE_TIMEOUT_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_zero_ttl() {
+        let mut cfg = timing_config();
+        cfg.payment_ttl_secs = 0;
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(err.contains("PAYMENT_TTL_SECS"), "got: {err}");
+    }
+
+    #[test]
+    fn timing_rejects_ttl_shorter_than_poll_interval() {
+        let mut cfg = timing_config();
+        cfg.poll_interval_secs = 60;
+        cfg.payment_ttl_secs = 30; // < poll interval
+        let err = cfg.validate_timing().unwrap_err().to_string();
+        assert!(
+            err.contains("PAYMENT_TTL_SECS") && err.contains("POLL_INTERVAL_SECS"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn timing_allows_ttl_equal_to_poll_interval() {
+        let mut cfg = timing_config();
+        cfg.poll_interval_secs = 60;
+        cfg.payment_ttl_secs = 60; // equal is fine
+        assert!(cfg.validate_timing().is_ok());
     }
 
     #[test]
@@ -1814,19 +1306,6 @@ mod tests {
         cfg.webhook_retry_attempts = 1;
         cfg.webhook_retry_delay_ms = 0; // no retries, so no burst
         assert!(cfg.validate_timing().is_ok());
-    }
-
-    #[test]
-    fn timing_rejects_zero_expiry_batch() {
-        let mut cfg = timing_config();
-        cfg.expiry_batch_size = 0;
-        let err = cfg.validate_timing().unwrap_err().to_string();
-        assert!(err.contains("EXPIRY_BATCH_SIZE"), "got: {err}");
-    }
-
-    #[test]
-    fn timing_allows_default_expiry_batch() {
-        assert!(timing_config().validate_timing().is_ok());
     }
 
     #[test]
@@ -1856,19 +1335,6 @@ mod tests {
         cfg.webhook_redrive_backoff_initial_secs = 0;
         cfg.webhook_redrive_backoff_max_secs = 0;
         assert!(cfg.validate_timing().is_ok());
-    }
-
-    #[test]
-    fn timing_rejects_zero_rate_limit_requests_per_sec() {
-        let mut cfg = timing_config();
-        cfg.rate_limit_requests_per_sec = 0;
-        let err = cfg.validate_timing().unwrap_err().to_string();
-        assert!(err.contains("RATE_LIMIT_REQUESTS_PER_SEC"), "got: {err}");
-    }
-
-    #[test]
-    fn timing_allows_default_rate_limit_requests_per_sec() {
-        assert!(timing_config().validate_timing().is_ok());
     }
 
     #[test]
@@ -1932,98 +1398,6 @@ mod tests {
     /// `run_with_env` test fails at the lock.
     const ENV_WEBHOOK_SECRET: &str = "a-very-long-and-secure-webhook-signing-secret-32-chars";
 
-    #[test]
-    fn cursor_staleness_multiple_defaults_to_three() {
-        run_with_env(&[("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET))], || {
-            assert_eq!(Config::from_env().unwrap().cursor_staleness_multiple, 3);
-        });
-    }
-
-    #[test]
-    fn cursor_staleness_multiple_parses_from_env() {
-        run_with_env(
-            &[
-                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("CURSOR_STALENESS_MULTIPLE", Some("7")),
-            ],
-            || {
-                assert_eq!(Config::from_env().unwrap().cursor_staleness_multiple, 7);
-            },
-        );
-    }
-
-    #[test]
-    fn cursor_staleness_multiple_rejects_non_numeric_value() {
-        run_with_env(
-            &[
-                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("CURSOR_STALENESS_MULTIPLE", Some("soon")),
-            ],
-            || {
-                let err = Config::from_env().unwrap_err().to_string();
-                assert!(
-                    err.contains("CURSOR_STALENESS_MULTIPLE"),
-                    "boot should abort on a non-numeric value; got: {err}"
-                );
-            },
-        );
-    }
-
-    // ── WebhookPayloadDetail::parse (issue #306) ─────────────────────────────
-
-    #[test]
-    fn webhook_payload_detail_empty_defaults_to_minimal() {
-        assert_eq!(
-            WebhookPayloadDetail::parse("").unwrap(),
-            WebhookPayloadDetail::Minimal
-        );
-    }
-
-    #[test]
-    fn webhook_payload_detail_minimal_parses() {
-        assert_eq!(
-            WebhookPayloadDetail::parse("minimal").unwrap(),
-            WebhookPayloadDetail::Minimal
-        );
-        assert_eq!(
-            WebhookPayloadDetail::parse("MINIMAL").unwrap(),
-            WebhookPayloadDetail::Minimal
-        );
-    }
-
-    #[test]
-    fn webhook_payload_detail_full_parses() {
-        assert_eq!(
-            WebhookPayloadDetail::parse("full").unwrap(),
-            WebhookPayloadDetail::Full
-        );
-        assert_eq!(
-            WebhookPayloadDetail::parse("FULL").unwrap(),
-            WebhookPayloadDetail::Full
-        );
-    }
-
-    #[test]
-    fn webhook_payload_detail_invalid_aborts_boot() {
-        let err = WebhookPayloadDetail::parse("rich").unwrap_err().to_string();
-        assert!(
-            err.contains("WEBHOOK_PAYLOAD_DETAIL"),
-            "error should name the variable; got: {err}"
-        );
-        assert!(
-            err.contains("rich"),
-            "error should echo the bad value; got: {err}"
-        );
-    }
-
-    #[test]
-    fn from_env_defaults_to_minimal_webhook_payload_detail() {
-        run_with_env(&[("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET))], || {
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.webhook_payload_detail, WebhookPayloadDetail::Minimal);
-        });
-    }
-
     // ── Plaintext webhook scheme startup warning (issue #306) ────────────────
 
     #[test]
@@ -2062,155 +1436,308 @@ mod tests {
         );
     }
 
-    // ── Deployment-tunable limits (issue #279) ────────────────────────────────
-    //
-    // MAX_BODY_BYTES, RATE_LIMITER_MAX_KEYS, RATE_LIMITER_IDLE_TTL_SECS,
-    // PAGINATION_DEFAULT_LIMIT, PAGINATION_MAX_LIMIT, SHUTDOWN_GRACE_SECS,
-    // HORIZON_PAGE_LIMIT, DB_PRUNE_BATCH_SIZE, RETENTION_MAX_ROWS_PER_CYCLE.
+    // ── issue #246: WEBHOOK_ALLOW_PRIVATE_TARGETS on public network ───────────
 
+    /// The flag must be rejected at boot when STELLAR_NETWORK=public (issue #246).
     #[test]
-    fn limits_default_from_sample_config_pass() {
-        assert!(sample_config().validate_limits().is_ok());
-    }
-
-    #[test]
-    fn limits_rejects_zero_max_body_bytes() {
-        let mut cfg = sample_config();
-        cfg.max_body_bytes = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("MAX_BODY_BYTES"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_rate_limiter_max_keys() {
-        let mut cfg = sample_config();
-        cfg.rate_limiter_max_keys = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("RATE_LIMITER_MAX_KEYS"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_rate_limiter_idle_ttl() {
-        let mut cfg = sample_config();
-        cfg.rate_limiter_idle_ttl_secs = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("RATE_LIMITER_IDLE_TTL_SECS"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_pagination_default_limit() {
-        let mut cfg = sample_config();
-        cfg.pagination_default_limit = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("PAGINATION_DEFAULT_LIMIT"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_pagination_max_below_default() {
-        let mut cfg = sample_config();
-        cfg.pagination_default_limit = 50;
-        cfg.pagination_max_limit = 10;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("PAGINATION_MAX_LIMIT"), "got: {err}");
-        assert!(err.contains("PAGINATION_DEFAULT_LIMIT"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_allows_pagination_max_equal_to_default() {
-        let mut cfg = sample_config();
-        cfg.pagination_default_limit = 20;
-        cfg.pagination_max_limit = 20;
-        assert!(cfg.validate_limits().is_ok());
-    }
-
-    #[test]
-    fn limits_rejects_zero_shutdown_grace() {
-        let mut cfg = sample_config();
-        cfg.shutdown_grace_secs = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("SHUTDOWN_GRACE_SECS"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_horizon_page_limit() {
-        let mut cfg = sample_config();
-        cfg.horizon_page_limit = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("HORIZON_PAGE_LIMIT"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_db_prune_batch_size() {
-        let mut cfg = sample_config();
-        cfg.db_prune_batch_size = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("DB_PRUNE_BATCH_SIZE"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_rejects_zero_retention_max_rows_per_cycle() {
-        let mut cfg = sample_config();
-        cfg.retention_max_rows_per_cycle = 0;
-        let err = cfg.validate_limits().unwrap_err().to_string();
-        assert!(err.contains("RETENTION_MAX_ROWS_PER_CYCLE"), "got: {err}");
-    }
-
-    #[test]
-    fn limits_parse_from_env_and_override_defaults() {
+    fn private_targets_on_public_network_aborts_boot() {
         run_with_env(
             &[
                 ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("MAX_BODY_BYTES", Some("1024")),
-                ("RATE_LIMITER_MAX_KEYS", Some("500")),
-                ("RATE_LIMITER_IDLE_TTL_SECS", Some("120")),
-                ("PAGINATION_DEFAULT_LIMIT", Some("5")),
-                ("PAGINATION_MAX_LIMIT", Some("50")),
-                ("SHUTDOWN_GRACE_SECS", Some("45")),
-                ("HORIZON_PAGE_LIMIT", Some("100")),
-                ("DB_PRUNE_BATCH_SIZE", Some("250")),
-                ("RETENTION_MAX_ROWS_PER_CYCLE", Some("1000")),
+                ("STELLAR_NETWORK", Some("public")),
+                ("CORS_ALLOWED_ORIGINS", Some("https://example.com")),
+                ("WEBHOOK_ALLOW_PRIVATE_TARGETS", Some("true")),
             ],
             || {
-                let cfg = Config::from_env().unwrap();
-                assert_eq!(cfg.max_body_bytes, 1024);
-                assert_eq!(cfg.rate_limiter_max_keys, 500);
-                assert_eq!(cfg.rate_limiter_idle_ttl_secs, 120);
-                assert_eq!(cfg.pagination_default_limit, 5);
-                assert_eq!(cfg.pagination_max_limit, 50);
-                assert_eq!(cfg.shutdown_grace_secs, 45);
-                assert_eq!(cfg.horizon_page_limit, 100);
-                assert_eq!(cfg.db_prune_batch_size, 250);
-                assert_eq!(cfg.retention_max_rows_per_cycle, 1000);
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("WEBHOOK_ALLOW_PRIVATE_TARGETS"),
+                    "error must name the offending variable; got: {err}"
+                );
+                assert!(
+                    err.contains("STELLAR_NETWORK=public"),
+                    "error must mention the network constraint; got: {err}"
+                );
             },
         );
     }
 
+    /// The flag is allowed on testnet (development use-case). Boot must succeed.
     #[test]
-    fn limits_default_to_the_previous_compile_time_constants() {
-        run_with_env(&[("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET))], || {
-            let cfg = Config::from_env().unwrap();
-            assert_eq!(cfg.max_body_bytes, 256 * 1024);
-            assert_eq!(cfg.rate_limiter_max_keys, 10_000);
-            assert_eq!(cfg.rate_limiter_idle_ttl_secs, 60);
-            assert_eq!(cfg.pagination_default_limit, 20);
-            assert_eq!(cfg.pagination_max_limit, 100);
-            assert_eq!(cfg.shutdown_grace_secs, 30);
-            assert_eq!(cfg.horizon_page_limit, 200);
-            assert_eq!(cfg.db_prune_batch_size, 500);
-            assert_eq!(cfg.retention_max_rows_per_cycle, 50_000);
-        });
-    }
-
-    #[test]
-    fn limits_invalid_env_value_aborts_boot() {
+    fn private_targets_on_testnet_is_allowed() {
         run_with_env(
             &[
                 ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
-                ("HORIZON_PAGE_LIMIT", Some("not-a-number")),
+                ("STELLAR_NETWORK", Some("testnet")),
+                ("WEBHOOK_ALLOW_PRIVATE_TARGETS", Some("true")),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(
+                    cfg.webhook_allow_private_targets,
+                    "flag should be set on testnet"
+                );
+            },
+        );
+    }
+
+    // ── issue #245: ADMIN_PROVISIONING_SECRET validation ──────────────────────
+
+    /// An empty (unset) admin secret disables provisioning — boot must succeed.
+    #[test]
+    fn admin_secret_empty_disables_provisioning() {
+        let result = Config::validate_admin_secret(Err(std::env::VarError::NotPresent));
+        assert!(
+            result.is_ok(),
+            "absent secret should succeed; got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), "");
+    }
+
+    /// An explicitly empty env var is the same as absent.
+    #[test]
+    fn admin_secret_explicit_empty_string_disables_provisioning() {
+        let result = Config::validate_admin_secret(Ok(String::new()));
+        assert!(
+            result.is_ok(),
+            "empty string should succeed; got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), "");
+    }
+
+    /// A value shorter than 32 characters is rejected.
+    #[test]
+    fn admin_secret_too_short_aborts_boot() {
+        let result = Config::validate_admin_secret(Ok("short".into()));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("at least 32 characters"),
+            "error must mention the length requirement; got: {err}"
+        );
+    }
+
+    /// Exactly 31 characters is one under the limit.
+    #[test]
+    fn admin_secret_31_chars_is_rejected() {
+        let result = Config::validate_admin_secret(Ok("a".repeat(31)));
+        assert!(
+            result.is_err(),
+            "31-char secret should be rejected; got: {:?}",
+            result
+        );
+    }
+
+    /// Exactly 32 characters is the boundary — must be accepted.
+    #[test]
+    fn admin_secret_32_chars_is_accepted() {
+        let result = Config::validate_admin_secret(Ok("a".repeat(32)));
+        assert!(
+            result.is_ok(),
+            "32-char secret should be accepted; got: {:?}",
+            result
+        );
+    }
+
+    /// Known placeholder values are rejected regardless of length.
+    #[test]
+    fn admin_secret_placeholder_admin_is_rejected() {
+        let result = Config::validate_admin_secret(Ok("admin".into()));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("placeholder"),
+            "error must mention placeholder; got: {err}"
+        );
+    }
+
+    #[test]
+    fn admin_secret_placeholder_changeme_is_rejected() {
+        let result = Config::validate_admin_secret(Ok("changeme".into()));
+        assert!(result.is_err(), "changeme should be rejected");
+    }
+
+    #[test]
+    fn admin_secret_placeholder_replace_me_prefix_is_rejected() {
+        let result =
+            Config::validate_admin_secret(Ok("REPLACE_ME_admin_provisioning_secret".into()));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("placeholder"),
+            "error must mention placeholder; got: {err}"
+        );
+    }
+
+    /// A strong, randomly-generated secret must be accepted.
+    #[test]
+    fn admin_secret_strong_value_is_accepted() {
+        let strong = "a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1";
+        let result = Config::validate_admin_secret(Ok(strong.into()));
+        assert!(
+            result.is_ok(),
+            "strong secret should be accepted; got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), strong);
+    }
+
+    /// The whole from_env path must accept a strong admin secret.
+    #[test]
+    fn admin_secret_from_env_strong_value_is_accepted() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                (
+                    "ADMIN_PROVISIONING_SECRET",
+                    Some("a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1"),
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(!cfg.admin_provisioning_secret.is_empty());
+            },
+        );
+    }
+
+    /// A short admin secret must abort boot through from_env.
+    #[test]
+    fn admin_secret_from_env_short_value_aborts_boot() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("ADMIN_PROVISIONING_SECRET", Some("tooshort")),
             ],
             || {
                 let err = Config::from_env().unwrap_err().to_string();
-                assert!(err.contains("HORIZON_PAGE_LIMIT"), "got: {err}");
+                assert!(
+                    err.contains("ADMIN_PROVISIONING_SECRET")
+                        || err.contains("at least 32 characters"),
+                    "error must indicate the secret is too short; got: {err}"
+                );
+            },
+        );
+    }
+
+    // ── issue #250: METRICS_TOKEN validation ───────────────────────────────────
+
+    /// An empty (unset) metrics token disables scraping — boot must succeed.
+    #[test]
+    fn metrics_token_empty_disables_scraping() {
+        let result = Config::validate_metrics_token(Err(std::env::VarError::NotPresent));
+        assert!(
+            result.is_ok(),
+            "absent token should succeed; got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), "");
+    }
+
+    /// An explicitly empty env var is the same as absent.
+    #[test]
+    fn metrics_token_explicit_empty_string_disables_scraping() {
+        let result = Config::validate_metrics_token(Ok(String::new()));
+        assert!(
+            result.is_ok(),
+            "empty string should succeed; got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), "");
+    }
+
+    /// A value shorter than 32 characters is rejected.
+    #[test]
+    fn metrics_token_too_short_aborts_boot() {
+        let result = Config::validate_metrics_token(Ok("short".into()));
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("at least 32 characters"),
+            "error must mention the length requirement; got: {err}"
+        );
+    }
+
+    /// Exactly 32 characters is the boundary — must be accepted.
+    #[test]
+    fn metrics_token_32_chars_is_accepted() {
+        let result = Config::validate_metrics_token(Ok("a".repeat(32)));
+        assert!(
+            result.is_ok(),
+            "32-char token should be accepted; got: {:?}",
+            result
+        );
+    }
+
+    /// Known placeholder values are rejected regardless of length.
+    #[test]
+    fn metrics_token_placeholder_is_rejected() {
+        let result = Config::validate_metrics_token(Ok("changeme".into()));
+        assert!(result.is_err(), "changeme should be rejected");
+    }
+
+    /// A strong, randomly-generated token must be accepted.
+    #[test]
+    fn metrics_token_strong_value_is_accepted() {
+        let strong = "a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1";
+        let result = Config::validate_metrics_token(Ok(strong.into()));
+        assert!(
+            result.is_ok(),
+            "strong token should be accepted; got: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), strong);
+    }
+
+    /// The whole from_env path must accept a strong metrics token.
+    #[test]
+    fn metrics_token_from_env_strong_value_is_accepted() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                (
+                    "METRICS_TOKEN",
+                    Some("a3f8b2c1d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8a9b0c1d2e3f4a5b6c7d8e9f0a1"),
+                ),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(!cfg.metrics_token.is_empty());
+            },
+        );
+    }
+
+    /// A short metrics token must abort boot through from_env.
+    #[test]
+    fn metrics_token_from_env_short_value_aborts_boot() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("METRICS_TOKEN", Some("tooshort")),
+            ],
+            || {
+                let err = Config::from_env().unwrap_err().to_string();
+                assert!(
+                    err.contains("METRICS_TOKEN") || err.contains("at least 32 characters"),
+                    "error must indicate the token is too short; got: {err}"
+                );
+            },
+        );
+    }
+
+    /// With no METRICS_TOKEN set, from_env boots successfully and the
+    /// resulting config disables scraping (acceptance criterion: /metrics is
+    /// not reachable anonymously from the public listener by default).
+    #[test]
+    fn metrics_token_unset_by_default() {
+        run_with_env(
+            &[
+                ("WEBHOOK_SECRET", Some(ENV_WEBHOOK_SECRET)),
+                ("METRICS_TOKEN", None),
+            ],
+            || {
+                let cfg = Config::from_env().unwrap();
+                assert!(
+                    cfg.metrics_token.is_empty(),
+                    "metrics_token should be empty (disabled) by default"
+                );
             },
         );
     }

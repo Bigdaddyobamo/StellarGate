@@ -1,6 +1,53 @@
-/target
-.env
-*.db
+# ── Rust build artifacts ──────────────────────────────────────────────────────
+/target/
+**/*.rs.bk
 
+# Cargo.lock is intentionally tracked for binary crates (this is a binary).
+# Do NOT add Cargo.lock here.
+
+# ── SQLite database files ─────────────────────────────────────────────────────
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+stellargate.db*
+
+# ── Environment / secrets ─────────────────────────────────────────────────────
+.env
 # Live deployment secrets — never commit.
 deploy/stellargate.env
+
+# ── Build and distribution output ────────────────────────────────────────────
+/dist/
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+
+# ── OS-generated files ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Editor and IDE files ──────────────────────────────────────────────────────
+*.orig
+*.rej
+*.bak
+
+# ── Assistant / editor workspace directories ─────────────────────────────────
+# Tool-specific scratch directories are not part of the product or build.
+.kiro/
+.cursor/
+.claude/
+.idea/
+.vscode/
+
+# ── Test and coverage artifacts ───────────────────────────────────────────────
+proptest-regressions/
+*.pending-snap
+*.snap.new
+tarpaulin-report.*
+*.profraw
+lcov.info
+coverage/
+
+# ── Node modules (in case any tooling adds them) ──────────────────────────────
+node_modules/
