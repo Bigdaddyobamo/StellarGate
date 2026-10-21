@@ -47,6 +47,44 @@ test.describe("dashboard smoke", () => {
     expect(pageErrors, "the entry module must evaluate cleanly").toEqual([]);
   });
 
+  /* Issue #866: a fast, Rust-independent smoke test. The dashboard is served
+     from `static/` with the gateway's path layout and `/v1/*` is stubbed from
+     `e2e/fixtures/`, so this test catches a page that fails to load (missing
+     export, undefined helper) without ever touching `cargo`. Any `pageerror`
+     or `console.error` fails the test, and the message names the offending
+     module or identifier. */
+  test("loads, signs in, and renders payments without a Rust build", async ({
+    page,
+    seedData,
+  }) => {
+    const pageErrors = [];
+    page.on("pageerror", (e) => pageErrors.push(e.message));
+    const consoleErrors = [];
+    page.on("console", (msg) => {
+      if (msg.type() === "error") consoleErrors.push(msg.text());
+    });
+
+    await page.goto("/dashboard");
+
+    await page.getByLabel("API key").fill(seedData.apiKey);
+    await page.getByRole("button", { name: "Sign in" }).click();
+
+    await expect(page.locator("#app")).toBeVisible();
+    await expect(page.locator("#gate")).toBeHidden();
+
+    // At least one payments row must render — an empty table means the page
+    // loaded but the data path is broken.
+    await expect(page.locator("#rows tr").first()).toBeVisible();
+
+    expect(pageErrors, "no pageerror may fire while loading the dashboard").toEqual(
+      [],
+    );
+    expect(
+      consoleErrors,
+      "no console.error may fire while loading the dashboard",
+    ).toEqual([]);
+  });
+
   /** The row whose memo cell holds `memo`. Scoped to the memo cell so a label
    *  elsewhere on the page cannot satisfy the locator. */
   function rowWithMemo(page, memo) {

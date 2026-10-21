@@ -225,6 +225,7 @@ for (const key of ["r", "j", "k", "Enter", "Escape", "?", "/"]) {
   if (!keys.includes(`"${key}"`)) {
     failures.push(`the SHORTCUTS table is missing the \`${key}\` shortcut`);
   }
+  return out;
 }
 
 /* ── Every form control has an accessible name ─────────────────────────── */

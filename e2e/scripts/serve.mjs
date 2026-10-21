@@ -14,8 +14,9 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { createServer } from "node:http";
+import { existsSync, readFileSync, statSync } from "node:fs";
+import { dirname, extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
