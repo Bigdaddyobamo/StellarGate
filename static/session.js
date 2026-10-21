@@ -6,6 +6,13 @@
 // How long a stored key stays valid, in milliseconds.
 const KEY_TTL_MS = 30 * 60 * 1000;
 
+// Storage keys used by the session store.
+export const KEY_NAME = "stellargate.apiKey";
+export const KEY_SAVED_AT = "stellargate.apiKeySavedAt";
+
+// How long a stored key's display window lasts, in milliseconds.
+const SESSION_TTL_MS = 30 * 60 * 1000;
+
 // In-memory storage for the API key. Deliberately not persisted anywhere so
 // the key can never leak through URLs, logs or console output.
 let storedKey = null;
@@ -28,6 +35,53 @@ export function getStoredKey() {
 export function storeKey(key) {
   storedKey = key;
   storedKeyExpiresAt = Date.now() + KEY_TTL_MS;
+}
+
+// Drops the in-memory key.
+export function forgetKey() {
+  storedKey = null;
+  storedKeyExpiresAt = 0;
+}
+
+// A minimal in-memory Storage stand-in used when no storage area is supplied.
+function memoryStorage() {
+  var data = {};
+  return {
+    getItem: function (k) {
+      return Object.prototype.hasOwnProperty.call(data, k) ? data[k] : null;
+    },
+    setItem: function (k, v) {
+      data[k] = String(v);
+    },
+    removeItem: function (k) {
+      delete data[k];
+    },
+  };
+}
+
+function safeGet(area, key) {
+  try {
+    return area.getItem(key);
+  } catch (e) {
+    return null;
+  }
+}
+
+function safeSet(area, key, value) {
+  try {
+    area.setItem(key, value);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+function safeRemove(area, key) {
+  try {
+    area.removeItem(key);
+  } catch (e) {
+    /* ignore */
+  }
 }
 
 /**
