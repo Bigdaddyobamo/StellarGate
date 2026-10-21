@@ -52,3 +52,21 @@ updates:
       - dependency-name: "rust"
         update-types:
           ["version-update:semver-major", "version-update:semver-minor"]
+
+  # End-to-end dashboard tests depend on Playwright in e2e/.
+  # Kept covered so security advisories surface and browser versions stay current.
+  - package-ecosystem: npm
+    directory: "/e2e"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "07:00"
+    open-pull-requests-limit: 5
+    groups:
+      playwright:
+        patterns: ["@playwright/*", "playwright*"]
+      patch-and-minor:
+        update-types: ["minor", "patch"]
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "chore(deps-e2e)"

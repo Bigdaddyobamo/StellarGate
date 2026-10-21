@@ -4,11 +4,13 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.94"
 
-description = "A Rust toolkit for building on the Stellar blockchain"
+description = "Non-custodial payment gateway API for accepting and settling payments on the Stellar network"
 repository = "https://github.com/StellarGateLabs/StellarGate"
+homepage = "https://github.com/StellarGateLabs/StellarGate"
+readme = "README.md"
 license = "MIT"
-keywords = ["stellar","blockchain","sdk","rpc"]
-categories = ["network-programming", "command-line-utilities"]
+keywords = ["stellar", "payments", "payment-gateway", "webhooks", "xlm"]
+categories = ["web-programming::http-server", "finance"]
 # Application binary, not a library published to crates.io. `publish = false`
 # lets cargo-deny skip it under `[licenses].private` rather than flagging the
 # (intentionally unlicensed) workspace crate itself.
