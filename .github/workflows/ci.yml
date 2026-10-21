@@ -109,6 +109,22 @@ jobs:
       - name: Lint openapi.yaml
         run: npx --yes @redocly/cli@1 lint openapi.yaml
 
+  # Enforces Prettier formatting for the dashboard frontend under static/
+  # (issue #827). Scoping is handled by .prettierignore so only HTML/CSS/JS
+  # in static/ is checked; the config lives in .prettierrc.
+  prettier:
+    name: prettier (static/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check formatting
+        run: npx --yes prettier@3 --check "static/**/*.{html,css,js}"
+
   deploy-consistency:
     name: deploy asset consistency
     runs-on: ubuntu-latest
