@@ -127,6 +127,42 @@ retention error handling.
 
 Blocking CI jobs (like formatting and clippy) are strictly tied to our pinned MSRV (1.94) as defined in `rust-toolchain.toml`. This ensures that your local `cargo clippy` and `cargo fmt` results perfectly match CI. An advisory lint job runs on the latest stable toolchain to catch upcoming lints, but it is set to `continue-on-error: true` and will not block your pull request.
 
+## Required Status Checks
+
+`main` is protected: a pull request cannot be merged until all of the
+following required status checks have run **and passed** on the PR's head
+commit:
+
+- `test (1.94)`
+- `test (stable)`
+- `fmt / clippy`
+- `openapi lint`
+- `deploy asset consistency`
+- `dashboard static checks`
+- `dashboard unit tests`
+
+A PR with failing **or missing** required checks cannot be merged into
+`main`. "Missing" matters: if a check never ran, it does not count as passing.
+If the merge button is disabled or the checks list is empty, do not merge —
+figure out why CI didn't run first.
+
+Branch protection also requires branches to be **up to date before merging**,
+so a PR is tested against the `main` it will actually merge into. If `main`
+has moved since your last push, update your branch (merge or rebase `main`)
+and let CI re-run before merging. Most breakage we've seen came from
+merge-resolution drift, not from the PRs themselves.
+
+### Fork PRs: approve workflow runs first
+
+PRs opened from forks do not run Actions automatically — a maintainer must
+approve the workflow run (the **"Approve and run"** button on the PR's checks
+section) before CI executes. Until that approval happens, the PR shows **zero
+checks**, and merging it would bypass every required check above.
+
+**Maintainers: approve fork workflow runs before reviewing or merging.** A
+fork PR with no checks reported is not ready for review — approve the run,
+wait for the required checks to go green, and only then review and merge.
+
 ## Dependency Upgrade Policy
 
 Dependency upgrades should be small, reviewable, and documented. For routine
