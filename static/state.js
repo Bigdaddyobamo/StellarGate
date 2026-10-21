@@ -65,6 +65,26 @@ import { filterPayments } from "./format.js";
  * @property {string|null} selectedPaymentId
  * @property {number} activeRow
  * @property {boolean} helpOpen
+ * @property {string} merchantId
+ * @property {MerchantKey[]} merchantKeys
+ * @property {boolean} keysLoading
+ * @property {string} keysError
+ * @property {string|null} revealedKey
+ * @property {string} sortKey
+ * @property {string} sortDirection
+ */
+
+/**
+ * An API key as returned by `GET /v1/merchants/{id}/keys` (issue #767).
+ *
+ * Only the non-secret fields are modelled: the API never returns full key
+ * material for an existing key, and the dashboard must never hold it either.
+ *
+ * @typedef {object} MerchantKey
+ * @property {string} id
+ * @property {string} prefix
+ * @property {string} created_at
+ * @property {string|null} [revoked_at]
  */
 
 /** State a freshly loaded page starts from. */
@@ -86,6 +106,24 @@ export function initialState() {
     activeRow: -1,
     /** Whether the `?` shortcut overlay is open. */
     helpOpen: false,
+    /** Merchant whose API keys the admin panel is showing (issue #767). */
+    merchantId: "",
+    /** Keys loaded for `merchantId`; never contains full key material. */
+    merchantKeys: [],
+    /** Whether the key list is being fetched. */
+    keysLoading: false,
+    /** Human-readable error from the last key request, or "". */
+    keysError: "",
+    /**
+     * The one-time key material from a just-issued key (issue #768), or null.
+     * Transient: never serialised to the hash, and cleared as soon as the
+     * reveal panel closes.
+     */
+    revealedKey: null,
+    /** Column the payments table is sorted by (issue #770). */
+    sortKey: "",
+    /** "asc" or "desc"; only meaningful when `sortKey` is set. */
+    sortDirection: "asc",
   };
 }
 
@@ -180,6 +218,89 @@ export function createStore(seed) {
   }
 
   /**
+   * The rows currently on screen, ordered by the active sort column
+   * (issue #770).
+   *
+   * Sorting is client-side over the rows already loaded, so it is only a
+   * complete ordering once every page has been fetched; the renderer labels it
+   * as such while `cursor` is non-null. Ties fall back to the original load
+   * order so the sort is stable across re-renders.
+   */
+  function sortedPayments() {
+    var rows = visiblePayments();
+    var key = state.sortKey;
+    if (!key) return rows;
+    var dir = state.sortDirection === "desc" ? -1 : 1;
+    // Decorate with the original index so equal keys keep their load order.
+    return rows
+      .map(function (row, index) {
+        return { row: row, index: index };
+      })
+      .sort(function (a, b) {
+        var cmp = comparePayments(a.row, b.row, key);
+        if (cmp === 0) return a.index - b.index;
+        return cmp * dir;
+      })
+      .map(function (entry) {
+        return entry.row;
+      });
+  }
+
+  /**
+   * Compare two payments on `key`. Returns 0 for equal or missing values so
+   * rows without the field keep their relative order rather than jumping.
+   *
+   * @param {Payment} a
+   * @param {Payment} b
+   * @param {string} key
+   */
+  function comparePayments(a, b, key) {
+    var av = a ? a[key] : undefined;
+    var bv = b ? b[key] : undefined;
+    if (av === undefined || av === null) return 0;
+    if (bv === undefined || bv === null) return 0;
+    if (key === "amount") {
+      var an = Number(av);
+      var bn = Number(bv);
+      if (isNaN(an) || isNaN(bn)) return 0;
+      return an === bn ? 0 : an < bn ? -1 : 1;
+    }
+    // created_at is an ISO-8601 string, so lexical order is chronological.
+    var as = String(av);
+    var bs = String(bv);
+    return as === bs ? 0 : as < bs ? -1 : 1;
+  }
+
+  /**
+   * Toggle the sort on `key`: a new column starts ascending, the active column
+   * flips direction. Passing the active key twice returns to ascending rather
+   * than clearing the sort, so the header always reflects a known order.
+   *
+   * @param {string} key
+   */
+  function toggleSort(key) {
+    if (state.sortKey === key) {
+      return update({ sortDirection: state.sortDirection === "asc" ? "desc" : "asc" });
+    }
+    return update({ sortKey: key, sortDirection: "asc" });
+  }
+
+  /**
+   * Store the one-time key material from a just-issued key (issue #768).
+   * Callers must clear it via `clearRevealedKey()` once the panel closes.
+   *
+   * @param {string|null} material
+   */
+  function revealKey(material) {
+    return update({ revealedKey: material === undefined ? null : material });
+  }
+
+  /** Drop the revealed key from state so it is not held in memory. */
+  function clearRevealedKey() {
+    return update({ revealedKey: null });
+  }
+
+  /**
    * Clamp the highlighted row to the current result set.
    *
    * A filter change can leave the cursor past the end of the list — selecting
@@ -249,6 +370,10 @@ export function createStore(seed) {
     replace: replace,
     subscribe: subscribe,
     visiblePayments: visiblePayments,
+    sortedPayments: sortedPayments,
+    toggleSort: toggleSort,
+    revealKey: revealKey,
+    clearRevealedKey: clearRevealedKey,
     clampActiveRow: clampActiveRow,
     resetPaging: resetPaging,
     selectedPayment: selectedPayment,
@@ -328,7 +453,8 @@ const HASH_KEYS = ["status", "search", "auto_refresh"];
  *
  * Only the keys in HASH_KEYS are honoured. An unrecognised key is ignored
  * rather than copied into state, so a hand-edited URL cannot set an arbitrary
- * field.
+ * field. `merchantId`, `revealedKey` and any key material are deliberately not
+ * in HASH_KEYS: they must never appear in a URL (issues #767–#769).
  *
  * @param {string} hash
  */
@@ -358,6 +484,10 @@ export function parseHash(hash) {
  * Serialise the filter fields of a state object to a hash string, without the
  * leading "#". Returns "" when no filter is set, which the controller turns into
  * a plain `location.pathname` so the URL does not collect a bare "#".
+ *
+ * Only HASH_KEYS are written, so the merchant id, the revealed key and the
+ * loaded key list can never reach the address bar even if they are present in
+ * the state object passed in.
  *
  * @param {Partial<DashboardState>} state
  */

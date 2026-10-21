@@ -304,3 +304,170 @@ test("serializeHash never emits a credential", () => {
   assert.ok(!hash.includes("secret"), hash);
   assert.ok(!/key|token|auth/i.test(hash), hash);
 });
+
+test("serializeHash never emits a merchant id or key material (#767, #768)", () => {
+  // The admin key panel must stay out of the address bar entirely: a merchant
+  // id is an internal identifier and a freshly issued key is a live credential.
+  const hash = serializeHash({
+    status: "pending",
+    merchantId: "mch_123",
+    apiKey: "sk_live_abcdef",
+    keyPrefix: "sk_live_ab",
+    revealedKey: "sk_live_abcdef",
+  });
+  assert.ok(!hash.includes("mch_123"), hash);
+  assert.ok(!hash.includes("sk_live"), hash);
+  assert.ok(!/merchant|api_?key|prefix|reveal/i.test(hash), hash);
+});
+
+/* ── admin API keys (#767, #768, #769) ─────────────────────────────────── */
+
+test("initialState starts with no merchant, no keys and no revealed key", () => {
+  const s = initialState();
+  assert.equal(s.merchantId, "");
+  assert.deepEqual(s.merchantKeys, []);
+  assert.equal(s.revealedKey, null);
+});
+
+test("revealKey stores the one-time key in state", () => {
+  const store = createStore();
+  store.revealKey("sk_live_abcdef", "sk_live_ab");
+  assert.equal(store.get().revealedKey, "sk_live_abcdef");
+  assert.equal(store.get().revealedKeyPrefix, "sk_live_ab");
+});
+
+test("clearRevealedKey wipes the key from state", () => {
+  // #768: closing the panel must drop the key from memory, not just hide it.
+  const store = createStore();
+  store.revealKey("sk_live_abcdef", "sk_live_ab");
+  store.clearRevealedKey();
+  assert.equal(store.get().revealedKey, null);
+  assert.equal(store.get().revealedKeyPrefix, null);
+  assert.ok(!JSON.stringify(store.get()).includes("sk_live_abcdef"));
+});
+
+test("clearRevealedKey notifies subscribers so the DOM can be cleared", () => {
+  const store = createStore();
+  store.revealKey("sk_live_abcdef", "sk_live_ab");
+  let changed = null;
+  store.subscribe((_state, keys) => {
+    changed = keys;
+  });
+  store.clearRevealedKey();
+  assert.ok(changed.includes("revealedKey"), String(changed));
+});
+
+test("clearRevealedKey is a no-op when nothing is revealed", () => {
+  const store = createStore();
+  let calls = 0;
+  store.subscribe(() => calls++);
+  store.clearRevealedKey();
+  assert.equal(calls, 0);
+});
+
+test("setMerchantKeys replaces the list without keeping key material", () => {
+  // The list endpoint only returns ids, prefixes and timestamps.
+  const store = createStore();
+  store.setMerchantKeys([
+    { id: "k1", prefix: "sk_live_ab", created_at: "2024-01-01T00:00:00Z", revoked_at: null },
+  ]);
+  assert.equal(store.get().merchantKeys.length, 1);
+  assert.equal(store.get().merchantKeys[0].prefix, "sk_live_ab");
+  assert.ok(!JSON.stringify(store.get().merchantKeys).includes("sk_live_abcdef"));
+});
+
+test("canRevokeKey requires an exact prefix match (#769)", () => {
+  const store = createStore();
+  store.setMerchantKeys([
+    { id: "k1", prefix: "sk_live_ab", created_at: "2024-01-01T00:00:00Z", revoked_at: null },
+  ]);
+  assert.equal(store.canRevokeKey("k1", "sk_live_ab"), true);
+  assert.equal(store.canRevokeKey("k1", "sk_live_a"), false, "a partial prefix must not confirm");
+  assert.equal(store.canRevokeKey("k1", "sk_live_abc"), false);
+  assert.equal(store.canRevokeKey("k1", "SK_LIVE_AB"), false, "case must match");
+  assert.equal(store.canRevokeKey("k1", " sk_live_ab"), false, "no trimming");
+  assert.equal(store.canRevokeKey("nope", "sk_live_ab"), false);
+});
+
+test("canRevokeKey refuses an already revoked key", () => {
+  const store = createStore();
+  store.setMerchantKeys([
+    { id: "k1", prefix: "sk_live_ab", created_at: "2024-01-01T00:00:00Z", revoked_at: "2024-02-01T00:00:00Z" },
+  ]);
+  assert.equal(store.canRevokeKey("k1", "sk_live_ab"), false);
+});
+
+/* ── sorting (#770) ────────────────────────────────────────────────────── */
+
+const SORT_ROWS = [
+  { id: "p1", amount: 300, created_at: "2024-01-02T00:00:00Z" },
+  { id: "p2", amount: 100, created_at: "2024-01-03T00:00:00Z" },
+  { id: "p3", amount: 200, created_at: "2024-01-01T00:00:00Z" },
+];
+
+test("initialState has no sort applied", () => {
+  const s = initialState();
+  assert.equal(s.sortKey, null);
+  assert.equal(s.sortDir, "asc");
+});
+
+test("sortedPayments returns loaded rows untouched with no sort", () => {
+  const store = createStore({ loadedPayments: SORT_ROWS });
+  assert.deepEqual(store.sortedPayments(), SORT_ROWS);
+});
+
+test("sortedPayments orders by amount ascending and descending", () => {
+  const store = createStore({ loadedPayments: SORT_ROWS, sortKey: "amount", sortDir: "asc" });
+  assert.deepEqual(store.sortedPayments().map((r) => r.id), ["p2", "p3", "p1"]);
+  store.update({ sortDir: "desc" });
+  assert.deepEqual(store.sortedPayments().map((r) => r.id), ["p1", "p3", "p2"]);
+});
+
+test("sortedPayments orders by created_at ascending and descending", () => {
+  const store = createStore({ loadedPayments: SORT_ROWS, sortKey: "created_at", sortDir: "asc" });
+  assert.deepEqual(store.sortedPayments().map((r) => r.id), ["p3", "p1", "p2"]);
+  store.update({ sortDir: "desc" });
+  assert.deepEqual(store.sortedPayments().map((r) => r.id), ["p2", "p1", "p3"]);
+});
+
+test("sortedPayments does not mutate the loaded rows", () => {
+  const store = createStore({ loadedPayments: SORT_ROWS, sortKey: "amount", sortDir: "desc" });
+  store.sortedPayments();
+  assert.deepEqual(store.get().loadedPayments.map((r) => r.id), ["p1", "p2", "p3"]);
+});
+
+test("sortedPayments is stable for equal keys", () => {
+  const rows = [
+    { id: "a", amount: 100 },
+    { id: "b", amount: 100 },
+    { id: "c", amount: 100 },
+  ];
+  const store = createStore({ loadedPayments: rows, sortKey: "amount", sortDir: "asc" });
+  assert.deepEqual(store.sortedPayments().map((r) => r.id), ["a", "b", "c"]);
+});
+
+test("toggleSort cycles a column through asc, desc and off", () => {
+  const store = createStore();
+  store.toggleSort("amount");
+  assert.equal(store.get().sortKey, "amount");
+  assert.equal(store.get().sortDir, "asc");
+  store.toggleSort("amount");
+  assert.equal(store.get().sortDir, "desc");
+  store.toggleSort("amount");
+  assert.equal(store.get().sortKey, null);
+});
+
+test("toggleSort on a new column starts ascending", () => {
+  const store = createStore({ sortKey: "amount", sortDir: "desc" });
+  store.toggleSort("created_at");
+  assert.equal(store.get().sortKey, "created_at");
+  assert.equal(store.get().sortDir, "asc");
+});
+
+test("sorting is labelled as client-side when more pages remain", () => {
+  // #770: the sort only covers loaded rows, so the UI must say so.
+  const store = createStore({ loadedPayments: SORT_ROWS, nextCursor: "abc" });
+  assert.equal(store.sortIsPartial(), true);
+  store.update({ nextCursor: null });
+  assert.equal(store.sortIsPartial(), false);
+});
