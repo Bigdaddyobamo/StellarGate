@@ -913,6 +913,80 @@ kbd {
   flex: 0 0 3rem;
 }
 
+@media print {
+  @page {
+    margin: 0.5in;
+  }
+
+  html,
+  body {
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  .topbar,
+  .toolbar,
+  .summary,
+  #gate,
+  .detail,
+  .help,
+  .theme-toggle,
+  #sign-out,
+  #health,
+  #selection-count,
+  #export-selected,
+  #export-csv,
+  #refresh,
+  #new-payment-btn,
+  #help-open {
+    display: none !important;
+  }
+
+  #app {
+    display: block !important;
+    visibility: visible !important;
+  }
+
+  main {
+    max-width: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  .card {
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+  }
+
+  .payments {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    page-break-inside: auto;
+  }
+
+  .payments th,
+  .payments td {
+    color: #000 !important;
+    background: #fff !important;
+    border: 1px solid #666 !important;
+    padding: 0.35rem 0.4rem !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .payments tbody tr,
+  .payments tbody tr.row-active,
+  .payments tbody tr:hover {
+    background: #fff !important;
+    cursor: default;
+  }
+
+  .payments .select-col {
+    display: none !important;
+  }
+}
+
 @media (max-width: 720px) {
   .payments thead {
     display: none;
