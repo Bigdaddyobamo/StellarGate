@@ -220,7 +220,229 @@ test.describe("dashboard smoke", () => {
     await expect(link).toHaveAttribute("target", "_blank");
     await expect(link).toHaveAttribute("rel", /noopener/);
   });
+
+  /* Issue #771: the settings dialog collects the display preferences that used
+     to be scattered across the page, and persists them under a namespace
+     separate from the API key so a credential can never be written alongside
+     them. */
+  test("settings dialog persists display preferences and resets", async ({
+    page,
+    seedData,
+  }) => {
+    const leaks = watchForKeyLeaks(page, seedData.apiKey);
+
+    await page.goto("/dashboard");
+    await page.getByLabel("API key").fill(seedData.apiKey);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator("#rows tr").first()).toBeVisible();
+
+    await page.getByRole("button", { name: "Settings" }).click();
+    const dialog = page.getByRole("dialog", { name: /settings/i });
+    await expect(dialog).toBeVisible();
+
+    // Page size: a smaller page must actually shorten the rendered list.
+    await dialog.getByLabel("Page size").selectOption("2");
+    await expect(page.locator("#rows tr")).toHaveCount(2);
+
+    // Auto-refresh: toggling it must not throw or navigate.
+    const autoRefresh = dialog.getByLabel("Auto-refresh");
+    if (await autoRefresh.isChecked()) await autoRefresh.uncheck();
+    else await autoRefresh.check();
+
+    // Theme: switching to dark must apply the theme attribute.
+    await dialog.getByLabel("Theme").selectOption("dark");
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+
+    // Timezone: a fixed zone must be accepted and reflected in the control.
+    await dialog.getByLabel("Timezone").selectOption("UTC");
+    await expect(dialog.getByLabel("Timezone")).toHaveValue("UTC");
+
+    await dialog.getByRole("button", { name: /close|done|save/i }).click();
+    await expect(dialog).toBeHidden();
+
+    // Preferences live under their own namespace, never next to the key.
+    const stored = await page.evaluate(() => {
+      const out = {};
+      for (let i = 0; i < localStorage.length; i += 1) {
+        const k = localStorage.key(i);
+        out[k] = localStorage.getItem(k);
+      }
+      return out;
+    });
+    const prefKeys = Object.keys(stored).filter((k) => /pref|setting/i.test(k));
+    expect(prefKeys.length, "preferences must be persisted").toBeGreaterThan(0);
+    for (const [k, v] of Object.entries(stored)) {
+      expect(v ?? "", `localStorage[${k}] must not hold the API key`).not.toContain(
+        seedData.apiKey,
+      );
+    }
+
+    // Reload: the persisted preferences survive a fresh page load.
+    await page.reload();
+    await page.getByLabel("API key").fill(seedData.apiKey);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator("#rows tr").first()).toBeVisible();
+    await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
+
+    // Reset to defaults restores the original page size and theme.
+    await page.getByRole("button", { name: "Settings" }).click();
+    await expect(dialog).toBeVisible();
+    await dialog.getByRole("button", { name: /reset/i }).click();
+    await dialog.getByRole("button", { name: /close|done|save/i }).click();
+    await expect(dialog).toBeHidden();
+    await expect(page.locator("html")).not.toHaveAttribute("data-theme", "dark");
+
+    leaks.assertClean();
+  });
+
+  /* Issue #772: the column menu hides columns, but Status and Payment ID are
+     structural — the row identity and the status pill — so they stay. */
+  test("column menu hides columns and persists across reloads", async ({
+    page,
+    seedData,
+  }) => {
+    const leaks = watchForKeyLeaks(page, seedData.apiKey);
+
+    await page.goto("/dashboard");
+    await page.getByLabel("API key").fill(seedData.apiKey);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator("#rows tr")).toHaveCount(4);
+
+    await page.getByRole("button", { name: /columns/i }).click();
+    const menu = page.getByRole("menu", { name: /columns/i });
+    await expect(menu).toBeVisible();
+
+    // Status and Payment ID are always visible and cannot be unchecked.
+    const status = menu.getByRole("checkbox", { name: /status/i });
+    const paymentId = menu.getByRole("checkbox", { name: /payment id/i });
+    await expect(status).toBeChecked();
+    await expect(status).toBeDisabled();
+    await expect(paymentId).toBeChecked();
+    await expect(paymentId).toBeDisabled();
+
+    // Hide the memo column and confirm the header disappears.
+    const memo = menu.getByRole("checkbox", { name: /memo/i });
+    await expect(memo).toBeChecked();
+    await memo.uncheck();
+    await expect(page.locator("#rows tr").first()).toBeVisible();
+    await expect(
+      page.locator("thead th", { hasText: /^Memo$/ }),
+    ).toHaveCount(0);
+
+    await page.keyboard.press("Escape");
+    await expect(menu).toBeHidden();
+
+    // Reload: the choice is persisted, so the memo header stays hidden.
+    await page.reload();
+    await page.getByLabel("API key").fill(seedData.apiKey);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator("#rows tr").first()).toBeVisible();
+    await expect(
+      page.locator("thead th", { hasText: /^Memo$/ }),
+    ).toHaveCount(0);
+    await expect(
+      page.locator("thead th", { hasText: /^Status$/ }),
+    ).toHaveCount(1);
+    await expect(
+      page.locator("thead th", { hasText: /^Payment ID$/ }),
+    ).toHaveCount(1);
+
+    leaks.assertClean();
+  });
+
+  /* Issue #773: the Asset and webhook status columns surface information that
+     used to require opening each payment's drawer. */
+  for (const viewport of [
+    { name: "desktop", width: 1280, height: 800 },
+    { name: "mobile", width: 390, height: 844 },
+  ]) {
+    test(`asset and webhook status columns — ${viewport.name}`, async ({
+      page,
+      seedData,
+    }) => {
+      const leaks = watchForKeyLeaks(page, seedData.apiKey);
+
+      await page.setViewportSize({
+        width: viewport.width,
+        height: viewport.height,
+      });
+      await page.goto("/dashboard");
+      await page.getByLabel("API key").fill(seedData.apiKey);
+      await page.getByRole("button", { name: "Sign in" }).click();
+      await expect(page.locator("#rows tr")).toHaveCount(4);
+
+      // The Asset column is present and carries the seeded asset code.
+      await expect(
+        page.locator("thead th", { hasText: /^Asset$/ }),
+      ).toHaveCount(1);
+      await expect(rowWithMemo(page, "e2e-order-alpha")).toContainText("XLM");
+
+      // The webhook status indicator renders one of the three known states.
+      const webhookCell = rowWithMemo(page, "e2e-order-alpha").locator(
+        "[data-webhook-status]",
+      );
+      await expect(webhookCell).toHaveCount(1);
+      await expect(webhookCell).toHaveAttribute(
+        "data-webhook-status",
+        /delivered|failing|none/,
+      );
+
+      leaks.assertClean();
+    });
+  }
+
+  /* Issue #774: on a long list the header must stay pinned inside the card so
+     the column labels remain readable while scrolling. */
+  test("the table header stays sticky on a long list", async ({
+    page,
+    seedData,
+  }) => {
+    const leaks = watchForKeyLeaks(page, seedData.apiKey);
+
+    await page.goto("/dashboard");
+    await page.getByLabel("API key").fill(seedData.apiKey);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator("#rows tr").first()).toBeVisible();
+
+    // Ask for a large page so the list is taller than the viewport.
+    await page.getByRole("button", { name: "Settings" }).click();
+    const dialog = page.getByRole("dialog", { name: /settings/i });
+    await expect(dialog).toBeVisible();
+    await dialog.getByLabel("Page size").selectOption("100");
+    await dialog.getByRole("button", { name: /close|done|save/i }).click();
+    await expect(dialog).toBeHidden();
+
+    const thead = page.locator("thead").first();
+    await expect(thead).toBeVisible();
+    await expect(thead).toHaveCSS("position", "sticky");
+
+    // Scroll the list and confirm the header is still in view.
+    await page.locator("#rows").evaluate((el) => {
+      el.scrollIntoView({ block: "end" });
+    });
+    await expect(thead).toBeInViewport();
+
+    leaks.assertClean();
+  });
 });
+
+/** Records every URL, console line and page error so a test can assert the
+ *  API key never escaped the gate input. Returns an object whose `assertClean`
+ *  fails with the offending line when it did. */
+function watchForKeyLeaks(page, apiKey) {
+  const seen = [];
+  page.on("request", (req) => seen.push(`request ${req.url()}`));
+  page.on("console", (msg) => seen.push(`console ${msg.text()}`));
+  page.on("pageerror", (e) => seen.push(`pageerror ${e.message}`));
+  return {
+    assertClean() {
+      const leaks = seen.filter((line) => line.includes(apiKey));
+      expect(leaks, "the API key must never appear in a URL or console line").toEqual(
+        [],
+      );
+    },
+  };
+}
 
 /* Visual regression coverage (issue #826).
  *

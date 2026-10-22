@@ -483,8 +483,11 @@ pub async fn list(
             None
         };
 
+        let mut rows = payments.iter().map(to_json).collect::<Vec<_>>();
+        attach_webhook_status(&state.pool, &payments, &mut rows).await?;
+
         Ok(Json(json!({
-            "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
+            "payments": rows,
             "limit": limit,
             "next_cursor": next_cursor,
         })))
@@ -505,8 +508,11 @@ pub async fn list(
         // Provide next_cursor to ease migration to keyset pagination.
         let next_cursor = payments.last().map(|p| encode_cursor(&p.created_at, &p.id));
 
+        let mut rows = payments.iter().map(to_json).collect::<Vec<_>>();
+        attach_webhook_status(&state.pool, &payments, &mut rows).await?;
+
         Ok(Json(json!({
-            "payments": payments.iter().map(to_json).collect::<Vec<_>>(),
+            "payments": rows,
             "total": total,
             "limit": limit,
             "offset": offset,
@@ -599,7 +605,42 @@ fn to_json(p: &db::Payment) -> Value {
         "created_at": p.created_at,
         "updated_at": p.updated_at,
         "expires_at": p.expires_at,
+        // `null` when the payment has no webhook configured; otherwise the
+        // status of its most recent delivery (`delivered` / `failed` /
+        // `pending`). Populated by the list handlers below.
+        "webhook_status": Value::Null,
     })
+}
+
+/// Fill in `webhook_status` on each serialized payment from its latest
+/// delivery, so the dashboard can render a delivered/failing/none indicator
+/// straight from the list response instead of opening each payment.
+///
+/// A payment with no webhook configured, or one whose webhook has not been
+/// attempted yet, gets `null` (rendered as "none"). Any delivery that has not
+/// succeeded — including `pending` — is reported as `"failing"` so a stuck or
+/// retrying webhook is visible rather than silently omitted.
+async fn attach_webhook_status(
+    pool: &db::Db,
+    payments: &[db::Payment],
+    rows: &mut [Value],
+) -> Result<(), AppError> {
+    for (payment, row) in payments.iter().zip(rows.iter_mut()) {
+        if payment.webhook_url.is_none() {
+            continue;
+        }
+        let deliveries = db::list_webhook_deliveries(pool, &payment.id).await?;
+        let Some(latest) = deliveries.first() else {
+            continue;
+        };
+        let status = if latest.status == "delivered" {
+            "delivered"
+        } else {
+            "failing"
+        };
+        row["webhook_status"] = Value::String(status.to_string());
+    }
+    Ok(())
 }
 
 pub async fn list_webhooks(

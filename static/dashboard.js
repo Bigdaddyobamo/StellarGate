@@ -35,6 +35,7 @@ import {
 import { createSessionStore } from "./session.js";
 import { createStore, parseHash, serializeHash } from "./state.js";
 import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
+import { createPrefsStore, COLUMNS, ALWAYS_VISIBLE } from "./prefs.js";
 import { sortPayments } from "./sort.js";
 
 (function () {
@@ -46,13 +47,19 @@ import { sortPayments } from "./sort.js";
   var API_BASE = "/v1";
   var KEY_NAME = "stellargate.apiKey";
   var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
-  var THEME_KEY = "stellargate.theme";
 
   var t = window.I18N.t;
 
   // ── Session store ─────────────────────────────────────────────────────────
   var session = createSessionStore({
     session: (function () { try { return window.sessionStorage; } catch (e) { return null; } })(),
+    local: (function () { try { return window.localStorage; } catch (e) { return null; } })(),
+  });
+
+  // ── Preferences store (#771 / #772) ───────────────────────────────────────
+  // Persisted under its own namespace ("stellargate.prefs."), separate from the
+  // API key. Never stores the key, and never writes it anywhere.
+  var prefs = createPrefsStore({
     local: (function () { try { return window.localStorage; } catch (e) { return null; } })(),
   });
 
@@ -177,23 +184,21 @@ import { sortPayments } from "./sort.js";
     });
   }
 
-  // ── Theme (#713) ───────────────────────────────────────────────────────────
+  // ── Theme (#713 / #771) ────────────────────────────────────────────────────
 
   function effectiveTheme() {
-    try {
-      var stored = window.localStorage.getItem(THEME_KEY);
-      if (stored === "light" || stored === "dark") return stored;
-    } catch (e) { /* storage unavailable */ }
+    var stored = prefs.get().theme;
+    if (stored === "light" || stored === "dark") return stored;
     return null;
   }
 
   function applyTheme(theme) {
     if (theme === "light" || theme === "dark") {
       document.documentElement.setAttribute("data-theme", theme);
-      window.localStorage.setItem(THEME_KEY, theme);
+      prefs.update({ theme: theme });
     } else {
       document.documentElement.removeAttribute("data-theme");
-      window.localStorage.removeItem(THEME_KEY);
+      prefs.update({ theme: "system" });
     }
     syncThemeUi();
   }
@@ -230,6 +235,211 @@ import { sortPayments } from "./sort.js";
         });
       }
     );
+  }
+
+  // ── Preferences (#771 / #772) ─────────────────────────────────────────────
+
+  /** Column keys that are always shown, regardless of preference. */
+  function isColumnVisible(key) {
+    if (ALWAYS_VISIBLE.indexOf(key) >= 0) return true;
+    var cols = prefs.get().columns || {};
+    return cols[key] !== false;
+  }
+
+  /** Apply persisted display preferences to the view-state store. */
+  function applyPreferences() {
+    var p = prefs.get();
+    store.update({ pageSize: p.pageSize });
+    store.update({ autoRefresh: !!p.autoRefresh });
+    if (p.theme === "light" || p.theme === "dark") {
+      document.documentElement.setAttribute("data-theme", p.theme);
+    } else {
+      document.documentElement.removeAttribute("data-theme");
+    }
+    syncThemeUi();
+    syncPrefsUi();
+    applyColumnVisibility();
+  }
+
+  /** Reflect the current preferences into the settings dialog controls. */
+  function syncPrefsUi() {
+    var p = prefs.get();
+    var size = $("prefs-page-size");
+    if (size) size.value = String(p.pageSize);
+    var auto = $("prefs-auto-refresh");
+    if (auto) auto.checked = !!p.autoRefresh;
+    var theme = $("prefs-theme");
+    if (theme) theme.value = p.theme || "system";
+    var tz = $("prefs-timezone");
+    if (tz) tz.value = p.timezone || "local";
+    syncColumnMenuUi();
+  }
+
+  /** Reflect column visibility into the column menu checkboxes. */
+  function syncColumnMenuUi() {
+    Array.prototype.forEach.call(
+      document.querySelectorAll("#columns-menu input[data-column]"),
+      function (box) {
+        var key = box.getAttribute("data-column");
+        box.checked = isColumnVisible(key);
+        box.disabled = ALWAYS_VISIBLE.indexOf(key) >= 0;
+      }
+    );
+  }
+
+  /** Toggle table column visibility via data-column attributes. */
+  function applyColumnVisibility() {
+    COLUMNS.forEach(function (key) {
+      var visible = isColumnVisible(key);
+      Array.prototype.forEach.call(
+        document.querySelectorAll('[data-column="' + key + '"]'),
+        function (node) {
+          if (node.tagName === "TH" || node.tagName === "TD") {
+            node.hidden = !visible;
+          } else {
+            node.hidden = !visible;
+          }
+        }
+      );
+    });
+    syncColumnMenuUi();
+  }
+
+  /** Build the column menu checkboxes once. */
+  function renderColumnMenu() {
+    var menu = $("columns-menu");
+    if (!menu) return;
+    var list = menu.querySelector(".columns-list");
+    if (!list) return;
+    clear(list);
+    COLUMNS.forEach(function (key) {
+      var li = el("li", "columns-item");
+      var label = el("label", "columns-label");
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.setAttribute("data-column", key);
+      box.checked = isColumnVisible(key);
+      box.disabled = ALWAYS_VISIBLE.indexOf(key) >= 0;
+      box.addEventListener("change", function () {
+        if (ALWAYS_VISIBLE.indexOf(key) >= 0) { box.checked = true; return; }
+        var cols = Object.assign({}, prefs.get().columns || {});
+        cols[key] = box.checked;
+        prefs.update({ columns: cols });
+        applyColumnVisibility();
+      });
+      label.appendChild(box);
+      label.appendChild(el("span", null, columnLabel(key)));
+      li.appendChild(label);
+      list.appendChild(li);
+    });
+  }
+
+  function columnLabel(key) {
+    switch (key) {
+      case "status":   return "Status";
+      case "amount":   return "Amount";
+      case "asset":    return "Asset";
+      case "webhook":  return "Webhook";
+      case "memo":     return "Memo";
+      case "created":  return "Created";
+      case "id":       return "Payment ID";
+      default:         return key;
+    }
+  }
+
+  function openSettings() {
+    syncPrefsUi();
+    openModal($("settings"));
+  }
+
+  function closeSettings() {
+    closeModal($("settings"));
+  }
+
+  function resetPreferences() {
+    prefs.reset();
+    applyPreferences();
+    onFilterChange();
+    announce("Preferences reset to defaults");
+  }
+
+  /** Wire the settings dialog and column menu. Called once from init(). */
+  function initPreferences() {
+    renderColumnMenu();
+
+    var settingsBtn = $("settings-open");
+    if (settingsBtn) settingsBtn.addEventListener("click", openSettings);
+
+    var settingsClose = $("settings-close");
+    if (settingsClose) settingsClose.addEventListener("click", closeSettings);
+
+    var settingsDone = $("settings-done");
+    if (settingsDone) settingsDone.addEventListener("click", closeSettings);
+
+    var settingsReset = $("settings-reset");
+    if (settingsReset) settingsReset.addEventListener("click", resetPreferences);
+
+    var settings = $("settings");
+    if (settings) {
+      settings.addEventListener("click", function (ev) {
+        if (ev.target !== settings) return;
+        var rect = settings.getBoundingClientRect();
+        var outside =
+          ev.clientX < rect.left || ev.clientX > rect.right ||
+          ev.clientY < rect.top  || ev.clientY > rect.bottom;
+        if (outside) closeSettings();
+      });
+    }
+
+    var size = $("prefs-page-size");
+    if (size) {
+      size.addEventListener("change", function () {
+        prefs.update({ pageSize: Number(size.value) || 25 });
+        store.update({ pageSize: prefs.get().pageSize });
+        onFilterChange();
+      });
+    }
+
+    var auto = $("prefs-auto-refresh");
+    if (auto) {
+      auto.addEventListener("change", function () {
+        prefs.update({ autoRefresh: auto.checked });
+        store.update({ autoRefresh: auto.checked });
+        onFilterChange();
+      });
+    }
+
+    var theme = $("prefs-theme");
+    if (theme) {
+      theme.addEventListener("change", function () {
+        applyTheme(theme.value);
+      });
+    }
+
+    var tz = $("prefs-timezone");
+    if (tz) {
+      tz.addEventListener("change", function () {
+        prefs.update({ timezone: tz.value });
+        renderRows();
+      });
+    }
+
+    var columnsBtn = $("columns-open");
+    if (columnsBtn) {
+      columnsBtn.addEventListener("click", function () {
+        var menu = $("columns-menu");
+        if (!menu) return;
+        show(menu, menu.hidden);
+        syncColumnMenuUi();
+      });
+    }
+
+    var columnsClose = $("columns-close");
+    if (columnsClose) {
+      columnsClose.addEventListener("click", function () {
+        show($("columns-menu"), false);
+      });
+    }
   }
 
   // ── API ───────────────────────────────────────────────────────────────────
@@ -418,16 +628,20 @@ import { sortPayments } from "./sort.js";
       tr.className = "skeleton-row";
       tr.setAttribute("aria-hidden", "true");
       var cols = [
-        { label: "Select",     cls: "sk-select" },
-        { label: "Status",     cls: "sk-status" },
-        { label: "Amount",     cls: "sk-amount" },
-        { label: "Memo",       cls: "sk-memo" },
-        { label: "Created",    cls: "sk-date" },
-        { label: "Payment ID", cls: "sk-id" },
+        { label: "Select",     cls: "sk-select",     key: null },
+        { label: "Status",     cls: "sk-status",     key: "status" },
+        { label: "Amount",     cls: "sk-amount",     key: "amount" },
+        { label: "Asset",      cls: "sk-asset",      key: "asset" },
+        { label: "Webhook",    cls: "sk-webhook",    key: "webhook" },
+        { label: "Memo",       cls: "sk-memo",       key: "memo" },
+        { label: "Created",    cls: "sk-date",       key: "created" },
+        { label: "Payment ID", cls: "sk-id",         key: "id" },
       ];
       cols.forEach(function (col) {
         var td = document.createElement("td");
         td.setAttribute("data-label", col.label);
+        if (col.key) td.setAttribute("data-column", col.key);
+        if (col.key && !isColumnVisible(col.key)) td.hidden = true;
         td.appendChild(el("span", "skeleton-cell " + col.cls));
         tr.appendChild(td);
       });
@@ -575,19 +789,62 @@ import { sortPayments } from "./sort.js";
 
     var statusCell = document.createElement("td");
     statusCell.setAttribute("data-label", "Status");
+    statusCell.setAttribute("data-column", "status");
     statusCell.appendChild(el("span", pillClass(p.status), p.status));
     tr.appendChild(statusCell);
 
-    tr.appendChild(labelledCell("Amount", null, formatAmount(p.amount, p.asset)));
-    tr.appendChild(labelledCell("Memo", "mono", p.memo));
-    tr.appendChild(labelledCell("Created", null, fmtTime(p.created_at)));
-    tr.appendChild(labelledCell("Payment ID", "mono", shortId(p.id)));
+    var amountCell = labelledCell("Amount", null, formatAmount(p.amount, p.asset));
+    amountCell.setAttribute("data-column", "amount");
+    if (!isColumnVisible("amount")) amountCell.hidden = true;
+    tr.appendChild(amountCell);
+
+    /* Asset column (#773). */
+    var assetCell = labelledCell("Asset", "mono", p.asset || "XLM");
+    assetCell.setAttribute("data-column", "asset");
+    if (!isColumnVisible("asset")) assetCell.hidden = true;
+    tr.appendChild(assetCell);
+
+    /* Webhook status column (#773). */
+    var webhookCell = document.createElement("td");
+    webhookCell.setAttribute("data-label", "Webhook");
+    webhookCell.setAttribute("data-column", "webhook");
+    webhookCell.appendChild(webhookBadge(p));
+    if (!isColumnVisible("webhook")) webhookCell.hidden = true;
+    tr.appendChild(webhookCell);
+
+    var memoCell = labelledCell("Memo", "mono", p.memo);
+    memoCell.setAttribute("data-column", "memo");
+    if (!isColumnVisible("memo")) memoCell.hidden = true;
+    tr.appendChild(memoCell);
+
+    var createdCell = labelledCell("Created", null, fmtTime(p.created_at));
+    createdCell.setAttribute("data-column", "created");
+    if (!isColumnVisible("created")) createdCell.hidden = true;
+    tr.appendChild(createdCell);
+
+    var idCell = labelledCell("Payment ID", "mono", shortId(p.id));
+    idCell.setAttribute("data-column", "id");
+    tr.appendChild(idCell);
 
     tr.addEventListener("click", function () { openDetail(p.id, tr); });
     tr.addEventListener("keydown", function (ev) {
       if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openDetail(p.id, tr); }
     });
     return tr;
+  }
+
+  /**
+   * Webhook status badge for the list (#773).
+   *
+   * The list response may carry `webhook_status` ("delivered" | "failing" |
+   * "none"); when it is absent we render a neutral "—" rather than guessing.
+   */
+  function webhookBadge(p) {
+    var status = p && p.webhook_status;
+    if (status === "delivered") return el("span", "pill pill-ok", "delivered");
+    if (status === "failing") return el("span", "pill pill-err", "failing");
+    if (status === "none") return el("span", "pill", "none");
+    return el("span", "muted", "\u2014");
   }
 
   // ── Detail panel (#715) ───────────────────────────────────────────────────
@@ -685,233 +942,4 @@ import { sortPayments } from "./sort.js";
       'textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
     ));
     if (!focusable.length) return;
-    var first = focusable[0];
-    var last = focusable[focusable.length - 1];
-    var active = document.activeElement;
-    if (ev.shiftKey && active === first) {
-      ev.preventDefault();
-      last.focus();
-    } else if (!ev.shiftKey && active === last) {
-      ev.preventDefault();
-      first.focus();
-    }
-  }
-
-  /**
-   * Keep focus inside the detail drawer when something outside tries to steal it.
-   * Handles the case where a click behind the backdrop lands focus on the body.
-   */
-  function keepFocusInDetail(ev) {
-    var detail = $("detail");
-    if (!detail || !detail.open) return;
-    if (!detail.contains(ev.target)) focusDetail();
-  }
-
-  /**
-   * Called when the <dialog> fires its `close` event (from Escape, close(),
-   * or the close button). Restores focus to the row that opened the drawer.
-   */
-  function onDetailClosed() {
-    store.update({ selectedPaymentId: null });
-    var trigger = state.detailTrigger;
-    state.detailTrigger = null;
-    if (trigger && trigger.isConnected) {
-      trigger.focus();
-    }
-  }
-
-  /** Open a <dialog> element as a modal. */
-  function openModal(dialogEl) {
-    if (dialogEl && !dialogEl.open) dialogEl.showModal();
-  }
-
-  /** Close a <dialog> element. */
-  function closeModal(dialogEl) {
-    if (dialogEl && dialogEl.open) dialogEl.close();
-  }
-
-  function closeDetail() {
-    /* Use detail.close() directly so the `close` event fires and
-       `onDetailClosed` can restore focus. The dialog's `close` event is the
-       single authoritative hook — it covers Escape, the button, and the
-       backdrop. */
-    var detail = $("detail");
-    if (detail && detail.open) detail.close();
-  }
-
-  /**
-   * Dismiss the detail drawer when a click lands on the ::backdrop.
-   *
-   * The ::backdrop is not a separate event target; clicks on it are retargeted
-   * to the <dialog>. So we ignore clicks that land inside the dialog's own rect.
-   */
-  function dismissOnBackdrop(ev) {
-    if (ev.target !== $("detail")) return;
-    var rect = $("detail").getBoundingClientRect();
-    var outside =
-      ev.clientX < rect.left || ev.clientX > rect.right ||
-      ev.clientY < rect.top  || ev.clientY > rect.bottom;
-    if (outside) closeDetail();
-  }
-
-  // ── Deliveries ────────────────────────────────────────────────────────────
-
-  function loadDeliveries(paymentId) {
-    api("/payments/" + encodeURIComponent(paymentId) + "/webhooks")
-      .then(function (body) {
-        var list = $("deliveries");
-        clear(list);
-        var deliveries = body.deliveries || [];
-        show($("deliveries-empty"), deliveries.length === 0);
-        if (deliveries.length > 0) {
-          deliveries.forEach(function (d) { list.appendChild(deliveryItem(paymentId, d)); });
-        }
-      })
-      .catch(function (err) {
-        if (err.message !== "unauthorized") {
-          var errNode = buildErrorState(err.message, function () {
-            setError($("deliveries-error"), null);
-            loadDeliveries(paymentId);
-          });
-          var container = $("deliveries-error") && $("deliveries-error").parentNode;
-          if (container) container.insertBefore(errNode, $("deliveries-error"));
-        }
-      });
-  }
-
-  function deliveryItem(paymentId, d) {
-    var li = el("li", "delivery");
-    var head = el("div", "delivery-head");
-    head.appendChild(el("strong", null, d.event || t("delivery.webhook")));
-    head.appendChild(el("span", pillClass(d.status), d.status));
-    li.appendChild(head);
-    li.appendChild(el("div", "mono", d.url));
-    li.appendChild(
-      el(
-        "div",
-        "delivery-meta",
-        t("delivery.meta", {
-          attempts: d.attempts,
-          last: fmtTime(d.last_attempt),
-        })
-      )
-    );
-    li.appendChild(el("div", "delivery-meta", "manual " + (d.manual_attempts || 0)));
-    li.appendChild(el("div", "delivery-meta", "last: " + relativeTime(d.last_attempt)));
-    li.lastChild.title = fmtTime(d.last_attempt);
-    li.appendChild(el("div", "delivery-meta", "created: " + relativeTime(d.created_at)));
-    li.lastChild.title = fmtTime(d.created_at);
-    if (d.status === "failed") {
-      li.appendChild(el("div", "error", "Last delivery failed; check receiver logs or redeliver."));
-    }
-    if (d.status !== "delivered") {
-      li.appendChild(el("div", "delivery-meta", "retry state: queued for redrive if attempts remain"));
-    }
-
-    var button = el("button", "ghost", t("delivery.redeliver"));
-    button.addEventListener("click", function () {
-      if (!window.confirm("Redeliver this webhook now?")) return;
-      button.disabled = true;
-      button.textContent = t("delivery.sending");
-      api(
-        "/payments/" + encodeURIComponent(paymentId) +
-        "/webhooks/" + encodeURIComponent(d.id) + "/redeliver",
-        { method: "POST" }
-      )
-        .then(function () { loadDeliveries(paymentId); })
-        .catch(function (err) {
-          button.disabled = false;
-          button.textContent = t("delivery.redeliver");
-          if (err.message !== "unauthorized") {
-            setError($("deliveries-error"),
-              err.message.indexOf("429") >= 0 ? "Rate limited. Try again shortly." : err.message);
-          }
-        });
-    });
-    li.appendChild(button);
-    return li;
-  }
-
-  // ── Create payment form (#758 / #760 / #761) ──────────────────────────────
-
-  /**
-   * Build a copy button that writes `value` to the clipboard and briefly shows
-   * "Copied" as confirmation (#698, #761).
-   */
-  function copyButton(value, label) {
-    var btn = el("button", "ghost copy", "Copy");
-    btn.type = "button";
-    btn.setAttribute("aria-label", label || ("Copy " + value));
-    btn.addEventListener("click", function () {
-      navigator.clipboard.writeText(value).then(function () {
-        btn.textContent = "Copied";
-        window.setTimeout(function () { btn.textContent = "Copy"; }, 1500);
-      }).catch(function () {
-        /* clipboard API unavailable — silently ignore */
-      });
-    });
-    return btn;
-  }
-
-  /**
-   * Show the payment instructions panel with destination, memo, amount, asset,
-   * expiry and a QR code for the SEP-7 URI (#761, #763).
-   *
-   * The panel is built inside the create-payment dialog so the merchant
-   * sees it immediately after creation without needing to re-open the drawer.
-   */
-  function showPaymentInstructions(payment) {
-    var dialog = $("create-payment-dialog");
-    if (!dialog) return;
-
-    /* Clear the form, reveal the instructions section. */
-    var formSection = $("create-payment-form-section");
-    var instrSection = $("create-payment-instructions");
-    if (formSection) formSection.hidden = true;
-    if (instrSection) instrSection.hidden = false;
-
-    /* Populate fields. */
-    function fillField(fieldId, value) {
-      var el = document.getElementById(fieldId);
-      if (el) el.textContent = value || "—";
-    }
-    fillField("instr-destination", payment.destination_address);
-    fillField("instr-memo", payment.memo);
-    fillField("instr-amount", formatAmount(payment.amount, payment.asset));
-    fillField("instr-asset", payment.asset || "XLM");
-    fillField("instr-expiry", fmtTime(payment.expires_at) +
-      (payment.expires_at ? " (" + countdown(payment.expires_at) + " left)" : ""));
-
-    /* Copy buttons (#698). */
-    function attachCopyBtn(containerId, value, label) {
-      var container = document.getElementById(containerId);
-      if (!container) return;
-      var existing = container.querySelector(".copy");
-      if (existing) container.removeChild(existing);
-      container.appendChild(copyButton(value, label));
-    }
-    attachCopyBtn("instr-destination-row", payment.destination_address, "Copy destination address");
-    attachCopyBtn("instr-memo-row", payment.memo, "Copy memo");
-    attachCopyBtn("instr-id-row", payment.id, "Copy payment ID");
-
-    /* Payment ID. */
-    fillField("instr-id", payment.id);
-
-    /* SEP-7 QR code (#763). */
-    var sep7Uri = buildSep7Uri(payment);
-    var qrContainer = $("instr-qr");
-    if (qrContainer) {
-      if (typeof QRCode !== "undefined" && QRCode.toSvg) {
-        var svgMarkup = QRCode.toSvg(sep7Uri, { size: 180, margin: 3 });
-        if (svgMarkup) {
-          /* We only set innerHTML on a div we own and control; the content
-             comes from our own QR encoder, not from the API or user input. */
-          qrContainer.innerHTML = svgMarkup;
-        }
-      }
-      /* Text alternative always present (#763). */
-      var altEl = $("instr-qr-alt");
-      if (altEl) altEl.textContent = sep7Uri;
-    }
-  }
-
+   

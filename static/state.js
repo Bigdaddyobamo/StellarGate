@@ -440,6 +440,242 @@ export function createRequestTracker() {
   return { begin: begin, abort: abort, abortAll: abortAll };
 }
 
+/* ── Display preferences (#771, #772) ─────────────────────────────────────
+ * Page size, auto-refresh, theme, timezone and column visibility are display
+ * preferences, not secrets, so they are persisted in `localStorage` under a
+ * dedicated `stellargate.prefs.` namespace. That namespace is deliberately
+ * disjoint from the API-key keys owned by `session.js`: nothing here reads or
+ * writes the key, and nothing here logs a value, so a preference can never
+ * carry the key into storage, a URL or the console.
+ *
+ * Every read is defensive. `localStorage` can throw (Safari private mode, a
+ * disabled cookie policy) and a stored value can be hand-edited, so a bad or
+ * missing entry falls back to the default rather than breaking the page. */
+
+/** Prefix for every preference key. Never used for the API key. */
+export const PREFS_NAMESPACE = "stellargate.prefs.";
+
+/** The themes the stylesheet understands. */
+export const THEMES = ["system", "light", "dark"];
+
+/** Page sizes offered in the settings dialog. */
+export const PAGE_SIZES = [10, 25, 50, 100];
+
+/**
+ * A table column.
+ *
+ * `alwaysVisible` columns (Status and Payment ID) have no checkbox in the
+ * column menu and cannot be hidden: the status is the point of the table and
+ * the id is what a merchant quotes to support.
+ *
+ * @typedef {object} Column
+ * @property {string} id
+ * @property {string} label
+ * @property {boolean} alwaysVisible
+ */
+
+/** Every table column, in display order. The single source of truth. */
+export const COLUMNS = [
+  { id: "id", label: "Payment ID", alwaysVisible: true },
+  { id: "created_at", label: "Created", alwaysVisible: false },
+  { id: "amount", label: "Amount", alwaysVisible: false },
+  { id: "currency", label: "Currency", alwaysVisible: false },
+  { id: "status", label: "Status", alwaysVisible: true },
+  { id: "description", label: "Memo", alwaysVisible: false },
+  { id: "customer_email", label: "Customer", alwaysVisible: false },
+];
+
+/** The columns that can be toggled in the column menu. */
+export function toggleableColumns() {
+  return COLUMNS.filter(function (column) {
+    return !column.alwaysVisible;
+  });
+}
+
+/** The default display preferences. */
+export function defaultPrefs() {
+  var columns = {};
+  COLUMNS.forEach(function (column) {
+    columns[column.id] = true;
+  });
+  return {
+    pageSize: 25,
+    autoRefresh: false,
+    theme: "system",
+    timezone: "local",
+    columns: columns,
+  };
+}
+
+/** Coerce a stored page size to one of PAGE_SIZES, else the default. */
+function coercePageSize(value) {
+  var n = Number(value);
+  return PAGE_SIZES.indexOf(n) >= 0 ? n : defaultPrefs().pageSize;
+}
+
+/** Coerce a stored theme to one of THEMES, else the default. */
+function coerceTheme(value) {
+  return THEMES.indexOf(value) >= 0 ? value : defaultPrefs().theme;
+}
+
+/**
+ * Coerce a stored timezone. "local" and "utc" are the two the dashboard
+ * renders; anything else falls back to "local".
+ */
+function coerceTimezone(value) {
+  return value === "utc" ? "utc" : "local";
+}
+
+/**
+ * Coerce a stored column map. Always-visible columns are forced on, unknown
+ * ids are dropped, and a missing id takes its default, so a stale entry from an
+ * older build cannot hide a column that no longer has a checkbox.
+ */
+function coerceColumns(value) {
+  var out = {};
+  var stored = value && typeof value === "object" ? value : {};
+  COLUMNS.forEach(function (column) {
+    if (column.alwaysVisible) {
+      out[column.id] = true;
+    } else {
+      out[column.id] = stored[column.id] === undefined ? true : !!stored[column.id];
+    }
+  });
+  return out;
+}
+
+/**
+ * Normalise an arbitrary object into a complete, valid preference set.
+ *
+ * @param {Partial<ReturnType<typeof defaultPrefs>>} [raw]
+ */
+export function normalizePrefs(raw) {
+  var defaults = defaultPrefs();
+  var s = raw && typeof raw === "object" ? raw : {};
+  return {
+    pageSize: coercePageSize(s.pageSize),
+    autoRefresh: !!s.autoRefresh,
+    theme: coerceTheme(s.theme),
+    timezone: coerceTimezone(s.timezone),
+    columns: coerceColumns(s.columns),
+  };
+}
+
+/**
+ * The storage backing the preferences. Defaults to `window.localStorage` when
+ * present; tests pass a stub. Returns null when no storage is available.
+ *
+ * @param {Storage} [storage]
+ */
+function resolveStorage(storage) {
+  if (storage) return storage;
+  try {
+    if (typeof localStorage !== "undefined" && localStorage) return localStorage;
+  } catch (e) {
+    // Accessing localStorage can throw when storage is disabled.
+  }
+  return null;
+}
+
+/** Read one namespaced key, returning null on any failure. */
+function readKey(storage, name) {
+  try {
+    return storage.getItem(PREFS_NAMESPACE + name);
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Write one namespaced key, ignoring quota or disabled-storage failures. */
+function writeKey(storage, name, value) {
+  try {
+    storage.setItem(PREFS_NAMESPACE + name, value);
+  } catch (e) {
+    // A full or disabled store must not break the page.
+  }
+}
+
+/**
+ * Load the persisted preferences, falling back to defaults for anything
+ * missing or invalid. Never throws.
+ *
+ * @param {Storage} [storage]
+ */
+export function loadPrefs(storage) {
+  var store = resolveStorage(storage);
+  if (!store) return defaultPrefs();
+  var raw = {
+    pageSize: readKey(store, "pageSize"),
+    autoRefresh: readKey(store, "autoRefresh") === "1",
+    theme: readKey(store, "theme"),
+    timezone: readKey(store, "timezone"),
+    columns: null,
+  };
+  var columnsRaw = readKey(store, "columns");
+  if (columnsRaw) {
+    try {
+      raw.columns = JSON.parse(columnsRaw);
+    } catch (e) {
+      raw.columns = null;
+    }
+  }
+  return normalizePrefs(raw);
+}
+
+/**
+ * Persist a preference set. Values are normalised first so an invalid value is
+ * never written. Never throws.
+ *
+ * @param {Partial<ReturnType<typeof defaultPrefs>>} prefs
+ * @param {Storage} [storage]
+ */
+export function savePrefs(prefs, storage) {
+  var store = resolveStorage(storage);
+  var normalized = normalizePrefs(prefs);
+  if (!store) return normalized;
+  writeKey(store, "pageSize", String(normalized.pageSize));
+  writeKey(store, "autoRefresh", normalized.autoRefresh ? "1" : "0");
+  writeKey(store, "theme", normalized.theme);
+  writeKey(store, "timezone", normalized.timezone);
+  writeKey(store, "columns", JSON.stringify(normalized.columns));
+  return normalized;
+}
+
+/**
+ * Remove every namespaced preference key and return the defaults.
+ *
+ * Only keys under PREFS_NAMESPACE are removed, so the API-key keys owned by
+ * `session.js` are untouched. Never throws.
+ *
+ * @param {Storage} [storage]
+ */
+export function resetToDefaults(storage) {
+  var store = resolveStorage(storage);
+  if (store) {
+    var doomed = [];
+    try {
+      for (var i = 0; i < store.length; i++) {
+        var name = store.key(i);
+        if (name && name.indexOf(PREFS_NAMESPACE) === 0) doomed.push(name);
+      }
+    } catch (e) {
+      // Fall through to the known keys below.
+    }
+    // Remove the known keys even if enumeration failed.
+    ["pageSize", "autoRefresh", "theme", "timezone", "columns"].forEach(function (name) {
+      doomed.push(PREFS_NAMESPACE + name);
+    });
+    doomed.forEach(function (name) {
+      try {
+        store.removeItem(name);
+      } catch (e) {
+        // Ignore a disabled store.
+      }
+    });
+  }
+  return defaultPrefs();
+}
+
 /* ── URL-hash serialisation (#696) ────────────────────────────────────────
  * Filters live in the hash, never the query string. That is not a style
  * preference: anything in `location.search` is sent to the server, logged by

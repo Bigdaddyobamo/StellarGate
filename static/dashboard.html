@@ -70,6 +70,73 @@
       </form>
     </section>
 
+    <!-- Settings dialog. Display preferences (page size, auto-refresh, theme,
+         timezone, visible columns) are persisted in localStorage under the
+         `stellargate.dashboard.` namespace, separate from the API key. See
+         #771 and #772. -->
+    <dialog id="settings" aria-modal="true" aria-labelledby="settings-title">
+      <form id="settings-form" method="dialog" class="settings-form">
+        <h2 id="settings-title">Display settings</h2>
+        <label for="settings-page-size">Page size</label>
+        <select id="settings-page-size">
+          <option>10</option>
+          <option>25</option>
+          <option>50</option>
+          <option>100</option>
+        </select>
+        <label class="checkbox">
+          <input id="settings-auto-refresh" type="checkbox" />
+          <span>Auto-refresh</span>
+        </label>
+        <label for="settings-theme">Theme</label>
+        <select id="settings-theme">
+          <option value="system">System</option>
+          <option value="light">Light</option>
+          <option value="dark">Dark</option>
+        </select>
+        <label for="settings-timezone">Timezone</label>
+        <select id="settings-timezone">
+          <option value="local">Local</option>
+          <option value="utc">UTC</option>
+        </select>
+        <fieldset class="settings-columns">
+          <legend>Visible columns</legend>
+          <label class="checkbox small">
+            <input type="checkbox" data-column-toggle="status" checked disabled />
+            <span>Status</span>
+          </label>
+          <label class="checkbox small">
+            <input type="checkbox" data-column-toggle="payment_id" checked disabled />
+            <span>Payment ID</span>
+          </label>
+          <label class="checkbox small">
+            <input type="checkbox" data-column-toggle="memo" checked />
+            <span>Memo</span>
+          </label>
+          <label class="checkbox small">
+            <input type="checkbox" data-column-toggle="amount" checked />
+            <span>Amount</span>
+          </label>
+          <label class="checkbox small">
+            <input type="checkbox" data-column-toggle="asset" checked />
+            <span>Asset</span>
+          </label>
+          <label class="checkbox small">
+            <input type="checkbox" data-column-toggle="webhook" checked />
+            <span>Webhook</span>
+          </label>
+          <label class="checkbox small">
+            <input type="checkbox" data-column-toggle="created_at" checked />
+            <span>Created</span>
+          </label>
+        </fieldset>
+        <div class="settings-actions">
+          <button id="settings-reset" class="ghost" type="button">Reset to defaults</button>
+          <button id="settings-close" class="primary" type="submit">Close</button>
+        </div>
+      </form>
+    </dialog>
+
     <!-- Main application. -->
     <div id="app" hidden>
       <a class="skip-link" href="#payments" data-i18n="nav.skip">Skip to payments</a>
@@ -160,6 +227,56 @@
           <button id="export-selected" class="ghost" hidden>Export selected</button>
           <button id="refresh" class="ghost" data-i18n="list.refresh">Refresh</button>
           <button id="new-payment-btn" class="primary" aria-haspopup="dialog">New payment</button>
+          <!-- Column visibility menu. The button is the popover anchor; the
+               menu itself is a plain list of checkboxes so it degrades to a
+               usable block if the popover API is unavailable. Status and
+               Payment ID are always visible and their checkboxes are
+               disabled. See #772. -->
+          <div class="columns-wrap">
+            <button
+              id="columns-open"
+              class="ghost"
+              type="button"
+              aria-haspopup="true"
+              aria-expanded="false"
+              aria-controls="columns-menu"
+            >
+              Columns
+            </button>
+            <div id="columns-menu" class="columns-menu" role="group" aria-label="Visible columns" hidden>
+              <label class="checkbox small">
+                <input type="checkbox" data-column-toggle="status" checked disabled />
+                <span>Status</span>
+              </label>
+              <label class="checkbox small">
+                <input type="checkbox" data-column-toggle="payment_id" checked disabled />
+                <span>Payment ID</span>
+              </label>
+              <label class="checkbox small">
+                <input type="checkbox" data-column-toggle="memo" checked />
+                <span>Memo</span>
+              </label>
+              <label class="checkbox small">
+                <input type="checkbox" data-column-toggle="amount" checked />
+                <span>Amount</span>
+              </label>
+              <label class="checkbox small">
+                <input type="checkbox" data-column-toggle="asset" checked />
+                <span>Asset</span>
+              </label>
+              <label class="checkbox small">
+                <input type="checkbox" data-column-toggle="webhook" checked />
+                <span>Webhook</span>
+              </label>
+              <label class="checkbox small">
+                <input type="checkbox" data-column-toggle="created_at" checked />
+                <span>Created</span>
+              </label>
+            </div>
+          </div>
+          <button id="settings-open" class="ghost" type="button" aria-haspopup="dialog">
+            Settings
+          </button>
           <button id="help-open" class="ghost" aria-haspopup="dialog">
             Shortcuts&nbsp;<kbd>?</kbd>
           </button>
@@ -233,7 +350,8 @@
           </div>
         </section>
 
-        <section class="card">
+        <section class="card table-card">
+          <div class="table-scroll">
           <table id="payments" class="payments" tabindex="-1" aria-label="Payments">
             <thead>
               <tr>
@@ -260,6 +378,7 @@
             </thead>
             <tbody id="payments-body"></tbody>
           </table>
+          </div>
           <p id="empty" class="empty" hidden data-i18n="list.empty">No payments match this filter.</p>
           <p id="list-error" class="error" hidden></p>
           <!-- Shown when a sort is applied while more pages remain: the sort
