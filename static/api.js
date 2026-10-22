@@ -124,3 +124,55 @@ export async function redeliver(paymentId, deliveryId, options = {}) {
     { ...options, method: "POST" },
   );
 }
+
+/**
+ * List the API keys belonging to a merchant.
+ *
+ * The response contains key metadata only (id, prefix, timestamps) — never
+ * full key material. Nothing here logs the response body.
+ *
+ * @param {string} merchantId merchant ID
+ * @param {object} [options]
+ * @param {string} [options.apiKey] merchant API key
+ * @param {AbortSignal} [options.signal] abort signal
+ * @returns {Promise<any>}
+ */
+export async function listMerchantKeys(merchantId, options = {}) {
+  return request(`/merchants/${encodeURIComponent(merchantId)}/keys`, options);
+}
+
+/**
+ * Issue a new API key for a merchant.
+ *
+ * The response carries the full key material exactly once; callers must show
+ * it to the operator and then discard it. It is never logged here.
+ *
+ * @param {string} merchantId merchant ID
+ * @param {object} [options]
+ * @param {string} [options.apiKey] merchant API key
+ * @param {AbortSignal} [options.signal] abort signal
+ * @returns {Promise<any>}
+ */
+export async function issueMerchantKey(merchantId, options = {}) {
+  return request(`/merchants/${encodeURIComponent(merchantId)}/keys`, {
+    ...options,
+    method: "POST",
+  });
+}
+
+/**
+ * Revoke an API key belonging to a merchant.
+ *
+ * @param {string} merchantId merchant ID
+ * @param {string} keyId API key ID to revoke
+ * @param {object} [options]
+ * @param {string} [options.apiKey] merchant API key
+ * @param {AbortSignal} [options.signal] abort signal
+ * @returns {Promise<any>}
+ */
+export async function revokeMerchantKey(merchantId, keyId, options = {}) {
+  return request(
+    `/merchants/${encodeURIComponent(merchantId)}/keys/${encodeURIComponent(keyId)}/revoke`,
+    { ...options, method: "POST" },
+  );
+}

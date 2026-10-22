@@ -46,23 +46,24 @@
             <span class="visually-hidden">Dark theme</span>
           </button>
         </div>
-        <p class="muted">Sign in with a merchant API key to view payments.</p>
-        <label for="api-key">API key</label>
+        <p class="muted" data-i18n="gate.intro">Sign in with a merchant API key to view payments.</p>
+        <label for="api-key" data-i18n="gate.apiKey">API key</label>
         <input
           id="api-key"
           name="api-key"
           type="password"
           placeholder="merchant API key"
+          data-i18n-placeholder="gate.apiKeyPlaceholder"
           spellcheck="false"
           required
         />
         <label class="checkbox">
           <input id="remember" type="checkbox" />
-          <span>Keep me signed in on this device</span>
+          <span data-i18n="gate.remember">Keep me signed in on this device</span>
         </label>
-        <button type="submit" class="primary">Sign in</button>
+        <button type="submit" class="primary" data-i18n="gate.signIn">Sign in</button>
         <p id="gate-error" class="error" role="alert" hidden></p>
-        <p class="muted small">
+        <p class="muted small" data-i18n="gate.notice">
           The key is held in your browser only and sent as a bearer token
           directly to this gateway. It is never stored on the server.
         </p>
@@ -71,6 +72,7 @@
 
     <!-- Main application. -->
     <div id="app" hidden>
+      <a class="skip-link" href="#payments" data-i18n="nav.skip">Skip to payments</a>
       <header class="topbar">
         <div class="brand">
           <span class="star">&#9733;</span>
@@ -79,9 +81,12 @@
         </div>
         <div class="topbar-right">
           <span id="session-expiry" class="muted small"></span>
-          <span id="health" class="pill pill-idle" title="Gateway health">
+          <span id="health" class="pill pill-idle" title="Gateway health"
+            data-i18n="health.checking" data-i18n-title="health.title">
             checking&hellip;
           </span>
+          <label class="visually-hidden" for="language" data-i18n="nav.language">Language</label>
+          <select id="language" class="ghost" data-i18n-title="nav.language"></select>
           <button
             type="button"
             class="ghost theme-toggle"
@@ -92,7 +97,7 @@
             <span class="theme-icon" aria-hidden="true">&#9788;</span>
             <span class="visually-hidden">Dark theme</span>
           </button>
-          <button id="sign-out" class="ghost">Sign out</button>
+          <button id="sign-out" class="ghost" data-i18n="nav.signOut">Sign out</button>
         </div>
       </header>
 
@@ -122,12 +127,13 @@
               &times;
             </button>
           </div>
-          <div class="filters" role="group" aria-label="Filter by status">
-            <button class="chip chip-on" data-status="" data-label="All" aria-pressed="true">All</button>
-            <button class="chip" data-status="pending" data-label="Pending" aria-pressed="false">Pending</button>
-            <button class="chip" data-status="completed" data-label="Completed" aria-pressed="false">Completed</button>
-            <button class="chip" data-status="underpaid" data-label="Underpaid" aria-pressed="false">Underpaid</button>
-            <button class="chip" data-status="expired" data-label="Expired" aria-pressed="false">Expired</button>
+          <div class="filters" role="group" aria-label="Filter by status"
+            data-i18n-aria-label="filter.label">
+            <button class="chip chip-on" data-status="" data-label="All" aria-pressed="true" data-i18n="filter.all">All</button>
+            <button class="chip" data-status="pending" data-label="Pending" aria-pressed="false" data-i18n="filter.pending">Pending</button>
+            <button class="chip" data-status="completed" data-label="Completed" aria-pressed="false" data-i18n="filter.completed">Completed</button>
+            <button class="chip" data-status="underpaid" data-label="Underpaid" aria-pressed="false" data-i18n="filter.underpaid">Underpaid</button>
+            <button class="chip" data-status="expired" data-label="Expired" aria-pressed="false" data-i18n="filter.expired">Expired</button>
           </div>
           <div class="filters" role="group" aria-label="Filter by creation date">
             <label class="small" for="created-after">From</label>
@@ -152,7 +158,7 @@
           <button id="export-csv" class="ghost">Export CSV</button>
           <span id="selection-count" class="muted small" hidden></span>
           <button id="export-selected" class="ghost" hidden>Export selected</button>
-          <button id="refresh" class="ghost">Refresh</button>
+          <button id="refresh" class="ghost" data-i18n="list.refresh">Refresh</button>
           <button id="new-payment-btn" class="primary" aria-haspopup="dialog">New payment</button>
           <button id="help-open" class="ghost" aria-haspopup="dialog">
             Shortcuts&nbsp;<kbd>?</kbd>
@@ -166,11 +172,125 @@
 
         <section id="summary" class="summary" aria-label="Payment summary"></section>
 
+        <!-- Admin: API keys for a merchant. Operators can list existing keys
+             (id, prefix, created, revoked) and issue or revoke keys. Full key
+             material is only ever shown once, in the reveal panel below, and
+             is never placed in a URL, log line or console output. -->
+        <section id="admin-keys" class="card admin-keys" aria-labelledby="admin-keys-title">
+          <h2 id="admin-keys-title">API keys</h2>
+          <div class="toolbar admin-keys-toolbar">
+            <label class="small" for="merchant-id">Merchant ID</label>
+            <input
+              id="merchant-id"
+              type="text"
+              placeholder="merchant ID"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="load-keys" class="ghost" type="button">Load keys</button>
+            <button id="issue-key" class="primary" type="button" aria-haspopup="dialog">
+              Issue key
+            </button>
+          </div>
+          <p id="keys-status" class="muted small" role="status" hidden></p>
+          <table class="keys" aria-label="API keys">
+            <thead>
+              <tr>
+                <th scope="col">Key ID</th>
+                <th scope="col">Prefix</th>
+                <th scope="col">Created</th>
+                <th scope="col">Revoked</th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="keys-body"></tbody>
+          </table>
+
+          <!-- One-time reveal. The key value lives only in this element while
+               the panel is open; closing it clears the text content and the
+               in-memory copy. The value is rendered as text, never as a link
+               or any other URL-bearing attribute. -->
+          <div
+            id="key-reveal"
+            class="card key-reveal"
+            role="dialog"
+            aria-modal="false"
+            aria-labelledby="key-reveal-title"
+            hidden
+          >
+            <h3 id="key-reveal-title">New API key</h3>
+            <p class="error" role="alert">
+              This key is shown only once. Copy it now and store it securely.
+              It cannot be retrieved again.
+            </p>
+            <div class="key-reveal-value">
+              <code id="key-reveal-value" class="key-value" aria-label="New API key"></code>
+            </div>
+            <div class="key-reveal-actions">
+              <button id="key-copy" class="primary" type="button">Copy</button>
+              <button id="key-reveal-close" class="ghost" type="button">Close</button>
+            </div>
+          </div>
+        </section>
+
         <section class="card">
-          <table class="payments" aria-label="Payments">
+          <table id="payments" class="payments" tabindex="-1" aria-label="Payments">
             <thead>
               <tr>
                 <th class="select-col">
-                  <input id="select-all" type="checkbox" aria-label
+                  <input id="select-all" type="checkbox" aria-label="Select all payments" />
+                </th>
+                <th scope="col" data-i18n="field.paymentId">Payment ID</th>
+                <th scope="col" data-i18n="field.memo">Memo</th>
+                <th scope="col" id="th-amount" aria-sort="none">
+                  <button type="button" class="sort-btn" data-sort="amount">
+                    <span data-i18n="field.amount">Amount</span>
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
+                <th scope="col" data-i18n="field.status">Status</th>
+                <th scope="col" id="th-created" aria-sort="none">
+                  <button type="button" class="sort-btn" data-sort="created">
+                    <span data-i18n="field.created">Created</span>
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="payments-body"></tbody>
+          </table>
+          <p id="empty" class="empty" hidden data-i18n="list.empty">No payments match this filter.</p>
+          <p id="list-error" class="error" hidden></p>
+          <!-- Shown when a sort is applied while more pages remain: the sort
+               covers only the rows currently loaded, not the full result set. -->
+          <p id="sort-note" class="muted small" role="status" hidden></p>
+          <div class="table-foot">
+            <button id="load-more" class="ghost" hidden data-i18n="list.loadMore">Load more</button>
+          </div>
+        </section>
+      </main>
 
-/* … truncated 5332 chars — edit only what you need near the top … */
+      <!-- Detail panel, opened by clicking a row. -->
+      <aside id="detail" class="detail" hidden aria-label="Payment detail"
+        data-i18n-aria-label="detail.label">
+        <div class="detail-head">
+          <h2 data-i18n="detail.title">Payment</h2>
+          <button id="detail-close" class="ghost" aria-label="Close" data-i18n-aria-label="detail.close">&times;</button>
+        </div>
+        <dl id="detail-fields" class="fields"></dl>
+
+        <h3 data-i18n="detail.deliveries">Webhook deliveries</h3>
+        <p id="deliveries-empty" class="muted small" hidden data-i18n="detail.noDeliveries">
+          No delivery attempts recorded for this payment.
+        </p>
+        <p id="deliveries-error" class="error" hidden></p>
+        <ul id="deliveries" class="deliveries"></ul>
+      </aside>
+      <div id="scrim" class="scrim" hidden></div>
+    </div>
+
+    <script src="/dashboard/i18n.js"></script>
+    <script src="/dashboard/app.js"></script>
+  </body>
+</html>

@@ -489,35 +489,6 @@ kbd {
   font-size: 0.8em;
   text-align: center;
 }
-.search button {
-  padding: 0.3rem 0.55rem;
-  line-height: 1;
-  font-size: 1rem;
-}
-
-/* Focus is the primary affordance for a keyboard-first list, so it gets a ring
-   that survives both colour schemes rather than the browser default that
-   disappears against the dark surface. */
-.search input:focus-visible,
-.payments tbody tr:focus-visible,
-.row-active {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
-kbd {
-  display: inline-block;
-  min-width: 1.4em;
-  padding: 0.1rem 0.35rem;
-  border: 1px solid var(--border);
-  border-bottom-width: 2px;
-  border-radius: 4px;
-  background: var(--bg);
-  color: var(--text);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.8em;
-  text-align: center;
-}
 
 .summary {
   display: grid;
@@ -559,7 +530,7 @@ kbd {
 
 .payments th,
 .payments td {
-  text-align: left;
+  text-align: start;
   padding: 0.65rem 0.9rem;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
@@ -760,7 +731,7 @@ kbd {
   background: var(--surface);
   color: var(--text);
   border: none;
-  border-left: 1px solid var(--border);
+  border-inline-start: 1px solid var(--border);
   padding: 1.25rem;
   overflow-y: auto;
   z-index: 5;
@@ -913,6 +884,80 @@ kbd {
   flex: 0 0 3rem;
 }
 
+@media print {
+  @page {
+    margin: 0.5in;
+  }
+
+  html,
+  body {
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  .topbar,
+  .toolbar,
+  .summary,
+  #gate,
+  .detail,
+  .help,
+  .theme-toggle,
+  #sign-out,
+  #health,
+  #selection-count,
+  #export-selected,
+  #export-csv,
+  #refresh,
+  #new-payment-btn,
+  #help-open {
+    display: none !important;
+  }
+
+  #app {
+    display: block !important;
+    visibility: visible !important;
+  }
+
+  main {
+    max-width: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  .card {
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+  }
+
+  .payments {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    page-break-inside: auto;
+  }
+
+  .payments th,
+  .payments td {
+    color: #000 !important;
+    background: #fff !important;
+    border: 1px solid #666 !important;
+    padding: 0.35rem 0.4rem !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .payments tbody tr,
+  .payments tbody tr.row-active,
+  .payments tbody tr:hover {
+    background: #fff !important;
+    cursor: default;
+  }
+
+  .payments .select-col {
+    display: none !important;
+  }
+}
+
 @media (max-width: 720px) {
   .payments thead {
     display: none;
@@ -1015,3 +1060,57 @@ dialog::backdrop {
   gap: 0.5rem;
   margin-top: 1rem;
 }
+
+/* ── Sortable table headers (#770) ─────────────────────────────────────── */
+
+/* The header cell keeps its own padding and border; the button inside it is
+   stripped back to plain text so the header still reads as a header. The
+   button is what takes focus and what carries `aria-sort`'s visual twin. */
+.payments th.sortable {
+  padding: 0;
+}
+
+.sort-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  width: 100%;
+  padding: 0.65rem 0.9rem;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  text-align: left;
+}
+.sort-button:hover {
+  border-color: transparent;
+  color: var(--text);
+}
+
+/* The arrow is drawn with a border triangle rather than a glyph so it does not
+   depend on a font that may not be installed. It is decorative: `aria-sort` on
+   the <th> is what assistive technology reads, and the arrow is hidden from it
+   so the header is not announced twice. */
+.sort-arrow {
+  flex: none;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  opacity: 0;
+}
+.sort-button[aria-sort="ascending"] .sort-arrow,
+.sort-button[aria-sort="descending"] .sort-arrow {
+  opacity: 1;
+}
+.sort-button[aria-sort="ascending"] .sort-arrow {
+  transform: rotate(180deg);
+}
+
+/* Shown when the sort only covers the rows already loaded, because

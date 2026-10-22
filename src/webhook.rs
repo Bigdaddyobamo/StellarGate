@@ -494,8 +494,10 @@ mod tests {
     //   a map with non-string keys). `serde_json::Value` produced by the `json!`
     //   macro is always serialisable; a failure here is a bug in the test
     //   fixture, not a recoverable error.
-    // * `String::from_utf8(body).unwrap()` — `serde_json::to_vec` always emits
-    //   valid UTF-8, so this is infallible for any body that `to_vec` produced.
+    // * `String::from_utf8(body).expect("webhook body should be valid UTF-8")`
+    //   — `serde_json::to_vec` always emits valid UTF-8, so this is infallible
+    //   for any body that `to_vec` produced; the message names the expected
+    //   condition so a failure is diagnosable from CI logs alone.
     //
     // Neither pattern appears in production code paths.
 
@@ -717,7 +719,8 @@ mod tests {
             // Confirm the serialised bytes contain the event string, i.e. that
             // it survives the round-trip through serde_json::to_vec used in dispatch().
             let body = serde_json::to_vec(&payload).unwrap();
-            let body_str = String::from_utf8(body).unwrap();
+            let body_str =
+                String::from_utf8(body).expect("webhook body should be valid UTF-8");
             assert!(
                 body_str.contains(event),
                 "serialised body must contain the event string (event={event})"

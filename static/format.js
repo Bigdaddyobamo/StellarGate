@@ -52,17 +52,39 @@ export function pillClass(status) {
   return "pill";
 }
 
-export function buildSep7Uri({ destination, amount, assetCode, assetIssuer, memo, memoType, networkPassphrase } = {}) {
+export function buildSep7Uri(payment = {}) {
+  const p = payment && typeof payment === "object" ? payment : {};
+  const destination = p.destination ?? p.destination_address ?? "";
+  const amount = p.amount ?? "";
+  const assetCode = p.asset_code ?? p.assetCode ?? p.asset ?? "";
+  const assetIssuer = p.asset_issuer ?? p.assetIssuer ?? "";
+  const memo = p.memo ?? "";
+  const memoType = p.memo_type ?? p.memoType ?? inferSep7MemoType(memo);
+  const networkPassphrase = p.network_passphrase ?? p.networkPassphrase ?? "";
+
   const params = new URLSearchParams();
-  if (destination) params.set("destination", destination);
-  if (amount !== undefined && amount !== null && amount !== "") params.set("amount", String(amount));
-  if (assetCode) params.set("asset_code", assetCode);
-  if (assetIssuer) params.set("asset_issuer", assetIssuer);
-  if (memo) params.set("memo", memo);
-  if (memoType) params.set("memo_type", memoType);
-  if (networkPassphrase) params.set("network_passphrase", networkPassphrase);
+  if (destination) params.set("destination", String(destination));
+  if (amount !== undefined && amount !== null && amount !== "") {
+    params.set("amount", String(amount));
+  }
+  if (assetCode && String(assetCode).trim() && String(assetCode).toUpperCase() !== "XLM") {
+    params.set("asset_code", String(assetCode));
+    if (assetIssuer) params.set("asset_issuer", String(assetIssuer));
+  }
+  if (memo !== undefined && memo !== null && memo !== "") {
+    params.set("memo", String(memo));
+    if (memoType) params.set("memo_type", String(memoType));
+  }
+  if (networkPassphrase) params.set("network_passphrase", String(networkPassphrase));
   const qs = params.toString();
   return qs ? `web+stellar:pay?${qs}` : "web+stellar:pay";
+}
+
+function inferSep7MemoType(memo) {
+  if (memo === null || memo === undefined || memo === "") return "";
+  const value = String(memo).trim();
+  if (/^-?\d+$/.test(value)) return "id";
+  return "text";
 }
 
 export function explorerTx(hash, network = "testnet") {

@@ -35,6 +35,7 @@ import {
 import { createSessionStore } from "./session.js";
 import { createStore, parseHash, serializeHash } from "./state.js";
 import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
+import { sortPayments } from "./sort.js";
 
 (function () {
   "use strict";
@@ -46,6 +47,8 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
   var KEY_NAME = "stellargate.apiKey";
   var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
   var THEME_KEY = "stellargate.theme";
+
+  var t = window.I18N.t;
 
   // ── Session store ─────────────────────────────────────────────────────────
   var session = createSessionStore({
@@ -248,14 +251,16 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     return fetch(API_BASE + path, { method: opts.method || "GET", headers: headers, body: opts.body || undefined }).then(
       function (res) {
         if (res.status === 401) {
-          signOut("That API key was rejected. Please sign in again.");
+          signOut(t("error.rejected"));
           throw new Error("unauthorized");
         }
         return res
           .json()
           .catch(function () { return {}; })
           .then(function (body) {
-            if (!res.ok) throw new Error(body.error || "Request failed (" + res.status + ")");
+            if (!res.ok) {
+              throw new Error(body.error || t("error.requestFailed", { status: res.status }));
+            }
             return body;
           });
       }
@@ -380,7 +385,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 
   function renderRows() {
     var tbody = $("rows");
-    var visible = store.visiblePayments();
+    var visible = sortedVisiblePayments();
     var active = store.get().activeRow;
     clear(tbody);
     visible.forEach(function (p, index) {
@@ -610,27 +615,27 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       .then(function (p) {
         clear(fields);
         [
-          ["Status", p.status],
-          ["Amount", formatAmount(p.amount, p.asset)],
-          ["Received", p.paid_amount ? formatAmount(p.paid_amount, p.asset) : "—"],
-          ["Memo", p.memo],
-          ["Destination", p.destination_address],
-          ["Transaction", p.tx_hash || "—"],
-          ["Network", "Stellar"],
-          ["Asset issuer", p.asset_issuer || "native"],
-          ["Payment ID", p.id],
-          ["Merchant", p.merchant_id],
-          ["Created", fmtTime(p.created_at)],
-          ["Updated", fmtTime(p.updated_at)],
-          ["Expires", fmtTime(p.expires_at) +
+          [t("field.status"), p.status, true],
+          [t("field.amount"), formatAmount(p.amount, p.asset)],
+          [t("field.received"), p.paid_amount ? formatAmount(p.paid_amount, p.asset) : "—"],
+          [t("field.memo"), p.memo],
+          [t("field.destination"), p.destination_address],
+          [t("field.transaction"), p.tx_hash || "—"],
+          [t("field.network"), "Stellar"],
+          [t("field.assetIssuer"), p.asset_issuer || "native"],
+          [t("field.paymentId"), p.id],
+          [t("field.merchant"), p.merchant_id],
+          [t("field.created"), fmtTime(p.created_at)],
+          [t("field.updated"), fmtTime(p.updated_at)],
+          [t("field.expires"), fmtTime(p.expires_at) +
             (p.status === "pending" ? " (" + countdown(p.expires_at) + " left)" : "")],
         ].forEach(function (pair) {
           fields.appendChild(el("dt", null, pair[0]));
-          if (pair[0] === "Status") {
+          if (pair[2]) {
             var dd = document.createElement("dd");
             dd.appendChild(el("span", pillClass(p.status), p.status));
             fields.appendChild(dd);
-          } else if (pair[0] === "Transaction" && p.tx_hash) {
+          } else if (pair[0] === t("field.transaction") && p.tx_hash) {
             var tx = document.createElement("dd");
             var link = el("a", "mono", shortId(p.tx_hash));
             link.href = explorerTx(p.tx_hash);
@@ -777,11 +782,21 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
   function deliveryItem(paymentId, d) {
     var li = el("li", "delivery");
     var head = el("div", "delivery-head");
-    head.appendChild(el("strong", null, d.event || "webhook"));
+    head.appendChild(el("strong", null, d.event || t("delivery.webhook")));
     head.appendChild(el("span", pillClass(d.status), d.status));
     li.appendChild(head);
     li.appendChild(el("div", "mono", d.url));
-    li.appendChild(el("div", "delivery-meta", "attempt " + d.attempts + " · manual " + (d.manual_attempts || 0)));
+    li.appendChild(
+      el(
+        "div",
+        "delivery-meta",
+        t("delivery.meta", {
+          attempts: d.attempts,
+          last: fmtTime(d.last_attempt),
+        })
+      )
+    );
+    li.appendChild(el("div", "delivery-meta", "manual " + (d.manual_attempts || 0)));
     li.appendChild(el("div", "delivery-meta", "last: " + relativeTime(d.last_attempt)));
     li.lastChild.title = fmtTime(d.last_attempt);
     li.appendChild(el("div", "delivery-meta", "created: " + relativeTime(d.created_at)));
@@ -792,11 +807,12 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     if (d.status !== "delivered") {
       li.appendChild(el("div", "delivery-meta", "retry state: queued for redrive if attempts remain"));
     }
-    var button = el("button", "ghost", "Redeliver");
+
+    var button = el("button", "ghost", t("delivery.redeliver"));
     button.addEventListener("click", function () {
       if (!window.confirm("Redeliver this webhook now?")) return;
       button.disabled = true;
-      button.textContent = "Sending\u2026";
+      button.textContent = t("delivery.sending");
       api(
         "/payments/" + encodeURIComponent(paymentId) +
         "/webhooks/" + encodeURIComponent(d.id) + "/redeliver",
@@ -805,7 +821,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
         .then(function () { loadDeliveries(paymentId); })
         .catch(function (err) {
           button.disabled = false;
-          button.textContent = "Redeliver";
+          button.textContent = t("delivery.redeliver");
           if (err.message !== "unauthorized") {
             setError($("deliveries-error"),
               err.message.indexOf("429") >= 0 ? "Rate limited. Try again shortly." : err.message);
@@ -899,496 +915,3 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     }
   }
 
-  /**
-   * Reset and re-open the create-payment form ("Create another" action, #761).
-   */
-  function resetCreateForm() {
-    var formSection = $("create-payment-form-section");
-    var instrSection = $("create-payment-instructions");
-    if (formSection) formSection.hidden = false;
-    if (instrSection) instrSection.hidden = true;
-
-    var form = $("create-payment-form");
-    if (form) form.reset();
-
-    var submitBtn = $("create-submit");
-    if (submitBtn) {
-      submitBtn.disabled = false;
-      submitBtn.textContent = "Create payment";
-    }
-    setError($("create-payment-error"), null);
-    /* Focus the first field. */
-    var amountInput = $("create-amount");
-    if (amountInput) amountInput.focus();
-  }
-
-  /** Wire up the create-payment dialog. Called once from init(). */
-  function initCreatePaymentDialog() {
-    var dialog = $("create-payment-dialog");
-    var openBtn = $("new-payment-btn");
-    var cancelBtn = $("create-cancel");
-    var createAnotherBtn = $("create-another");
-    var form = $("create-payment-form");
-
-    if (!dialog || !form) return;
-
-    if (openBtn) {
-      openBtn.addEventListener("click", function () {
-        resetCreateForm();
-        openModal(dialog);
-        var amountInput = $("create-amount");
-        if (amountInput) amountInput.focus();
-      });
-    }
-
-    if (cancelBtn) {
-      cancelBtn.addEventListener("click", function () { closeModal(dialog); });
-    }
-
-    if (createAnotherBtn) {
-      createAnotherBtn.addEventListener("click", function () { resetCreateForm(); });
-    }
-
-    var doneBtn = $("create-done");
-    if (doneBtn) {
-      doneBtn.addEventListener("click", function () { closeModal(dialog); });
-    }
-
-    var cancelBtn2 = $("create-cancel-2");
-    if (cancelBtn2) {
-      cancelBtn2.addEventListener("click", function () { closeModal(dialog); });
-    }
-
-    var instrCloseBtn = $("create-instr-close");
-    if (instrCloseBtn) {
-      instrCloseBtn.addEventListener("click", function () { closeModal(dialog); });
-    }
-
-    /* Backdrop click dismissal. */
-    dialog.addEventListener("click", function (ev) {
-      if (ev.target !== dialog) return;
-      var rect = dialog.getBoundingClientRect();
-      var outside =
-        ev.clientX < rect.left || ev.clientX > rect.right ||
-        ev.clientY < rect.top  || ev.clientY > rect.bottom;
-      if (outside) closeModal(dialog);
-    });
-
-    /* #760: prevent double submission. */
-    form.addEventListener("submit", function (ev) {
-      ev.preventDefault();
-      var submitBtn = $("create-submit");
-      if (submitBtn && submitBtn.disabled) return;
-
-      var amount = ($("create-amount") || {}).value || "";
-      var asset  = ($("create-asset")  || {}).value || "XLM";
-      var webhookUrl = ($("create-webhook") || {}).value || "";
-
-      if (!amount.trim()) {
-        setError($("create-payment-error"), "Amount is required.");
-        return;
-      }
-
-      /* Disable button and show spinner while request is in flight (#760). */
-      if (submitBtn) {
-        submitBtn.disabled = true;
-        submitBtn.textContent = "Creating\u2026";
-      }
-      setError($("create-payment-error"), null);
-
-      var body = { amount: amount.trim(), asset: asset };
-      if (webhookUrl.trim()) body.webhook_url = webhookUrl.trim();
-
-      /* Generate a per-form idempotency key so a network retry doesn't create
-         duplicates. A new key is minted each time the form is submitted fresh
-         (but stays constant across retries of the same submission). (#760) */
-      var idempotencyKey = generateIdempotencyKey();
-
-      api("/payments", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "Idempotency-Key": idempotencyKey,
-        },
-        body: JSON.stringify(body),
-      })
-        .then(function (payment) {
-          /* #761: show instructions panel with copy buttons and QR code. */
-          showPaymentInstructions(payment);
-          /* Prepend the new payment to the loaded list. */
-          var payments = store.get().loadedPayments;
-          store.update({ loadedPayments: [payment].concat(payments) });
-          renderRows();
-          loadSummary();
-        })
-        .catch(function (err) {
-          /* Re-enable on error (#760). */
-          if (submitBtn) {
-            submitBtn.disabled = false;
-            submitBtn.textContent = "Create payment";
-          }
-          if (err.message !== "unauthorized") {
-            setError($("create-payment-error"), err.message);
-          }
-        });
-    });
-  }
-
-  /**
-   * Generate a random idempotency key for the current form submission.
-   * Uses crypto.randomUUID when available, falls back to Math.random.
-   */
-  function generateIdempotencyKey() {
-    if (typeof crypto !== "undefined" && crypto.randomUUID) {
-      return crypto.randomUUID();
-    }
-    var arr = [];
-    for (var i = 0; i < 32; i++) arr.push(Math.floor(Math.random() * 16).toString(16));
-    return arr.join("");
-  }
-
-  // ── Export ────────────────────────────────────────────────────────────────
-
-  function exportCsv(payments, filename) {
-    var csv = toCsv(payments, CSV_COLUMNS);
-    var blob = new Blob([csv], { type: "text/csv" });
-    var url = URL.createObjectURL(blob);
-    var a = document.createElement("a");
-    a.href = url;
-    a.download = filename || "stellargate-payments.csv";
-    a.click();
-    URL.revokeObjectURL(url);
-  }
-
-  // ── Version ───────────────────────────────────────────────────────────────
-
-  function loadVersion() {
-    fetch("/")
-      .then(function (res) { return res.text(); })
-      .then(function (text) {
-        var match = /v\d+\.\d+\.\d+/.exec(text);
-        if (match) $("version").textContent = match[0];
-      })
-      .catch(function () { /* cosmetic only */ });
-  }
-
-  // ── Health ────────────────────────────────────────────────────────────────
-
-  function updateSessionExpiry() {
-    var expiresAt = session.expiresAt();
-    var node = $("session-expiry");
-    if (!node) return;
-    if (expiresAt === null) { node.textContent = ""; return; }
-    node.textContent = "session " + countdown(new Date(expiresAt).toISOString());
-    node.title = "Saved " + fmtTime(new Date(session.savedAt()).toISOString());
-  }
-
-  function pollHealth() {
-    fetch("/ready", { headers: { Accept: "application/json" } })
-      .then(function (res) {
-        return res.json().then(function (body) { return { ok: res.ok, body: body }; });
-      })
-      .then(function (r) {
-        var pill = $("health");
-        pill.className = r.ok ? "pill pill-ok" : "pill pill-err";
-        pill.textContent = r.ok ? "healthy" : r.body.reason || "unavailable";
-        pill.title = JSON.stringify(r.body);
-      })
-      .catch(function () {
-        var pill = $("health");
-        pill.className = "pill pill-err";
-        pill.textContent = "unreachable";
-        pill.title = "Readiness request failed";
-      });
-  }
-
-  // ── Filter / search UI ────────────────────────────────────────────────────
-
-  function syncFilterUi() {
-    var state = store.get();
-    Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
-      var status = chip.getAttribute("data-status") || "";
-      var isActive = status ? state.statuses
-        ? state.statuses.indexOf(status) >= 0
-        : status === state.status
-      : (state.statuses ? state.statuses.length === 0 : !state.status);
-      chip.className = isActive ? "chip chip-on" : "chip";
-      chip.setAttribute("aria-pressed", isActive ? "true" : "false");
-    });
-
-    var search = $("search");
-    if (search && search.value !== state.search) search.value = state.search;
-
-    var size = $("page-size");
-    if (size) size.value = String(state.pageSize);
-
-    var after = $("created-after");
-    if (after && after.value !== state.createdAfter) after.value = state.createdAfter;
-
-    var before = $("created-before");
-    if (before && before.value !== state.createdBefore) before.value = state.createdBefore;
-
-    var auto = $("auto-refresh");
-    if (auto) auto.checked = state.autoRefresh;
-
-    syncPresetUi();
-  }
-
-  function onFilterChange() {
-    syncFilterUi();
-    writeHash();
-    reload();
-  }
-
-  function syncSearchClear() {
-    var button = $("search-clear");
-    if (button) button.hidden = !store.get().search;
-  }
-
-  // ── Keyboard navigation ───────────────────────────────────────────────────
-
-  function moveActiveRow(delta) {
-    var count = store.visiblePayments().length;
-    store.update({ activeRow: moveRow(store.get().activeRow, count, delta) });
-    renderRows();
-    var active = document.querySelector("#rows tr.row-active");
-    if (active && typeof active.scrollIntoView === "function") {
-      active.scrollIntoView({ block: "nearest" });
-    }
-  }
-
-  function openActiveRow() {
-    var stateSnap = store.get();
-    var visible = store.visiblePayments();
-    if (stateSnap.activeRow < 0 || stateSnap.activeRow >= visible.length) return;
-    openDetail(visible[stateSnap.activeRow].id);
-  }
-
-  function onKeydown(ev) {
-    if (store.get().helpOpen) {
-      if (ev.key === "Escape" || ev.key === "?") { ev.preventDefault(); closeHelp(); }
-      return;
-    }
-    var action = matchShortcut(ev, { activeElement: document.activeElement });
-    if (!action) return;
-    if (action === "focusSearch") {
-      var search = $("search");
-      if (!search) return;
-      ev.preventDefault();
-      search.focus();
-      search.select();
-      return;
-    }
-    ev.preventDefault();
-    switch (action) {
-      case "refresh":    reload(); break;
-      case "nextRow":    moveActiveRow(1); break;
-      case "prevRow":    moveActiveRow(-1); break;
-      case "closeDrawer": closeDetail(); break;
-      case "toggleHelp": toggleHelp(); break;
-    }
-  }
-
-  // ── Shortcut help overlay (#721) ──────────────────────────────────────────
-
-  function renderHelp() {
-    var list = $("help-list");
-    if (!list) return;
-    clear(list);
-    SHORTCUTS.forEach(function (s) {
-      var li = el("li", "help-row");
-      var kbd = el("kbd", null, s.hint);
-      var span = el("span", null, s.label);
-      li.appendChild(kbd);
-      li.appendChild(span);
-      list.appendChild(li);
-    });
-  }
-
-  function openHelp() {
-    store.update({ helpOpen: true });
-    show($("help"), true);
-    var closeBtn = $("help-close");
-    if (closeBtn) closeBtn.focus();
-  }
-
-  function closeHelp() {
-    store.update({ helpOpen: false });
-    show($("help"), false);
-    var openBtn = $("help-open");
-    if (openBtn) openBtn.focus();
-  }
-
-  function toggleHelp() {
-    if (store.get().helpOpen) closeHelp(); else openHelp();
-  }
-
-  // ── Internal mutable state not in store ───────────────────────────────────
-  // (The store covers serialisable filter/pagination state; non-serialisable
-  //  focus-restoration state lives here.)
-  var state = {
-    detailTrigger: null,
-  };
-
-  // ── Init ──────────────────────────────────────────────────────────────────
-
-  function init() {
-    initTheme();
-    renderHelp();
-
-    $("gate-form").addEventListener("submit", function (ev) {
-      ev.preventDefault();
-      var key = $("api-key").value.trim();
-      if (!key) return;
-      setError($("gate-error"), null);
-      signIn(key, $("remember").checked).catch(function (err) {
-        if (err.message !== "unauthorized") setError($("gate-error"), err.message);
-      });
-    });
-
-    $("sign-out").addEventListener("click", function () { signOut(null); });
-
-    $("refresh").addEventListener("click", function () { loadSummary(); reload(); });
-
-    $("export-csv").addEventListener("click", function () {
-      exportCsv(store.get().loadedPayments, "stellargate-payments.csv");
-    });
-
-    var exportSel = $("export-selected");
-    if (exportSel) {
-      exportSel.addEventListener("click", function () {
-        exportCsv(Object.values(selectedPayments), "stellargate-payments-selected.csv");
-      });
-    }
-
-    $("select-all").addEventListener("change", function () {
-      var on = $("select-all").checked;
-      store.get().loadedPayments.forEach(function (p) { setSelected(p, on); });
-      syncSelectionUi();
-    });
-
-    $("page-size").addEventListener("change", function () {
-      store.update({ pageSize: Number($("page-size").value) || 25 });
-      onFilterChange();
-    });
-
-    $("created-after").addEventListener("change", function () {
-      store.update({ createdAfter: $("created-after").value });
-      onFilterChange();
-    });
-
-    $("created-before").addEventListener("change", function () {
-      store.update({ createdBefore: $("created-before").value });
-      onFilterChange();
-    });
-
-    $("auto-refresh").addEventListener("change", function () {
-      store.update({ autoRefresh: $("auto-refresh").checked });
-      onFilterChange();
-    });
-
-    Array.prototype.forEach.call(document.querySelectorAll(".preset"), function (btn) {
-      btn.addEventListener("click", function () {
-        var range = presetRange(Number(btn.getAttribute("data-days")));
-        store.update({ createdAfter: range.from, createdBefore: range.to });
-        var afterEl = $("created-after"), beforeEl = $("created-before");
-        if (afterEl) afterEl.value = range.from;
-        if (beforeEl) beforeEl.value = range.to;
-        onFilterChange();
-      });
-    });
-
-    var search = $("search");
-    if (search) {
-      search.addEventListener("input", function () {
-        store.update({ search: search.value.trim() });
-        store.clampActiveRow();
-        renderRows();
-        writeHash();
-        syncSearchClear();
-      });
-    }
-
-    $("load-more").addEventListener("click", function () {
-      store.update({ activeRow: -1 });
-      loadPayments();
-    });
-
-    var searchClear = $("search-clear");
-    if (searchClear) {
-      searchClear.addEventListener("click", function () {
-        store.update({ search: "" });
-        renderRows();
-        writeHash();
-        syncSearchClear();
-        var box = $("search");
-        if (box) box.focus();
-      });
-    }
-
-    /* Detail drawer wiring. */
-    var detail = $("detail");
-    if (detail) {
-      $("detail-close").addEventListener("click", closeDetail);
-      $("detail").addEventListener("click", dismissOnBackdrop);
-      $("detail").addEventListener("keydown", trapDetailFocus);
-      $("detail").addEventListener("close", onDetailClosed);
-      document.addEventListener("focusin", function (ev) { keepFocusInDetail(ev); });
-    }
-
-    $("help-close").addEventListener("click", closeHelp);
-    $("help").addEventListener("click", function (ev) {
-      if (ev.target === $("help")) closeHelp();
-    });
-    $("help-open").addEventListener("click", openHelp);
-
-    document.addEventListener("keydown", function (ev) {
-      if (ev.key !== "Enter") return;
-      if (store.get().helpOpen) return;
-      if (document.activeElement && document.activeElement.tagName === "TR") return;
-      if (ev.ctrlKey || ev.metaKey || ev.altKey) return;
-      if (store.get().activeRow < 0) return;
-      ev.preventDefault();
-      openActiveRow();
-    });
-
-    document.addEventListener("keydown", onKeydown);
-
-    Array.prototype.forEach.call(document.querySelectorAll(".chip"), function (chip) {
-      chip.addEventListener("click", function () {
-        store.update({ status: chip.getAttribute("data-status") || "" });
-        onFilterChange();
-      });
-    });
-
-    window.addEventListener("hashchange", function () {
-      if (store.get().key) { applyHash(); reload(); }
-    });
-
-    window.setInterval(function () {
-      if (store.get().key) pollHealth();
-    }, 30000);
-
-    window.setInterval(function () {
-      var stateSnap = store.get();
-      if (stateSnap.key && stateSnap.autoRefresh && (!stateSnap.status || stateSnap.status === "pending")) {
-        reload();
-      }
-    }, 15000);
-
-    initCreatePaymentDialog();
-
-    var existing = session.read();
-    if (existing) {
-      signIn(existing, null).catch(function (err) {
-        if (err.message !== "unauthorized") showGate("Could not restore your session: " + err.message);
-      });
-    }
-  }
-
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", init);
-  } else {
-    init();
-  }
-})();

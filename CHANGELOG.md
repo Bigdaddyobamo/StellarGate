@@ -59,6 +59,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **SEP-7 `web+stellar:pay` URIs for native and issued assets (issue #762).**
+  The dashboard now builds a valid SEP-7 URI from a payment object, omitting
+  `asset_code`/`asset_issuer` for XLM while including them for issued assets and
+  percent-encoding memo values so wallet clients receive the intended payload.
+
 - **A manual light/dark override (issue #713).** The dashboard followed the OS
   palette with no way to disagree with it. A toggle now sets `data-theme` on
   `<html>` and remembers the choice in `localStorage` under
