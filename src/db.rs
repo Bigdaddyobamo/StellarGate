@@ -1603,7 +1603,9 @@ mod tests {
             .connect("sqlite::memory:")
             .await
             .unwrap();
-        migrate(&pool).await.unwrap();
+        migrate(&pool)
+            .await
+            .expect("migrations should apply cleanly");
         pool
     }
 
@@ -1959,13 +1961,17 @@ mod tests {
         assert_eq!(sum_processed_stroops(&pool, "legacy").await.unwrap(), 0);
 
         // A subsequent migrate() (as on the next startup) backfills the ledger.
-        migrate(&pool).await.unwrap();
+        migrate(&pool)
+            .await
+            .expect("migrations should apply cleanly on re-run");
         assert_eq!(
             sum_processed_stroops(&pool, "legacy").await.unwrap(),
             30_000_000
         );
         // And it is idempotent across restarts.
-        migrate(&pool).await.unwrap();
+        migrate(&pool)
+            .await
+            .expect("migrations should apply cleanly on re-run");
         assert_eq!(
             sum_processed_stroops(&pool, "legacy").await.unwrap(),
             30_000_000
