@@ -73,6 +73,39 @@ export function explorerTx(hash, network = "testnet") {
   return `${base}${encodeURIComponent(hash)}`;
 }
 
+// Asset code for a payment row, with a dash fallback when the list
+// response does not carry one. Pure and DOM-free.
+export function assetLabel(payment) {
+  if (!payment || typeof payment !== "object") return "—";
+  const code = payment.asset_code ?? payment.assetCode ?? payment.asset;
+  if (code === null || code === undefined) return "—";
+  const s = String(code).trim();
+  return s === "" ? "—" : s;
+}
+
+// Webhook delivery status for a payment row.
+// Returns "delivered" | "failing" | "none" when the list response carries
+// webhook status, and "unknown" when it does not (neutral fallback).
+export function webhookStatus(payment) {
+  if (!payment || typeof payment !== "object") return "unknown";
+  const raw = payment.webhook_status ?? payment.webhookStatus;
+  if (raw === null || raw === undefined || raw === "") return "unknown";
+  const s = String(raw).toLowerCase();
+  if (["delivered", "success", "succeeded", "ok"].includes(s)) return "delivered";
+  if (["failing", "failed", "error", "retrying", "pending"].includes(s)) return "failing";
+  if (["none", "not_configured", "disabled", "skipped"].includes(s)) return "none";
+  return "unknown";
+}
+
+// Badge class for a webhook status value; reuses pillClass so the
+// dashboard stays visually consistent.
+export function webhookPillClass(status) {
+  const s = String(status || "").toLowerCase();
+  if (s === "delivered") return pillClass("delivered");
+  if (s === "failing") return pillClass("failed");
+  return "pill";
+}
+
 // Shorten a long identifier (tx hash, payment id, ...) for display.
 export function shortId(id, head = 6, tail = 6) {
   if (id === null || id === undefined) return "—";

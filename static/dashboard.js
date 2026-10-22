@@ -35,6 +35,7 @@ import {
 import { createSessionStore } from "./session.js";
 import { createStore, parseHash, serializeHash } from "./state.js";
 import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
+import { createPrefsStore, COLUMNS, ALWAYS_VISIBLE } from "./prefs.js";
 
 (function () {
   "use strict";
@@ -45,11 +46,17 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
   var API_BASE = "/v1";
   var KEY_NAME = "stellargate.apiKey";
   var KEY_SAVED_AT = "stellargate.apiKeySavedAt";
-  var THEME_KEY = "stellargate.theme";
 
   // ── Session store ─────────────────────────────────────────────────────────
   var session = createSessionStore({
     session: (function () { try { return window.sessionStorage; } catch (e) { return null; } })(),
+    local: (function () { try { return window.localStorage; } catch (e) { return null; } })(),
+  });
+
+  // ── Preferences store (#771 / #772) ───────────────────────────────────────
+  // Persisted under its own namespace ("stellargate.prefs."), separate from the
+  // API key. Never stores the key, and never writes it anywhere.
+  var prefs = createPrefsStore({
     local: (function () { try { return window.localStorage; } catch (e) { return null; } })(),
   });
 
@@ -174,23 +181,21 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     });
   }
 
-  // ── Theme (#713) ───────────────────────────────────────────────────────────
+  // ── Theme (#713 / #771) ────────────────────────────────────────────────────
 
   function effectiveTheme() {
-    try {
-      var stored = window.localStorage.getItem(THEME_KEY);
-      if (stored === "light" || stored === "dark") return stored;
-    } catch (e) { /* storage unavailable */ }
+    var stored = prefs.get().theme;
+    if (stored === "light" || stored === "dark") return stored;
     return null;
   }
 
   function applyTheme(theme) {
     if (theme === "light" || theme === "dark") {
       document.documentElement.setAttribute("data-theme", theme);
-      window.localStorage.setItem(THEME_KEY, theme);
+      prefs.update({ theme: theme });
     } else {
       document.documentElement.removeAttribute("data-theme");
-      window.localStorage.removeItem(THEME_KEY);
+      prefs.update({ theme: "system" });
     }
     syncThemeUi();
   }
@@ -227,6 +232,211 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
         });
       }
     );
+  }
+
+  // ── Preferences (#771 / #772) ─────────────────────────────────────────────
+
+  /** Column keys that are always shown, regardless of preference. */
+  function isColumnVisible(key) {
+    if (ALWAYS_VISIBLE.indexOf(key) >= 0) return true;
+    var cols = prefs.get().columns || {};
+    return cols[key] !== false;
+  }
+
+  /** Apply persisted display preferences to the view-state store. */
+  function applyPreferences() {
+    var p = prefs.get();
+    store.update({ pageSize: p.pageSize });
+    store.update({ autoRefresh: !!p.autoRefresh });
+    if (p.theme === "light" || p.theme === "dark") {
+      document.documentElement.setAttribute("data-theme", p.theme);
+    } else {
+      document.documentElement.removeAttribute("data-theme");
+    }
+    syncThemeUi();
+    syncPrefsUi();
+    applyColumnVisibility();
+  }
+
+  /** Reflect the current preferences into the settings dialog controls. */
+  function syncPrefsUi() {
+    var p = prefs.get();
+    var size = $("prefs-page-size");
+    if (size) size.value = String(p.pageSize);
+    var auto = $("prefs-auto-refresh");
+    if (auto) auto.checked = !!p.autoRefresh;
+    var theme = $("prefs-theme");
+    if (theme) theme.value = p.theme || "system";
+    var tz = $("prefs-timezone");
+    if (tz) tz.value = p.timezone || "local";
+    syncColumnMenuUi();
+  }
+
+  /** Reflect column visibility into the column menu checkboxes. */
+  function syncColumnMenuUi() {
+    Array.prototype.forEach.call(
+      document.querySelectorAll("#columns-menu input[data-column]"),
+      function (box) {
+        var key = box.getAttribute("data-column");
+        box.checked = isColumnVisible(key);
+        box.disabled = ALWAYS_VISIBLE.indexOf(key) >= 0;
+      }
+    );
+  }
+
+  /** Toggle table column visibility via data-column attributes. */
+  function applyColumnVisibility() {
+    COLUMNS.forEach(function (key) {
+      var visible = isColumnVisible(key);
+      Array.prototype.forEach.call(
+        document.querySelectorAll('[data-column="' + key + '"]'),
+        function (node) {
+          if (node.tagName === "TH" || node.tagName === "TD") {
+            node.hidden = !visible;
+          } else {
+            node.hidden = !visible;
+          }
+        }
+      );
+    });
+    syncColumnMenuUi();
+  }
+
+  /** Build the column menu checkboxes once. */
+  function renderColumnMenu() {
+    var menu = $("columns-menu");
+    if (!menu) return;
+    var list = menu.querySelector(".columns-list");
+    if (!list) return;
+    clear(list);
+    COLUMNS.forEach(function (key) {
+      var li = el("li", "columns-item");
+      var label = el("label", "columns-label");
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.setAttribute("data-column", key);
+      box.checked = isColumnVisible(key);
+      box.disabled = ALWAYS_VISIBLE.indexOf(key) >= 0;
+      box.addEventListener("change", function () {
+        if (ALWAYS_VISIBLE.indexOf(key) >= 0) { box.checked = true; return; }
+        var cols = Object.assign({}, prefs.get().columns || {});
+        cols[key] = box.checked;
+        prefs.update({ columns: cols });
+        applyColumnVisibility();
+      });
+      label.appendChild(box);
+      label.appendChild(el("span", null, columnLabel(key)));
+      li.appendChild(label);
+      list.appendChild(li);
+    });
+  }
+
+  function columnLabel(key) {
+    switch (key) {
+      case "status":   return "Status";
+      case "amount":   return "Amount";
+      case "asset":    return "Asset";
+      case "webhook":  return "Webhook";
+      case "memo":     return "Memo";
+      case "created":  return "Created";
+      case "id":       return "Payment ID";
+      default:         return key;
+    }
+  }
+
+  function openSettings() {
+    syncPrefsUi();
+    openModal($("settings"));
+  }
+
+  function closeSettings() {
+    closeModal($("settings"));
+  }
+
+  function resetPreferences() {
+    prefs.reset();
+    applyPreferences();
+    onFilterChange();
+    announce("Preferences reset to defaults");
+  }
+
+  /** Wire the settings dialog and column menu. Called once from init(). */
+  function initPreferences() {
+    renderColumnMenu();
+
+    var settingsBtn = $("settings-open");
+    if (settingsBtn) settingsBtn.addEventListener("click", openSettings);
+
+    var settingsClose = $("settings-close");
+    if (settingsClose) settingsClose.addEventListener("click", closeSettings);
+
+    var settingsDone = $("settings-done");
+    if (settingsDone) settingsDone.addEventListener("click", closeSettings);
+
+    var settingsReset = $("settings-reset");
+    if (settingsReset) settingsReset.addEventListener("click", resetPreferences);
+
+    var settings = $("settings");
+    if (settings) {
+      settings.addEventListener("click", function (ev) {
+        if (ev.target !== settings) return;
+        var rect = settings.getBoundingClientRect();
+        var outside =
+          ev.clientX < rect.left || ev.clientX > rect.right ||
+          ev.clientY < rect.top  || ev.clientY > rect.bottom;
+        if (outside) closeSettings();
+      });
+    }
+
+    var size = $("prefs-page-size");
+    if (size) {
+      size.addEventListener("change", function () {
+        prefs.update({ pageSize: Number(size.value) || 25 });
+        store.update({ pageSize: prefs.get().pageSize });
+        onFilterChange();
+      });
+    }
+
+    var auto = $("prefs-auto-refresh");
+    if (auto) {
+      auto.addEventListener("change", function () {
+        prefs.update({ autoRefresh: auto.checked });
+        store.update({ autoRefresh: auto.checked });
+        onFilterChange();
+      });
+    }
+
+    var theme = $("prefs-theme");
+    if (theme) {
+      theme.addEventListener("change", function () {
+        applyTheme(theme.value);
+      });
+    }
+
+    var tz = $("prefs-timezone");
+    if (tz) {
+      tz.addEventListener("change", function () {
+        prefs.update({ timezone: tz.value });
+        renderRows();
+      });
+    }
+
+    var columnsBtn = $("columns-open");
+    if (columnsBtn) {
+      columnsBtn.addEventListener("click", function () {
+        var menu = $("columns-menu");
+        if (!menu) return;
+        show(menu, menu.hidden);
+        syncColumnMenuUi();
+      });
+    }
+
+    var columnsClose = $("columns-close");
+    if (columnsClose) {
+      columnsClose.addEventListener("click", function () {
+        show($("columns-menu"), false);
+      });
+    }
   }
 
   // ── API ───────────────────────────────────────────────────────────────────
@@ -413,16 +623,20 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
       tr.className = "skeleton-row";
       tr.setAttribute("aria-hidden", "true");
       var cols = [
-        { label: "Select",     cls: "sk-select" },
-        { label: "Status",     cls: "sk-status" },
-        { label: "Amount",     cls: "sk-amount" },
-        { label: "Memo",       cls: "sk-memo" },
-        { label: "Created",    cls: "sk-date" },
-        { label: "Payment ID", cls: "sk-id" },
+        { label: "Select",     cls: "sk-select",     key: null },
+        { label: "Status",     cls: "sk-status",     key: "status" },
+        { label: "Amount",     cls: "sk-amount",     key: "amount" },
+        { label: "Asset",      cls: "sk-asset",      key: "asset" },
+        { label: "Webhook",    cls: "sk-webhook",    key: "webhook" },
+        { label: "Memo",       cls: "sk-memo",       key: "memo" },
+        { label: "Created",    cls: "sk-date",       key: "created" },
+        { label: "Payment ID", cls: "sk-id",         key: "id" },
       ];
       cols.forEach(function (col) {
         var td = document.createElement("td");
         td.setAttribute("data-label", col.label);
+        if (col.key) td.setAttribute("data-column", col.key);
+        if (col.key && !isColumnVisible(col.key)) td.hidden = true;
         td.appendChild(el("span", "skeleton-cell " + col.cls));
         tr.appendChild(td);
       });
@@ -570,19 +784,62 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 
     var statusCell = document.createElement("td");
     statusCell.setAttribute("data-label", "Status");
+    statusCell.setAttribute("data-column", "status");
     statusCell.appendChild(el("span", pillClass(p.status), p.status));
     tr.appendChild(statusCell);
 
-    tr.appendChild(labelledCell("Amount", null, formatAmount(p.amount, p.asset)));
-    tr.appendChild(labelledCell("Memo", "mono", p.memo));
-    tr.appendChild(labelledCell("Created", null, fmtTime(p.created_at)));
-    tr.appendChild(labelledCell("Payment ID", "mono", shortId(p.id)));
+    var amountCell = labelledCell("Amount", null, formatAmount(p.amount, p.asset));
+    amountCell.setAttribute("data-column", "amount");
+    if (!isColumnVisible("amount")) amountCell.hidden = true;
+    tr.appendChild(amountCell);
+
+    /* Asset column (#773). */
+    var assetCell = labelledCell("Asset", "mono", p.asset || "XLM");
+    assetCell.setAttribute("data-column", "asset");
+    if (!isColumnVisible("asset")) assetCell.hidden = true;
+    tr.appendChild(assetCell);
+
+    /* Webhook status column (#773). */
+    var webhookCell = document.createElement("td");
+    webhookCell.setAttribute("data-label", "Webhook");
+    webhookCell.setAttribute("data-column", "webhook");
+    webhookCell.appendChild(webhookBadge(p));
+    if (!isColumnVisible("webhook")) webhookCell.hidden = true;
+    tr.appendChild(webhookCell);
+
+    var memoCell = labelledCell("Memo", "mono", p.memo);
+    memoCell.setAttribute("data-column", "memo");
+    if (!isColumnVisible("memo")) memoCell.hidden = true;
+    tr.appendChild(memoCell);
+
+    var createdCell = labelledCell("Created", null, fmtTime(p.created_at));
+    createdCell.setAttribute("data-column", "created");
+    if (!isColumnVisible("created")) createdCell.hidden = true;
+    tr.appendChild(createdCell);
+
+    var idCell = labelledCell("Payment ID", "mono", shortId(p.id));
+    idCell.setAttribute("data-column", "id");
+    tr.appendChild(idCell);
 
     tr.addEventListener("click", function () { openDetail(p.id, tr); });
     tr.addEventListener("keydown", function (ev) {
       if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); openDetail(p.id, tr); }
     });
     return tr;
+  }
+
+  /**
+   * Webhook status badge for the list (#773).
+   *
+   * The list response may carry `webhook_status` ("delivered" | "failing" |
+   * "none"); when it is absent we render a neutral "—" rather than guessing.
+   */
+  function webhookBadge(p) {
+    var status = p && p.webhook_status;
+    if (status === "delivered") return el("span", "pill pill-ok", "delivered");
+    if (status === "failing") return el("span", "pill pill-err", "failing");
+    if (status === "none") return el("span", "pill", "none");
+    return el("span", "muted", "\u2014");
   }
 
   // ── Detail panel (#715) ───────────────────────────────────────────────────
@@ -1234,6 +1491,8 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 
   function init() {
     initTheme();
+    initPreferences();
+    applyPreferences();
     renderHelp();
 
     $("gate-form").addEventListener("submit", function (ev) {
@@ -1268,7 +1527,9 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     });
 
     $("page-size").addEventListener("change", function () {
-      store.update({ pageSize: Number($("page-size").value) || 25 });
+      var size = Number($("page-size").value) || 25;
+      prefs.update({ pageSize: size });
+      store.update({ pageSize: size });
       onFilterChange();
     });
 
@@ -1283,7 +1544,9 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     });
 
     $("auto-refresh").addEventListener("change", function () {
-      store.update({ autoRefresh: $("auto-refresh").checked });
+      var on = $("auto-refresh").checked;
+      prefs.update({ autoRefresh: on });
+      store.update({ autoRefresh: on });
       onFilterChange();
     });
 

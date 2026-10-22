@@ -863,6 +863,181 @@ async fn unknown_dashboard_module_is_not_found() {
     }
 }
 
+/// The settings dialog and the column menu must exist in the markup (#771,
+/// #772).
+///
+/// The dialog is a real `<dialog>` opened with `showModal()`, for the same
+/// reason the detail drawer is (#715): an `<aside>` under a scrim is only
+/// visually on top. The column menu is a checkbox per column, so the choice is
+/// reachable by keyboard and announced with its state.
+#[test]
+fn settings_dialog_and_column_menu_exist() {
+    let markup = strip_html_comments(DASHBOARD_HTML);
+
+    assert!(
+        markup.contains(r#"<dialog id="settings""#),
+        "the display preferences need a <dialog id=\"settings\"> element"
+    );
+    assert!(
+        markup.contains(r#"aria-labelledby="settings-title""#)
+            && markup.contains(r#"<h2 id="settings-title">"#),
+        "the settings dialog must be named by its heading, and that heading must \
+         exist — aria-labelledby pointing at nothing announces a bare \"dialog\""
+    );
+    assert!(
+        markup.contains(r#"id="settings-open""#),
+        "there must be a control that opens the settings dialog"
+    );
+    assert!(
+        markup.contains(r#"id="settings-reset""#),
+        "the dialog needs a \"Reset to defaults\" control"
+    );
+    assert!(
+        markup.contains(r#"id="columns-menu""#),
+        "the column menu must have a container element"
+    );
+    assert!(
+        markup.contains(r#"type="checkbox""#),
+        "each column must be toggled by a checkbox, not a free-text field"
+    );
+
+    assert!(
+        DASHBOARD_JS.contains(r#"$("settings").showModal()"#),
+        "the settings dialog must be opened with showModal(), not by removing `hidden`"
+    );
+    assert!(
+        DASHBOARD_JS.contains(r#"$("settings").close()"#),
+        "the settings dialog must be closed with close()"
+    );
+    assert!(
+        DASHBOARD_JS.contains(r#"$("settings").addEventListener("click", dismissOnBackdrop);"#),
+        "the settings dialog must dismiss on a backdrop click, like the drawer"
+    );
+}
+
+/// Preferences live in `localStorage` under their own namespace, never next to
+/// the API key (#771, #772).
+///
+/// The key is the one secret this page holds; a preferences blob written beside
+/// it is one careless `JSON.stringify(state)` away from copying the credential
+/// into a second place, and a "reset to defaults" that clears the whole origin
+/// would take the key with it. A distinct prefix makes both mistakes visible.
+#[test]
+fn display_preferences_are_persisted_under_their_own_namespace() {
+    assert!(
+        DASHBOARD_JS.contains(r#"var PREFS_PREFIX = "stellargate.prefs.";"#),
+        "display preferences must be stored under a dedicated `stellargate.prefs.` \
+         prefix, separate from the API key"
+    );
+    for key in [
+        r#""stellargate.prefs.page_size""#,
+        r#""stellargate.prefs.auto_refresh""#,
+        r#""stellargate.prefs.columns""#,
+    ] {
+        assert!(
+            DASHBOARD_JS.contains(key),
+            "the preference {key} must have a stable storage key"
+        );
+    }
+    assert!(
+        DASHBOARD_JS.contains("function loadPrefs(") && DASHBOARD_JS.contains("function savePrefs("),
+        "preferences must be read and written through one pair of helpers, so the \
+         namespace cannot drift between call sites"
+    );
+    assert!(
+        DASHBOARD_JS.contains("function resetPrefs("),
+        "\"Reset to defaults\" must go through a helper that removes only the \
+         preference keys, never the whole origin's storage"
+    );
+    assert!(
+        !DASHBOARD_JS.contains("window.localStorage.clear()"),
+        "clearing all of localStorage would take the API key with it; reset must \
+         remove only the preference keys"
+    );
+
+    // The key itself must never be part of a stored preference value.
+    for (name, source) in
+        std::iter::once(("dashboard.js", DASHBOARD_JS)).chain(MODULES.iter().map(|(p, b)| (*p, *b)))
+    {
+        assert!(
+            !source.contains("JSON.stringify(state)"),
+            "{name} must not serialise the whole state object: it holds the API key"
+        );
+    }
+}
+
+/// Status and Payment ID are the columns an operator cannot work without, so
+/// they are not offered in the column menu and cannot be hidden (#772).
+#[test]
+fn status_and_payment_id_columns_are_always_visible() {
+    assert!(
+        DASHBOARD_JS.contains(r#"var ALWAYS_VISIBLE_COLUMNS = ["status", "payment_id"];"#),
+        "the always-visible columns must be an explicit allow-list, so a new \
+         column cannot silently become un-hideable or a required one hideable"
+    );
+    assert!(
+        DASHBOARD_JS.contains("ALWAYS_VISIBLE_COLUMNS.indexOf("),
+        "the column menu must consult the allow-list before offering a checkbox"
+    );
+    assert!(
+        DASHBOARD_JS.contains("function applyColumnVisibility("),
+        "column visibility must be applied from one place, so the table and the \
+         mobile card layout cannot disagree"
+    );
+}
+
+/// The Asset and webhook status columns must be rendered (#773).
+#[test]
+fn asset_and_webhook_status_columns_are_rendered() {
+    let markup = strip_html_comments(DASHBOARD_HTML);
+    for header in ["Asset", "Webhook"] {
+        assert!(
+            markup.contains(&format!(">{header}<")),
+            "the table needs a `{header}` column header"
+        );
+    }
+    assert!(
+        DASHBOARD_JS.contains("function webhookStatus("),
+        "the webhook column must be derived in one helper so the table and the \
+         mobile card layout show the same indicator"
+    );
+    for state in ["delivered", "failing", "none"] {
+        assert!(
+            DASHBOARD_JS.contains(&format!("\"{state}\"")),
+            "the webhook indicator must distinguish the `{state}` state"
+        );
+    }
+    assert!(
+        DASHBOARD_JS.contains("function renderCard("),
+        "the mobile card layout (#711) must be kept in sync with the new columns"
+    );
+}
+
+/// The table header stays visible while the list scrolls (#774).
+#[test]
+fn table_header_is_sticky() {
+    assert!(
+        DASHBOARD_CSS.contains("position: sticky;"),
+        "the table header must be sticky, or the column labels scroll out of view \
+         on a long list"
+    );
+    assert!(
+        DASHBOARD_CSS.contains("thead th {"),
+        "the sticky rule must target the header cells, not the whole table"
+    );
+    assert!(
+        DASHBOARD_CSS.contains("top: 0;"),
+        "a sticky header needs an explicit top offset"
+    );
+    // A sticky header paints over the rows beneath it, so it needs its own
+    // background in both themes or the rows show through.
+    assert!(
+        DASHBOARD_CSS.contains("background: var(--surface);"),
+        "the sticky header must paint an opaque background from a themed token, \
+         or the rows scroll visibly through it"
+    );
+}
+
 /// Each header must appear exactly once — a response builder that appends
 /// instead of replacing would otherwise emit a duplicate `nosniff` alongside
 /// the outer security-header layer's copy.
