@@ -166,11 +166,99 @@
 
         <section id="summary" class="summary" aria-label="Payment summary"></section>
 
+        <!-- Admin: API keys for a merchant. Operators can list existing keys
+             (id, prefix, created, revoked) and issue or revoke keys. Full key
+             material is only ever shown once, in the reveal panel below, and
+             is never placed in a URL, log line or console output. -->
+        <section id="admin-keys" class="card admin-keys" aria-labelledby="admin-keys-title">
+          <h2 id="admin-keys-title">API keys</h2>
+          <div class="toolbar admin-keys-toolbar">
+            <label class="small" for="merchant-id">Merchant ID</label>
+            <input
+              id="merchant-id"
+              type="text"
+              placeholder="merchant ID"
+              autocomplete="off"
+              spellcheck="false"
+            />
+            <button id="load-keys" class="ghost" type="button">Load keys</button>
+            <button id="issue-key" class="primary" type="button" aria-haspopup="dialog">
+              Issue key
+            </button>
+          </div>
+          <p id="keys-status" class="muted small" role="status" hidden></p>
+          <table class="keys" aria-label="API keys">
+            <thead>
+              <tr>
+                <th scope="col">Key ID</th>
+                <th scope="col">Prefix</th>
+                <th scope="col">Created</th>
+                <th scope="col">Revoked</th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="keys-body"></tbody>
+          </table>
+
+          <!-- One-time reveal. The key value lives only in this element while
+               the panel is open; closing it clears the text content and the
+               in-memory copy. The value is rendered as text, never as a link
+               or any other URL-bearing attribute. -->
+          <div
+            id="key-reveal"
+            class="card key-reveal"
+            role="dialog"
+            aria-modal="false"
+            aria-labelledby="key-reveal-title"
+            hidden
+          >
+            <h3 id="key-reveal-title">New API key</h3>
+            <p class="error" role="alert">
+              This key is shown only once. Copy it now and store it securely.
+              It cannot be retrieved again.
+            </p>
+            <div class="key-reveal-value">
+              <code id="key-reveal-value" class="key-value" aria-label="New API key"></code>
+            </div>
+            <div class="key-reveal-actions">
+              <button id="key-copy" class="primary" type="button">Copy</button>
+              <button id="key-reveal-close" class="ghost" type="button">Close</button>
+            </div>
+          </div>
+        </section>
+
         <section class="card">
           <table class="payments" aria-label="Payments">
             <thead>
               <tr>
                 <th class="select-col">
-                  <input id="select-all" type="checkbox" aria-label
-
-/* … truncated 5332 chars — edit only what you need near the top … */
+                  <input id="select-all" type="checkbox" aria-label="Select all payments" />
+                </th>
+                <th scope="col">Payment ID</th>
+                <th scope="col">Memo</th>
+                <th scope="col" id="th-amount" aria-sort="none">
+                  <button type="button" class="sort-btn" data-sort="amount">
+                    Amount
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
+                <th scope="col">Status</th>
+                <th scope="col" id="th-created" aria-sort="none">
+                  <button type="button" class="sort-btn" data-sort="created">
+                    Created
+                    <span class="sort-indicator" aria-hidden="true"></span>
+                  </button>
+                </th>
+                <th scope="col">Actions</th>
+              </tr>
+            </thead>
+            <tbody id="payments-body"></tbody>
+          </table>
+          <!-- Shown when a sort is applied while more pages remain: the sort
+               covers only the rows currently loaded, not the full result set. -->
+          <p id="sort-note" class="muted small" role="status" hidden></p>
+        </section>
+      </main>
+    </div>
+  </body>
+</html>

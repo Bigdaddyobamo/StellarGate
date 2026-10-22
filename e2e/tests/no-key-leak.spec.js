@@ -150,6 +150,93 @@ test.describe("the API key never leaves the Authorization header", () => {
     ).toEqual([]);
   });
 
+  test("an issued key is revealed once and never leaks (issues #767-#769)", async ({
+    page,
+    seedData,
+  }) => {
+    const key = seedData.apiKey;
+    const { requests, consoleMessages, pageErrors } = instrument(page);
+
+    await page.goto("/dashboard");
+    await page.getByLabel("API key").fill(key);
+    await page.getByRole("button", { name: "Sign in" }).click();
+    await expect(page.locator("#rows tr").first()).toBeVisible();
+
+    // Open the admin key panel and list the merchant's keys. The list must
+    // show prefixes only — never full key material.
+    await page.getByLabel("Merchant ID").fill(seedData.merchantId);
+    await page.getByRole("button", { name: "Load keys" }).click();
+    await expect(page.locator("#keys tr").first()).toBeVisible();
+
+    // Issue a new key. The reveal panel shows it exactly once.
+    await page.getByRole("button", { name: "Issue key" }).click();
+    const reveal = page.locator("#key-reveal");
+    await expect(reveal).toBeVisible();
+    await expect(reveal).toContainText("shown only once");
+
+    const revealed = (await page.locator("#key-reveal-value").textContent())?.trim() ?? "";
+    expect(revealed.length).toBeGreaterThan(32);
+    expect(revealed).not.toBe(key);
+
+    // The revealed key must not be in the address bar or the hash.
+    expect(page.url()).not.toContain(revealed);
+    expect(new URL(page.url()).hash).not.toContain(revealed);
+
+    // Close the panel: the key must be gone from the DOM.
+    await page.getByRole("button", { name: "Close reveal" }).click();
+    await expect(reveal).toBeHidden();
+    const bodyText = await page.evaluate(() => document.body.innerHTML);
+    expect(bodyText, "closing the reveal must clear the key from the DOM").not.toContain(
+      revealed,
+    );
+
+    // Revoke a key, confirming by typing its prefix.
+    const firstPrefix = (await page.locator("#keys tr").first().locator("td").nth(1).textContent())?.trim() ?? "";
+    expect(firstPrefix.length).toBeGreaterThan(0);
+    await page.locator("#keys tr").first().getByRole("button", { name: "Revoke" }).click();
+    await page.getByLabel("Type the key prefix to confirm").fill(firstPrefix);
+    await page.getByRole("button", { name: "Confirm revoke" }).click();
+    await expect(page.locator("#keys tr").first()).toBeVisible();
+
+    // 1. No request URL carries either key.
+    const leakingRequests = requests.filter(
+      (r) => r.url.includes(key) || r.url.includes(revealed),
+    );
+    expect(
+      leakingRequests.map((r) => `${r.method} ${r.url}`),
+      "no key may appear in a request URL",
+    ).toEqual([]);
+
+    const urlValues = requests.flatMap((r) => [...new URL(r.url).searchParams.values()]);
+    expect(urlValues.filter((v) => v.includes(key) || v.includes(revealed))).toEqual([]);
+
+    // 2. Nothing in the console, and no uncaught error quoting a key.
+    expect(
+      consoleMessages
+        .filter((m) => m.text.includes(key) || m.text.includes(revealed))
+        .map((m) => `${m.type}: ${m.text}`),
+      "no key may be written to the console",
+    ).toEqual([]);
+
+    expect(
+      pageErrors
+        .filter(
+          (e) =>
+            e.message.includes(key) ||
+            e.message.includes(revealed) ||
+            (e.stack ?? "").includes(key) ||
+            (e.stack ?? "").includes(revealed),
+        )
+        .map((e) => e.message),
+      "no key may appear in an uncaught error",
+    ).toEqual([]);
+
+    // 3. The address bar and history entries the page created.
+    expect(page.url()).not.toContain(key);
+    expect(page.url()).not.toContain(revealed);
+    expect(new URL(page.url()).hash).not.toContain(revealed);
+  });
+
   test("the key is absent from the URL after a bad sign-in and after sign-out", async ({
     page,
     seedData,

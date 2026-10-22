@@ -1015,3 +1015,233 @@ dialog::backdrop {
   gap: 0.5rem;
   margin-top: 1rem;
 }
+
+/* ── Sortable table headers (#770) ─────────────────────────────────────── */
+
+/* The header cell keeps its own padding and border; the button inside it is
+   stripped back to plain text so the header still reads as a header. The
+   button is what takes focus and what carries `aria-sort`'s visual twin. */
+.payments th.sortable {
+  padding: 0;
+}
+
+.sort-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  width: 100%;
+  padding: 0.65rem 0.9rem;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  text-align: left;
+}
+.sort-button:hover {
+  border-color: transparent;
+  color: var(--text);
+}
+
+/* The arrow is drawn with a border triangle rather than a glyph so it does not
+   depend on a font that may not be installed. It is decorative: `aria-sort` on
+   the <th> is what assistive technology reads, and the arrow is hidden from it
+   so the header is not announced twice. */
+.sort-arrow {
+  flex: none;
+  width: 0;
+  height: 0;
+  border-left: 4px solid transparent;
+  border-right: 4px solid transparent;
+  border-top: 5px solid currentColor;
+  opacity: 0;
+}
+.sort-button[aria-sort="ascending"] .sort-arrow,
+.sort-button[aria-sort="descending"] .sort-arrow {
+  opacity: 1;
+}
+.sort-button[aria-sort="ascending"] .sort-arrow {
+  transform: rotate(180deg);
+}
+
+/* Shown when the sort only covers the rows already loaded, because more pages
+   remain on the server. Without it a sorted view would silently claim to be
+   the whole result set. */
+.sort-note {
+  margin: 0 0 0.75rem;
+  font-size: 0.82rem;
+  color: var(--muted);
+}
+
+/* ── Admin: API keys (#767 / #768 / #769) ──────────────────────────────── */
+
+.admin {
+  margin-top: 1.5rem;
+}
+
+.admin-merchant {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 0.5rem;
+  margin-bottom: 0.75rem;
+}
+.admin-merchant label {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.admin-merchant input {
+  min-width: 220px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.keys {
+  width: 100%;
+  border-collapse: collapse;
+}
+.keys th,
+.keys td {
+  text-align: left;
+  padding: 0.6rem 0.9rem;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.keys th {
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted);
+}
+.keys tbody tr:last-child td {
+  border-bottom: none;
+}
+.keys .key-actions {
+  text-align: right;
+  white-space: nowrap;
+}
+.keys .key-actions button {
+  padding: 0.3rem 0.7rem;
+  font-size: 0.85rem;
+}
+
+/* The one-time reveal. Distinguishable without colour: a heavy border, a
+   dashed edge and a heading that says what it is, so it survives a monochrome
+   display or a colour-vision difference. */
+.reveal {
+  margin: 0.75rem 0;
+  padding: 0.9rem 1rem;
+  border: 2px dashed var(--warn);
+  border-radius: var(--radius);
+  background: var(--warn-bg);
+}
+.reveal h3 {
+  margin: 0 0 0.35rem;
+  color: var(--warn);
+}
+.reveal-warning {
+  font-weight: 600;
+  margin: 0 0 0.6rem;
+}
+.reveal-key {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+.reveal-key code {
+  flex: 1 1 220px;
+  min-width: 0;
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+.reveal-key button {
+  flex: none;
+}
+
+/* Revoke confirmation. The prefix the operator must retype is shown in a
+   monospace block so it can be compared character by character. */
+.revoke-prefix {
+  display: block;
+  margin: 0.5rem 0;
+  padding: 0.4rem 0.6rem;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.9rem;
+  word-break: break-all;
+}
+#revoke-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 1.5rem;
+}
+#revoke-form label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-top: 0.5rem;
+}
+#revoke-form input {
+  padding: 0.6rem 0.7rem;
+  background: var(--bg);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+#revoke-form input[aria-invalid="true"] {
+  border-color: var(--err);
+}
+
+@media (max-width: 720px) {
+  /* The keys table stacks the same way the payments table does, so the admin
+     section stays usable at mobile widths. */
+  .keys thead {
+    display: none;
+  }
+  .keys,
+  .keys tbody,
+  .keys tr,
+  .keys td {
+    display: block;
+    width: 100%;
+  }
+  .keys tr {
+    border-bottom: 1px solid var(--border);
+    padding: 0.65rem 0;
+  }
+  .keys td {
+    border-bottom: none;
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .keys td::before {
+    content: attr(data-label);
+    color: var(--muted);
+    font-size: 0.78rem;
+    text-transform: uppercase;
+  }
+  .keys .key-actions {
+    text-align: left;
+  }
+
+  .admin-merchant input {
+    min-width: 0;
+    width: 100%;
+  }
+  .admin-merchant label {
+    flex: 1 1 100%;
+  }
+}

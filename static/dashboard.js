@@ -35,6 +35,7 @@ import {
 import { createSessionStore } from "./session.js";
 import { createStore, parseHash, serializeHash } from "./state.js";
 import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
+import { sortPayments } from "./sort.js";
 
 (function () {
   "use strict";
@@ -380,7 +381,7 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
 
   function renderRows() {
     var tbody = $("rows");
-    var visible = store.visiblePayments();
+    var visible = sortedVisiblePayments();
     var active = store.get().activeRow;
     clear(tbody);
     visible.forEach(function (p, index) {
@@ -1223,6 +1224,252 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     if (store.get().helpOpen) closeHelp(); else openHelp();
   }
 
+  // ── Admin: merchant API keys (#767 / #768 / #769) ─────────────────────────
+  //
+  // Key material is held only in `revealedKey` (a transient variable) and
+  // `state.revealedKey` while the reveal panel is open. It is never written to
+  // the URL hash, never logged, and never rendered anywhere but the reveal
+  // panel. The list only ever shows the id, prefix, created and revoked
+  // columns — never the full key.
+
+  var revealedKey = null;
+
+  function adminMerchantId() {
+    var input = $("admin-merchant-id");
+    return input ? input.value.trim() : "";
+  }
+
+  function clearKeyListState() {
+    var prev = $("keys-state");
+    if (prev && prev.parentNode) prev.parentNode.removeChild(prev);
+  }
+
+  function setKeyListState(node) {
+    clearKeyListState();
+    node.id = "keys-state";
+    var tbody = $("keys-rows");
+    if (tbody && tbody.parentNode) tbody.parentNode.insertBefore(node, tbody.nextSibling);
+  }
+
+  function renderKeyRows(keys) {
+    var tbody = $("keys-rows");
+    if (!tbody) return;
+    clear(tbody);
+    keys.forEach(function (k) {
+      var tr = document.createElement("tr");
+      tr.appendChild(labelledCell("Key ID", "mono", k.id));
+      tr.appendChild(labelledCell("Prefix", "mono", k.prefix));
+      tr.appendChild(labelledCell("Created", null, fmtTime(k.created_at)));
+      tr.appendChild(labelledCell("Revoked", null, k.revoked_at ? fmtTime(k.revoked_at) : "—"));
+
+      var actionCell = document.createElement("td");
+      actionCell.setAttribute("data-label", "Action");
+      if (!k.revoked_at) {
+        var revokeBtn = el("button", "ghost", "Revoke");
+        revokeBtn.type = "button";
+        revokeBtn.setAttribute("aria-label", "Revoke key " + k.prefix);
+        revokeBtn.addEventListener("click", function () { openRevokeDialog(k); });
+        actionCell.appendChild(revokeBtn);
+      }
+      tr.appendChild(actionCell);
+      tbody.appendChild(tr);
+    });
+  }
+
+  function loadMerchantKeys() {
+    var merchantId = adminMerchantId();
+    if (!merchantId) {
+      setError($("admin-keys-error"), "Enter a merchant ID first.");
+      return;
+    }
+    setError($("admin-keys-error"), null);
+    clearKeyListState();
+    announce("Loading API keys");
+
+    api("/merchants/" + encodeURIComponent(merchantId) + "/keys")
+      .then(function (body) {
+        var keys = body.keys || [];
+        renderKeyRows(keys);
+        if (keys.length === 0) {
+          setKeyListState(buildEmptyState("🔑", "No API keys",
+            "This merchant has no API keys yet.", null));
+        }
+      })
+      .catch(function (err) {
+        if (err.message !== "unauthorized") {
+          setError($("admin-keys-error"), err.message);
+        }
+      });
+  }
+
+  function issueMerchantKey() {
+    var merchantId = adminMerchantId();
+    if (!merchantId) {
+      setError($("admin-keys-error"), "Enter a merchant ID first.");
+      return;
+    }
+    var btn = $("admin-issue-key");
+    if (btn && btn.disabled) return;
+    if (btn) { btn.disabled = true; btn.textContent = "Issuing\u2026"; }
+    setError($("admin-keys-error"), null);
+
+    api("/merchants/" + encodeURIComponent(merchantId) + "/keys", { method: "POST" })
+      .then(function (body) {
+        revealedKey = body.key || null;
+        store.update({ revealedKey: revealedKey });
+        showRevealPanel(revealedKey);
+        loadMerchantKeys();
+        announce("New API key issued. It is shown only once.");
+      })
+      .catch(function (err) {
+        if (err.message !== "unauthorized") {
+          setError($("admin-keys-error"), err.message);
+        }
+      })
+      .then(function () {
+        if (btn) { btn.disabled = false; btn.textContent = "Issue key"; }
+      });
+  }
+
+  function showRevealPanel(key) {
+    var panel = $("key-reveal");
+    var valueNode = $("key-reveal-value");
+    if (!panel || !valueNode) return;
+    valueNode.textContent = key || "";
+    var copyHost = $("key-reveal-copy");
+    if (copyHost) {
+      clear(copyHost);
+      copyHost.appendChild(copyButton(key || "", "Copy new API key"));
+    }
+    show(panel, true);
+    var closeBtn = $("key-reveal-close");
+    if (closeBtn) closeBtn.focus();
+  }
+
+  /** Wipe the revealed key from the DOM and memory. Never logs it. */
+  function closeRevealPanel() {
+    revealedKey = null;
+    store.update({ revealedKey: null });
+    var valueNode = $("key-reveal-value");
+    if (valueNode) valueNode.textContent = "";
+    var copyHost = $("key-reveal-copy");
+    if (copyHost) clear(copyHost);
+    show($("key-reveal"), false);
+    announce("API key hidden.");
+  }
+
+  function openRevokeDialog(key) {
+    var dialog = $("revoke-dialog");
+    if (!dialog) return;
+    store.update({ revokeTarget: { id: key.id, prefix: key.prefix } });
+    var prefixNode = $("revoke-prefix");
+    if (prefixNode) prefixNode.textContent = key.prefix;
+    var input = $("revoke-confirm-input");
+    if (input) input.value = "";
+    var confirmBtn = $("revoke-confirm");
+    if (confirmBtn) confirmBtn.disabled = true;
+    setError($("revoke-error"), null);
+    openModal(dialog);
+    if (input) input.focus();
+  }
+
+  function syncRevokeConfirm() {
+    var target = store.get().revokeTarget;
+    var input = $("revoke-confirm-input");
+    var confirmBtn = $("revoke-confirm");
+    if (!target || !input || !confirmBtn) return;
+    confirmBtn.disabled = input.value.trim() !== target.prefix;
+  }
+
+  function confirmRevoke() {
+    var target = store.get().revokeTarget;
+    var input = $("revoke-confirm-input");
+    var merchantId = adminMerchantId();
+    if (!target || !input || !merchantId) return;
+    if (input.value.trim() !== target.prefix) return;
+
+    var confirmBtn = $("revoke-confirm");
+    if (confirmBtn) { confirmBtn.disabled = true; confirmBtn.textContent = "Revoking\u2026"; }
+    setError($("revoke-error"), null);
+
+    api(
+      "/merchants/" + encodeURIComponent(merchantId) +
+      "/keys/" + encodeURIComponent(target.id),
+      { method: "DELETE" }
+    )
+      .then(function () {
+        closeModal($("revoke-dialog"));
+        store.update({ revokeTarget: null });
+        loadMerchantKeys();
+        announce("API key " + target.prefix + " revoked.");
+      })
+      .catch(function (err) {
+        if (err.message !== "unauthorized") setError($("revoke-error"), err.message);
+      })
+      .then(function () {
+        if (confirmBtn) { confirmBtn.disabled = false; confirmBtn.textContent = "Revoke key"; }
+      });
+  }
+
+  function initAdminKeys() {
+    var loadBtn = $("admin-load-keys");
+    if (loadBtn) loadBtn.addEventListener("click", loadMerchantKeys);
+    var issueBtn = $("admin-issue-key");
+    if (issueBtn) issueBtn.addEventListener("click", issueMerchantKey);
+    var revealClose = $("key-reveal-close");
+    if (revealClose) revealClose.addEventListener("click", closeRevealPanel);
+
+    var revokeInput = $("revoke-confirm-input");
+    if (revokeInput) revokeInput.addEventListener("input", syncRevokeConfirm);
+    var revokeConfirm = $("revoke-confirm");
+    if (revokeConfirm) revokeConfirm.addEventListener("click", confirmRevoke);
+    var revokeCancel = $("revoke-cancel");
+    if (revokeCancel) {
+      revokeCancel.addEventListener("click", function () {
+        closeModal($("revoke-dialog"));
+        store.update({ revokeTarget: null });
+      });
+    }
+  }
+
+  // ── Sortable payments columns (#770) ──────────────────────────────────────
+
+  function syncSortHeaders() {
+    var stateSnap = store.get();
+    Array.prototype.forEach.call(document.querySelectorAll("th[data-sort-key]"), function (th) {
+      var key = th.getAttribute("data-sort-key");
+      var active = stateSnap.sortKey === key;
+      th.setAttribute("aria-sort", active
+        ? (stateSnap.sortDir === "asc" ? "ascending" : "descending")
+        : "none");
+      var btn = th.querySelector("button");
+      if (btn) btn.setAttribute("aria-pressed", active ? "true" : "false");
+    });
+    var note = $("sort-note");
+    if (note) {
+      var more = !!stateSnap.cursor;
+      note.textContent = more && stateSnap.sortKey
+        ? "Sorted over loaded rows only; more pages remain."
+        : "";
+      show(note, !!(more && stateSnap.sortKey));
+    }
+  }
+
+  function onSortHeader(key) {
+    var stateSnap = store.get();
+    var dir = stateSnap.sortKey === key && stateSnap.sortDir === "asc" ? "desc" : "asc";
+    store.update({ sortKey: key, sortDir: dir });
+    syncSortHeaders();
+    renderRows();
+  }
+
+  function sortedVisiblePayments() {
+    var stateSnap = store.get();
+    var visible = store.visiblePayments();
+    if (!stateSnap.sortKey) return visible;
+    return sortPayments(visible, stateSnap.sortKey, stateSnap.sortDir);
+  }
+
   // ── Internal mutable state not in store ───────────────────────────────────
   // (The store covers serialisable filter/pagination state; non-serialisable
   //  focus-restoration state lives here.)
@@ -1377,6 +1624,16 @@ import { matchShortcut, moveRow, SHORTCUTS } from "./keys.js";
     }, 15000);
 
     initCreatePaymentDialog();
+    initAdminKeys();
+
+    Array.prototype.forEach.call(document.querySelectorAll("th[data-sort-key]"), function (th) {
+      var btn = th.querySelector("button");
+      if (!btn) return;
+      btn.addEventListener("click", function () {
+        onSortHeader(th.getAttribute("data-sort-key"));
+      });
+    });
+    syncSortHeaders();
 
     var existing = session.read();
     if (existing) {
