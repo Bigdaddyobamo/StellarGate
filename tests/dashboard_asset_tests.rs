@@ -379,6 +379,27 @@ fn every_dashboard_helper_the_script_calls_is_defined() {
     }
 }
 
+#[test]
+fn dashboard_print_styles_hide_chrome_and_keep_table_readable() {
+    assert!(DASHBOARD_CSS.contains("@media print"), "print styles must be defined");
+    for needle in [
+        ".topbar,",
+        ".toolbar,",
+        ".summary,",
+        "#gate,",
+        ".detail,",
+        ".help,",
+        ".payments th,",
+        ".payments td {",
+        "page-break-inside: avoid;",
+    ] {
+        assert!(
+            DASHBOARD_CSS.contains(needle),
+            "print stylesheet must keep the dashboard chrome hidden and the table readable: missing {needle}"
+        );
+    }
+}
+
 /// The detail drawer is a real modal dialog (issue #715).
 ///
 /// An `<aside>` under a scrim is only *visually* on top: `Tab`, the address bar
