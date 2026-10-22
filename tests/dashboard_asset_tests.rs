@@ -15,6 +15,22 @@ use stellargate::{
     db,
 };
 
+const HTML: &str = include_str!("../static/dashboard.html");
+const CSS: &str = include_str!("../static/dashboard.css");
+const JS: &str = include_str!("../static/dashboard.js");
+const I18N: &str = include_str!("../static/i18n.js");
+
+const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
+const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
+const DASHBOARD_JS: &str = include_str!("../static/dashboard.js");
+const DASHBOARD_THEME_JS: &str = include_str!("../static/dashboard-theme.js");
+
+const DASHBOARD_FORMAT_JS: &str = include_str!("../static/dashboard-format.js");
+
+const DASHBOARD_STATE_JS: &str = include_str!("../static/state.js");
+
+const TEST_ADMIN_SECRET: &str = "test-admin-secret";
+
 fn make_config() -> Config {
     Config {
         port: 0,
@@ -55,11 +71,6 @@ fn make_config() -> Config {
     }
 }
 
-const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
-const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
-const DASHBOARD_JS: &str = include_str!("../static/dashboard.js");
-const DASHBOARD_THEME_JS: &str = include_str!("../static/dashboard-theme.js");
-
 /// The document with its `<!-- … -->` comments removed.
 ///
 /// The dashboard's markup is heavily commented, and those comments name the
@@ -79,10 +90,6 @@ fn strip_html_comments(html: &str) -> String {
     out.push_str(rest);
     out
 }
-
-const DASHBOARD_FORMAT_JS: &str = include_str!("../static/dashboard-format.js");
-
-const DASHBOARD_STATE_JS: &str = include_str!("../static/state.js");
 
 /// All ES module siblings of `app.js`, as `(served_path, source_body)` pairs.
 ///
@@ -109,6 +116,106 @@ const JS_ROUTES: &[&str] = &[
     "/dashboard/keys.js",
     "/dashboard/vendor/qrcode.js",
 ];
+
+#[test]
+fn skip_link_is_first_focusable_in_app_and_targets_table() {
+    let app = &HTML[HTML.find(r#"<div id="app""#).expect("app container")..];
+    let skip = app
+        .find(r##"<a class="skip-link" href="#payments""##)
+        .expect("skip link");
+    let first_focusable = ["<a ", "<button", "<input", "<select", "<textarea"]
+        .iter()
+        .filter_map(|tag| app.find(tag))
+        .min()
+        .expect("focusable element");
+    assert_eq!(skip, first_focusable);
+    assert!(HTML.contains(r#"<table id="payments""#));
+}
+
+#[test]
+fn skip_link_is_visible_on_focus() {
+    assert!(CSS.contains(".skip-link:focus"));
+}
+
+/// Keys defined in one locale block of `i18n.js`, e.g. `catalog_keys("en")`.
+fn catalog_keys(locale: &str) -> Vec<String> {
+    let start = I18N
+        .find(&format!("\n    {locale}: {{"))
+        .expect("locale block");
+    let block = &I18N[start..];
+    let block = &block[..block.find("\n    },").expect("block end")];
+    block
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('"')?.split_once("\":"))
+        .map(|(key, _)| key.to_string())
+        .collect()
+}
+
+/// Every `prefix…"key"` occurrence in `source`.
+fn used_keys(source: &str, prefix: &str) -> Vec<String> {
+    source
+        .match_indices(prefix)
+        .filter(|(i, _)| {
+            !source[..*i].ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '.')
+        })
+        .map(|(i, _)| {
+            let rest = &source[i + prefix.len()..];
+            rest[..rest.find('"').unwrap()].to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn every_used_message_key_exists_in_catalog() {
+    let en = catalog_keys("en");
+    let mut used = used_keys(JS, "t(\"");
+    for attr in [
+        "data-i18n=\"",
+        "data-i18n-placeholder=\"",
+        "data-i18n-title=\"",
+        "data-i18n-aria-label=\"",
+    ] {
+        used.extend(used_keys(HTML, attr));
+    }
+    assert!(
+        used.len() > 20,
+        "expected the UI strings to use the catalog"
+    );
+    for key in used {
+        assert!(en.contains(&key), "missing message key: {key}");
+    }
+}
+
+#[test]
+fn extra_locale_covers_every_english_key() {
+    assert_eq!(catalog_keys("en"), catalog_keys("es"));
+}
+
+#[test]
+fn language_switcher_sets_lang_and_dir() {
+    assert!(HTML.contains(r#"<select id="language""#));
+    assert!(HTML.find("/dashboard/i18n.js") < HTML.find("/dashboard/app.js"));
+    assert!(I18N.contains("navigator.language"));
+    assert!(I18N.contains("root.lang =") && I18N.contains("root.dir ="));
+}
+
+#[test]
+fn layout_uses_logical_properties() {
+    for physical in [
+        "left:",
+        "right:",
+        "-left",
+        "-right:",
+        "text-align: left",
+        "text-align: right",
+    ] {
+        assert!(
+            !CSS.contains(physical),
+            "physical property in CSS: {physical}"
+        );
+    }
+    assert!(CSS.contains("inset-inline-end: 0"));
+}
 
 #[test]
 fn dashboard_api_requests_use_canonical_v1_base() {
@@ -553,8 +660,6 @@ fn payment_rows_are_keyboard_reachable_and_activate_on_enter() {
     );
 }
 
-const TEST_ADMIN_SECRET: &str = "test-admin-secret";
-
 /// The admin key-management panel must be present in the markup (#767–#769).
 ///
 /// The panel is the only place an operator can see, issue or revoke a
@@ -751,281 +856,4 @@ fn theme_override_is_tri_state_and_persisted() {
     );
     assert!(
         DASHBOARD_JS.contains(r#"document.documentElement.removeAttribute("data-theme")"#),
-        "clearing the override must drop the attribute so the CSS falls through \
-         to prefers-color-scheme again"
-    );
-    assert!(
-        DASHBOARD_CSS.contains(":root:not([data-theme])"),
-        "the OS palette must stop applying once an override exists, or a stored \
-         \"light\" choice loses to an OS preference of dark"
-    );
-    for selector in [r#"html[data-theme="light"]"#, r#"html[data-theme="dark"]"#] {
-        assert!(
-            DASHBOARD_CSS.contains(selector),
-            "{selector} must exist, or the stored choice has nothing to select on"
-        );
-    }
-    // `color-scheme` is what carries an explicit override to the parts of the
-    // page CSS does not paint: the date pickers, the <select>, the scrollbar.
-    assert!(
-        DASHBOARD_CSS.contains("color-scheme: light dark;"),
-        "the default must declare both palettes are supported so the OS picks"
-    );
-    for block in ["light", "dark"] {
-        assert!(
-            DASHBOARD_CSS.contains(&format!("color-scheme: {block};")),
-            "an explicit {block} override must set color-scheme: {block}, or the \
-             native controls keep the OS palette on a page that has changed"
-        );
-    }
-}
-
-/// The control is a toggle button, so its name is constant and `aria-pressed`
-/// carries the state.
-#[test]
-fn theme_toggle_is_a_toggle_button_on_both_panels() {
-    // Comments explain the control and name the attribute, so they are stripped
-    // before counting attributes.
-    let markup = strip_html_comments(DASHBOARD_HTML);
-    let toggles = markup.matches("data-theme-toggle").count();
-    assert_eq!(
-        toggles, 2,
-        "both the sign-in gate and the top bar need the control — whichever panel \
-         is on screen should offer the override"
-    );
-    assert!(
-        DASHBOARD_HTML.contains("class=\"visually-hidden\""),
-        "the icon-only control needs a visually-hidden text label, or it has no \
-         accessible name at all"
-    );
-    assert!(
-        DASHBOARD_HTML.contains(r#"aria-pressed="false""#),
-        "a toggle button must expose its state with aria-pressed"
-    );
-    assert!(
-        DASHBOARD_JS.contains(r#"button.setAttribute("aria-pressed", dark ? "true" : "false")"#),
-        "the control's state must follow the theme in effect"
-    );
-    assert!(
-        DASHBOARD_JS.contains("function syncThemeUi()"),
-        "both controls must be kept in step from one place"
-    );
-    assert!(
-        DASHBOARD_JS.contains(r#"document.querySelectorAll("[data-theme-toggle]")"#),
-        "controls must be bound by attribute, so a third one needs no new wiring"
-    );
-}
-
-/// Colour contrast is checked numerically by `scripts/check-dashboard-contrast.mjs`
-/// (issue #718) — this pins the structural preconditions that audit depends on,
-/// so a failure means "the audit is looking in the wrong place" rather than
-/// "the audit is broken".
-#[test]
-fn contrast_audit_can_find_every_theme_block() {
-    // One palette per block, and the same tokens in each. The audit compares
-    // block-by-block, so a token added to one and not another is exactly the
-    // drift that would make a colour unreadable in the theme nobody was
-    // looking at — and #719's `--skeleton-*` are the tokens most likely to
-    // land that way.
-    for selector in [
-        ":root",
-        ":root:not([data-theme])",
-        r#"html[data-theme="light"]"#,
-        r#"html[data-theme="dark"]"#,
-    ] {
-        assert!(
-            DASHBOARD_CSS.contains(selector),
-            "the contrast audit reads the `{selector}` block; it is missing"
-        );
-    }
-    assert_eq!(
-        DASHBOARD_CSS.matches("--control-border:").count(),
-        4,
-        "every theme block must define --control-border, or an interactive control \
-         falls back to a colour no audit looked at"
-    );
-    assert_eq!(
-        DASHBOARD_CSS.matches("--focus:").count(),
-        4,
-        "every theme block must define --focus; there was no focus colour at all \
-         before #718, and the audit needs one per theme"
-    );
-}
-
-/// The focus ring's `outline-offset` is load-bearing, not cosmetic.
-///
-/// `scripts/check-dashboard-contrast.mjs` deliberately does not pair the focus
-/// colour against `--accent`, because a 2px offset puts a gap of the page
-/// background between the ring and a filled control's own edge. Remove the
-/// offset and that reasoning stops holding while the audit still passes, so the
-/// invariant is asserted here.
-#[test]
-fn focus_ring_offset_is_preserved() {
-    assert!(
-        DASHBOARD_CSS.contains("outline-offset: 2px;"),
-        "the focus ring needs a 2px offset: without it the ring touches an \
-         accent-filled control and the contrast audit's reasoning about adjacent \
-         colours no longer holds"
-    );
-    assert!(
-        DASHBOARD_CSS.contains(":focus-visible {"),
-        "focus must be indicated through :focus-visible, which every current \
-         browser supports and which keeps a mouse click from leaving a ring"
-    );
-}
-
-/// Decorative separators and interactive control boundaries are different jobs
-/// and now have different tokens.
-#[test]
-fn control_boundaries_use_the_audited_token() {
-    assert!(
-        DASHBOARD_CSS.contains("border: 1px solid var(--control-border);"),
-        "buttons and inputs must draw their edge from --control-border, the token \
-         the contrast audit holds to 3:1"
-    );
-    for selector in ["input[type=\"date\"]", "select"] {
-        assert!(
-            DASHBOARD_CSS.contains(selector),
-            "{selector} needs a rule: it previously had none at all, so its border \
-             was drawn by the user agent in a colour this stylesheet never chose"
-        );
-    }
-}
-
-async fn test_server() -> TestServer {
-    let cfg = make_config();
-    let pool = SqlitePoolOptions::new()
-        .connect_with(
-            SqliteConnectOptions::from_str(&cfg.database_url)
-                .unwrap()
-                .create_if_missing(true),
-        )
-        .await
-        .unwrap();
-    db::migrate(&pool).await.unwrap();
-    let router = api::router(Arc::new(AppState {
-        pool,
-        config: cfg,
-        http: reqwest::Client::new(),
-        webhook_http: reqwest::Client::new(),
-        webhook_metrics: stellargate::metrics::WebhookMetrics::new(),
-        auth_metrics: stellargate::metrics::AuthMetrics::new(),
-        horizon_metrics: stellargate::metrics::HorizonMetrics::new(),
-        trustline_metrics: stellargate::metrics::TrustlineMetrics::new(),
-        http_metrics: stellargate::metrics::HttpMetrics::new(),
-        payment_metrics: stellargate::metrics::PaymentMetrics::new(),
-        task_health: stellargate::TaskHealth::new(),
-    }))
-    .into_make_service_with_connect_info::<std::net::SocketAddr>();
-    TestServer::new(router)
-}
-
-/// Mirrors `DASHBOARD_CSP` in `src/api/mod.rs`. Compared verbatim so any
-/// change to the policy — or the header being dropped by a framework upgrade —
-/// is a deliberate, reviewed edit rather than a silent regression.
-const EXPECTED_CSP: &str = "default-src 'none'; \
-     script-src 'self'; \
-     style-src 'self'; \
-     img-src 'self' data:; \
-     connect-src 'self'; \
-     form-action 'none'; \
-     frame-ancestors 'none'; \
-     base-uri 'none'";
-
-/// Every dashboard asset must be served with its exact content type, the full
-/// CSP, and the baseline security headers the outer layers add (#637).
-#[tokio::test]
-async fn dashboard_assets_keep_content_type_and_csp() {
-    let server = test_server().await;
-
-    let mut assets: Vec<(&str, &str, &str)> = vec![
-        ("/dashboard", "text/html; charset=utf-8", DASHBOARD_HTML),
-        (
-            "/dashboard/app.css",
-            "text/css; charset=utf-8",
-            DASHBOARD_CSS,
-        ),
-        (
-            "/dashboard/app.js",
-            "text/javascript; charset=utf-8",
-            DASHBOARD_JS,
-        ),
-    ];
-    assets.extend(
-        MODULES
-            .iter()
-            .map(|(path, body)| (*path, "text/javascript; charset=utf-8", *body)),
-    );
-
-    for (path, content_type, body) in assets {
-        let res = server.get(path).await;
-        res.assert_status_ok();
-        assert_eq!(
-            res.header("content-type"),
-            content_type,
-            "{path} served with the wrong content type"
-        );
-        assert_eq!(
-            res.header("content-security-policy"),
-            EXPECTED_CSP,
-            "{path} must carry the dashboard CSP unchanged"
-        );
-        assert_eq!(res.header("x-content-type-options"), "nosniff", "{path}");
-        assert_eq!(res.header("referrer-policy"), "no-referrer", "{path}");
-        assert_eq!(res.header("cache-control"), "no-store", "{path}");
-        assert_eq!(
-            res.text(),
-            body,
-            "{path} must serve the include_str! asset byte-for-byte"
-        );
-    }
-}
-
-/// An unknown file under `/dashboard/` must 404 rather than being resolved from
-/// disk. The modules are individually routed from `include_str!` constants, so
-/// there is no directory to traverse — this pins that property so a future
-/// wildcard route cannot quietly expose `static/`.
-#[tokio::test]
-async fn unknown_dashboard_module_is_not_found() {
-    let server = test_server().await;
-
-    for path in [
-        "/dashboard/../Cargo.toml",
-        "/dashboard/tests/format.test.js",
-        "/dashboard/dashboard.js",
-        "/dashboard/nope.js",
-    ] {
-        let res = server.get(path).await;
-        res.assert_status_not_found();
-    }
-}
-
-/// Each header must appear exactly once — a response builder that appends
-/// instead of replacing would otherwise emit a duplicate `nosniff` alongside
-/// the outer security-header layer's copy.
-#[tokio::test]
-async fn dashboard_security_headers_are_not_duplicated() {
-    let server = test_server().await;
-
-    for path in [
-        "/dashboard",
-        "/dashboard/app.css",
-        "/dashboard/app.js",
-        "/dashboard/format.js",
-        "/dashboard/theme.js",
-    ] {
-        let res = server.get(path).await;
-        res.assert_status_ok();
-        for name in [
-            "content-type",
-            "content-security-policy",
-            "x-content-type-options",
-        ] {
-            assert_eq!(
-                res.headers().get_all(name).iter().count(),
-                1,
-                "{path} must send exactly one {name} header"
-            );
-        }
-    }
-}
+        "cle

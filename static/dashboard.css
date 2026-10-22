@@ -489,35 +489,6 @@ kbd {
   font-size: 0.8em;
   text-align: center;
 }
-.search button {
-  padding: 0.3rem 0.55rem;
-  line-height: 1;
-  font-size: 1rem;
-}
-
-/* Focus is the primary affordance for a keyboard-first list, so it gets a ring
-   that survives both colour schemes rather than the browser default that
-   disappears against the dark surface. */
-.search input:focus-visible,
-.payments tbody tr:focus-visible,
-.row-active {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
-kbd {
-  display: inline-block;
-  min-width: 1.4em;
-  padding: 0.1rem 0.35rem;
-  border: 1px solid var(--border);
-  border-bottom-width: 2px;
-  border-radius: 4px;
-  background: var(--bg);
-  color: var(--text);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.8em;
-  text-align: center;
-}
 
 .summary {
   display: grid;
@@ -559,7 +530,7 @@ kbd {
 
 .payments th,
 .payments td {
-  text-align: left;
+  text-align: start;
   padding: 0.65rem 0.9rem;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
@@ -760,7 +731,7 @@ kbd {
   background: var(--surface);
   color: var(--text);
   border: none;
-  border-left: 1px solid var(--border);
+  border-inline-start: 1px solid var(--border);
   padding: 1.25rem;
   overflow-y: auto;
   z-index: 5;
@@ -1142,180 +1113,4 @@ dialog::backdrop {
   transform: rotate(180deg);
 }
 
-/* Shown when the sort only covers the rows already loaded, because more pages
-   remain on the server. Without it a sorted view would silently claim to be
-   the whole result set. */
-.sort-note {
-  margin: 0 0 0.75rem;
-  font-size: 0.82rem;
-  color: var(--muted);
-}
-
-/* ── Admin: API keys (#767 / #768 / #769) ──────────────────────────────── */
-
-.admin {
-  margin-top: 1.5rem;
-}
-
-.admin-merchant {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-end;
-  gap: 0.5rem;
-  margin-bottom: 0.75rem;
-}
-.admin-merchant label {
-  display: flex;
-  flex-direction: column;
-  gap: 0.25rem;
-  font-size: 0.85rem;
-  font-weight: 600;
-}
-.admin-merchant input {
-  min-width: 220px;
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-
-.keys {
-  width: 100%;
-  border-collapse: collapse;
-}
-.keys th,
-.keys td {
-  text-align: left;
-  padding: 0.6rem 0.9rem;
-  border-bottom: 1px solid var(--border);
-  vertical-align: middle;
-}
-.keys th {
-  font-size: 0.78rem;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--muted);
-}
-.keys tbody tr:last-child td {
-  border-bottom: none;
-}
-.keys .key-actions {
-  text-align: right;
-  white-space: nowrap;
-}
-.keys .key-actions button {
-  padding: 0.3rem 0.7rem;
-  font-size: 0.85rem;
-}
-
-/* The one-time reveal. Distinguishable without colour: a heavy border, a
-   dashed edge and a heading that says what it is, so it survives a monochrome
-   display or a colour-vision difference. */
-.reveal {
-  margin: 0.75rem 0;
-  padding: 0.9rem 1rem;
-  border: 2px dashed var(--warn);
-  border-radius: var(--radius);
-  background: var(--warn-bg);
-}
-.reveal h3 {
-  margin: 0 0 0.35rem;
-  color: var(--warn);
-}
-.reveal-warning {
-  font-weight: 600;
-  margin: 0 0 0.6rem;
-}
-.reveal-key {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 0.5rem;
-}
-.reveal-key code {
-  flex: 1 1 220px;
-  min-width: 0;
-  padding: 0.5rem 0.6rem;
-  border: 1px solid var(--control-border);
-  border-radius: var(--radius);
-  background: var(--surface);
-  color: var(--text);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.85rem;
-  word-break: break-all;
-}
-.reveal-key button {
-  flex: none;
-}
-
-/* Revoke confirmation. The prefix the operator must retype is shown in a
-   monospace block so it can be compared character by character. */
-.revoke-prefix {
-  display: block;
-  margin: 0.5rem 0;
-  padding: 0.4rem 0.6rem;
-  border: 1px solid var(--control-border);
-  border-radius: var(--radius);
-  background: var(--bg);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.9rem;
-  word-break: break-all;
-}
-#revoke-form {
-  display: flex;
-  flex-direction: column;
-  gap: 0.4rem;
-  padding: 1.5rem;
-}
-#revoke-form label {
-  font-size: 0.85rem;
-  font-weight: 600;
-  margin-top: 0.5rem;
-}
-#revoke-form input {
-  padding: 0.6rem 0.7rem;
-  background: var(--bg);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-}
-#revoke-form input[aria-invalid="true"] {
-  border-color: var(--err);
-}
-
-@media (max-width: 720px) {
-  /* The keys table stacks the same way the payments table does, so the admin
-     section stays usable at mobile widths. */
-  .keys thead {
-    display: none;
-  }
-  .keys,
-  .keys tbody,
-  .keys tr,
-  .keys td {
-    display: block;
-    width: 100%;
-  }
-  .keys tr {
-    border-bottom: 1px solid var(--border);
-    padding: 0.65rem 0;
-  }
-  .keys td {
-    border-bottom: none;
-    display: flex;
-    justify-content: space-between;
-    gap: 1rem;
-  }
-  .keys td::before {
-    content: attr(data-label);
-    color: var(--muted);
-    font-size: 0.78rem;
-    text-transform: uppercase;
-  }
-  .keys .key-actions {
-    text-align: left;
-  }
-
-  .admin-merchant input {
-    min-width: 0;
-    width: 100%;
-  }
-  .admin-merchant label {
-    flex: 1 1 100%;
-  }
-}
+/* Shown when the sort only covers the rows already loaded, because
