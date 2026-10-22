@@ -98,10 +98,13 @@ fn strip_html_comments(html: &str) -> String {
 /// router actually serves. Add a new module here the moment it is created so
 /// the check stays exhaustive.
 const MODULES: &[(&str, &str)] = &[
-    ("/dashboard/format.js",  include_str!("../static/format.js")),
-    ("/dashboard/session.js", include_str!("../static/session.js")),
-    ("/dashboard/state.js",   include_str!("../static/state.js")),
-    ("/dashboard/keys.js",    include_str!("../static/keys.js")),
+    ("/dashboard/format.js", include_str!("../static/format.js")),
+    (
+        "/dashboard/session.js",
+        include_str!("../static/session.js"),
+    ),
+    ("/dashboard/state.js", include_str!("../static/state.js")),
+    ("/dashboard/keys.js", include_str!("../static/keys.js")),
 ];
 
 /// Every `/dashboard/…` path the router actually serves.

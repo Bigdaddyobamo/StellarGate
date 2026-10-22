@@ -1735,3 +1735,13 @@ Released under the [MIT License](LICENSE).
 
 <!-- handsoff-issue-301 -->
 - #301: `settle()` awaits webhook delivery inline, so one slow receiver stalls settlement for every other intent
+
+### Admin key management
+
+Open `/dashboard/admin` and enter the configured admin provisioning secret,
+then select a merchant ID to list, issue, or revoke keys. The secret stays in
+memory, is sent only in `X-Admin-Secret`, and is cleared on sign-out or page exit.
+Issued keys are shown once; save the key before hiding it or leaving the page.
+The merchant dashboard does not load the admin controller.
+
+Static-only browser regression: `cd e2e && npx playwright test --config playwright.admin.config.js`.

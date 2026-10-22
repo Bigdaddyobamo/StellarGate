@@ -200,6 +200,8 @@ pub fn router(state: Arc<AppState>) -> axum::Router {
         are served unauthenticated — every figure they display is fetched by
         the browser from the same authenticated endpoints a merchant would
         call directly, using an API key the operator supplies. */
+        .route("/dashboard/admin", get(dashboard_admin_html))
+        .route("/dashboard/admin.js", get(dashboard_admin_js))
         .route("/dashboard", get(dashboard_html))
         .route("/dashboard/app.css", get(dashboard_css))
         .route("/dashboard/app.js", get(dashboard_js))
