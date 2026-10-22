@@ -489,35 +489,6 @@ kbd {
   font-size: 0.8em;
   text-align: center;
 }
-.search button {
-  padding: 0.3rem 0.55rem;
-  line-height: 1;
-  font-size: 1rem;
-}
-
-/* Focus is the primary affordance for a keyboard-first list, so it gets a ring
-   that survives both colour schemes rather than the browser default that
-   disappears against the dark surface. */
-.search input:focus-visible,
-.payments tbody tr:focus-visible,
-.row-active {
-  outline: 2px solid var(--accent);
-  outline-offset: -2px;
-}
-
-kbd {
-  display: inline-block;
-  min-width: 1.4em;
-  padding: 0.1rem 0.35rem;
-  border: 1px solid var(--border);
-  border-bottom-width: 2px;
-  border-radius: 4px;
-  background: var(--bg);
-  color: var(--text);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-  font-size: 0.8em;
-  text-align: center;
-}
 
 .summary {
   display: grid;
@@ -559,7 +530,7 @@ kbd {
 
 .payments th,
 .payments td {
-  text-align: left;
+  text-align: start;
   padding: 0.65rem 0.9rem;
   border-bottom: 1px solid var(--border);
   vertical-align: middle;
@@ -570,6 +541,45 @@ kbd {
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--muted);
+}
+
+/* ── Sticky table header (#774) ─────────────────────────────────────────────
+ *
+ * The card around the table is the scroll container, so the header can stick
+ * to the top of the card while the rows scroll under it. `max-height` keeps a
+ * long list from pushing the page footer off screen; the table itself still
+ * lays out at full width.
+ *
+ * `position: sticky` on the `th` rather than the `thead`: Safari has
+ * historically refused to stick a `thead` inside a scrolling ancestor, while a
+ * `th` with `position: sticky` works everywhere. The background must be opaque
+ * and come from a theme token — a transparent sticky header would let rows
+ * scroll through it, and a hard-coded colour would fail contrast in one of the
+ * two themes. The bottom border is redrawn on the `th` because a collapsed
+ * table border belongs to the cell, not to the row, and would otherwise scroll
+ * away with the body. */
+.table-scroll {
+  max-height: 70vh;
+  overflow-y: auto;
+  /* Keep the card's rounded corners clipping the scrolled content. */
+  border-radius: var(--radius);
+  /* A hairline so the sticky header has an edge to sit against. */
+  border-top: 1px solid var(--border);
+}
+
+.payments thead th {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background: var(--surface);
+  /* A collapsed border is painted by the cell, so restate it here. */
+  border-bottom: 1px solid var(--border);
+}
+
+/* The select column is the one cell that can sit above the sticky header's
+   stacking context when a row is highlighted; keep it below the header. */
+.payments .select-col {
+  z-index: 1;
 }
 
 .payments tbody tr {
@@ -684,6 +694,132 @@ kbd {
   background: var(--idle-bg);
 }
 
+/* ── Asset and webhook-status columns (#773) ────────────────────────────────
+ *
+ * The asset code is short and monospaced so a column of them lines up; the
+ * webhook indicator reuses the pill palette above so "delivered / failing /
+ * none" reads the same as every other status on the page and inherits the
+ * audited contrast pairs rather than introducing new colours. */
+.asset-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 0.82rem;
+  white-space: nowrap;
+}
+
+.webhook-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  white-space: nowrap;
+}
+
+/* A small dot alongside the pill text, so the state is legible without
+   relying on colour alone (WCAG 1.4.1). */
+.webhook-dot {
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: currentColor;
+  flex: none;
+}
+
+/* ── Column menu (#772) ─────────────────────────────────────────────────────
+ *
+ * A popover anchored under the toolbar button. It is a plain positioned
+ * element rather than a <dialog> because it is a menu, not a modal: it must
+ * not trap focus, and clicking elsewhere should dismiss it. The surface and
+ * border come from theme tokens so it reads correctly in both themes. */
+.column-menu {
+  position: absolute;
+  z-index: 4;
+  min-width: 12rem;
+  padding: 0.5rem;
+  background: var(--surface);
+  color: var(--text);
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.18);
+}
+
+.column-menu-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.column-menu-list .checkbox {
+  padding: 0.3rem 0.4rem;
+  border-radius: var(--radius);
+}
+.column-menu-list .checkbox:hover {
+  background: var(--bg);
+}
+
+/* A column that cannot be hidden (Status, Payment ID) is shown disabled so the
+   operator can see it exists and why it is not theirs to turn off. */
+.column-menu-list .checkbox input:disabled {
+  cursor: default;
+}
+.column-menu-list .checkbox:has(input:disabled) {
+  color: var(--muted);
+}
+
+/* ── Settings dialog (#771) ─────────────────────────────────────────────────
+ *
+ * Reuses the generic <dialog> styling below; these rules only add the layout
+ * of the form inside it. The dialog is width-clamped to the viewport so it
+ * works at mobile widths, and the body scrolls rather than the page. */
+#settings-form {
+  display: flex;
+  flex-direction: column;
+  gap: 0.4rem;
+  padding: 1.5rem;
+  max-height: min(85vh, 640px);
+  overflow-y: auto;
+}
+
+#settings-form label {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-top: 0.5rem;
+}
+
+#settings-form select,
+#settings-form input[type="text"] {
+  padding: 0.5rem 0.6rem;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius);
+  background: var(--bg);
+  color: var(--text);
+  font: inherit;
+}
+
+.settings-section {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: 0.75rem 0 0;
+  padding: 0.75rem 0 0;
+}
+.settings-section legend {
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 0;
+}
+
+.settings-foot {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  margin-top: 1rem;
+}
+.settings-foot .dialog-actions {
+  display: flex;
+  gap: 0.5rem;
+}
+
 /* ── Skeleton loading rows (#719) ─────────────────────────────────────── */
 
 /* Skeleton placeholder block: a rounded rectangle filled with the base
@@ -760,7 +896,7 @@ kbd {
   background: var(--surface);
   color: var(--text);
   border: none;
-  border-left: 1px solid var(--border);
+  border-inline-start: 1px solid var(--border);
   padding: 1.25rem;
   overflow-y: auto;
   z-index: 5;
@@ -913,6 +1049,80 @@ kbd {
   flex: 0 0 3rem;
 }
 
+@media print {
+  @page {
+    margin: 0.5in;
+  }
+
+  html,
+  body {
+    background: #fff !important;
+    color: #000 !important;
+  }
+
+  .topbar,
+  .toolbar,
+  .summary,
+  #gate,
+  .detail,
+  .help,
+  .theme-toggle,
+  #sign-out,
+  #health,
+  #selection-count,
+  #export-selected,
+  #export-csv,
+  #refresh,
+  #new-payment-btn,
+  #help-open {
+    display: none !important;
+  }
+
+  #app {
+    display: block !important;
+    visibility: visible !important;
+  }
+
+  main {
+    max-width: none !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  .card {
+    border: none !important;
+    background: transparent !important;
+    box-shadow: none !important;
+  }
+
+  .payments {
+    width: 100% !important;
+    border-collapse: collapse !important;
+    page-break-inside: auto;
+  }
+
+  .payments th,
+  .payments td {
+    color: #000 !important;
+    background: #fff !important;
+    border: 1px solid #666 !important;
+    padding: 0.35rem 0.4rem !important;
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .payments tbody tr,
+  .payments tbody tr.row-active,
+  .payments tbody tr:hover {
+    background: #fff !important;
+    cursor: default;
+  }
+
+  .payments .select-col {
+    display: none !important;
+  }
+}
+
 @media (max-width: 720px) {
   .payments thead {
     display: none;
@@ -946,6 +1156,43 @@ kbd {
     display: flex;
     justify-content: flex-end;
     padding: 0.65rem 0.9rem;
+  }
+
+  /* #774: the header is hidden in the card layout, so there is nothing to
+     stick; drop the scroll container's height cap so the cards flow with the
+     page instead of scrolling inside a box. */
+  .table-scroll {
+    max-height: none;
+    overflow-y: visible;
+  }
+
+  /* #773: the new columns are ordinary cells in the card layout, so they pick
+     up the same label/value split as the rest. Keep the asset code from
+     wrapping and let the webhook pill sit on the right. */
+  .payments td .asset-code {
+    white-space: nowrap;
+  }
+  .payments td .webhook-status {
+    justify-content: flex-end;
+  }
+
+  /* #771 / #772: the column menu and settings dialog must fit a phone. The
+     menu is anchored to the viewport edge rather than the button, and the
+     dialog already clamps to `calc(100vw - 2rem)` via the generic rule. */
+  .column-menu {
+    left: 1rem;
+    right: 1rem;
+    min-width: 0;
+  }
+
+  #settings-form {
+    padding: 1.25rem;
+  }
+  .settings-foot {
+    flex-direction: column-reverse;
+  }
+  .settings-foot .dialog-actions {
+    justify-content: flex-end;
   }
 }
 

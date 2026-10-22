@@ -15,6 +15,22 @@ use stellargate::{
     db,
 };
 
+const HTML: &str = include_str!("../static/dashboard.html");
+const CSS: &str = include_str!("../static/dashboard.css");
+const JS: &str = include_str!("../static/dashboard.js");
+const I18N: &str = include_str!("../static/i18n.js");
+
+const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
+const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
+const DASHBOARD_JS: &str = include_str!("../static/dashboard.js");
+const DASHBOARD_THEME_JS: &str = include_str!("../static/dashboard-theme.js");
+
+const DASHBOARD_FORMAT_JS: &str = include_str!("../static/dashboard-format.js");
+
+const DASHBOARD_STATE_JS: &str = include_str!("../static/state.js");
+
+const TEST_ADMIN_SECRET: &str = "test-admin-secret";
+
 fn make_config() -> Config {
     Config {
         port: 0,
@@ -55,11 +71,6 @@ fn make_config() -> Config {
     }
 }
 
-const DASHBOARD_HTML: &str = include_str!("../static/dashboard.html");
-const DASHBOARD_CSS: &str = include_str!("../static/dashboard.css");
-const DASHBOARD_JS: &str = include_str!("../static/dashboard.js");
-const DASHBOARD_THEME_JS: &str = include_str!("../static/dashboard-theme.js");
-
 /// The document with its `<!-- … -->` comments removed.
 ///
 /// The dashboard's markup is heavily commented, and those comments name the
@@ -79,10 +90,6 @@ fn strip_html_comments(html: &str) -> String {
     out.push_str(rest);
     out
 }
-
-const DASHBOARD_FORMAT_JS: &str = include_str!("../static/dashboard-format.js");
-
-const DASHBOARD_STATE_JS: &str = include_str!("../static/state.js");
 
 /// All ES module siblings of `app.js`, as `(served_path, source_body)` pairs.
 ///
@@ -112,6 +119,106 @@ const JS_ROUTES: &[&str] = &[
     "/dashboard/keys.js",
     "/dashboard/vendor/qrcode.js",
 ];
+
+#[test]
+fn skip_link_is_first_focusable_in_app_and_targets_table() {
+    let app = &HTML[HTML.find(r#"<div id="app""#).expect("app container")..];
+    let skip = app
+        .find(r##"<a class="skip-link" href="#payments""##)
+        .expect("skip link");
+    let first_focusable = ["<a ", "<button", "<input", "<select", "<textarea"]
+        .iter()
+        .filter_map(|tag| app.find(tag))
+        .min()
+        .expect("focusable element");
+    assert_eq!(skip, first_focusable);
+    assert!(HTML.contains(r#"<table id="payments""#));
+}
+
+#[test]
+fn skip_link_is_visible_on_focus() {
+    assert!(CSS.contains(".skip-link:focus"));
+}
+
+/// Keys defined in one locale block of `i18n.js`, e.g. `catalog_keys("en")`.
+fn catalog_keys(locale: &str) -> Vec<String> {
+    let start = I18N
+        .find(&format!("\n    {locale}: {{"))
+        .expect("locale block");
+    let block = &I18N[start..];
+    let block = &block[..block.find("\n    },").expect("block end")];
+    block
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix('"')?.split_once("\":"))
+        .map(|(key, _)| key.to_string())
+        .collect()
+}
+
+/// Every `prefix…"key"` occurrence in `source`.
+fn used_keys(source: &str, prefix: &str) -> Vec<String> {
+    source
+        .match_indices(prefix)
+        .filter(|(i, _)| {
+            !source[..*i].ends_with(|c: char| c.is_alphanumeric() || c == '_' || c == '.')
+        })
+        .map(|(i, _)| {
+            let rest = &source[i + prefix.len()..];
+            rest[..rest.find('"').unwrap()].to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn every_used_message_key_exists_in_catalog() {
+    let en = catalog_keys("en");
+    let mut used = used_keys(JS, "t(\"");
+    for attr in [
+        "data-i18n=\"",
+        "data-i18n-placeholder=\"",
+        "data-i18n-title=\"",
+        "data-i18n-aria-label=\"",
+    ] {
+        used.extend(used_keys(HTML, attr));
+    }
+    assert!(
+        used.len() > 20,
+        "expected the UI strings to use the catalog"
+    );
+    for key in used {
+        assert!(en.contains(&key), "missing message key: {key}");
+    }
+}
+
+#[test]
+fn extra_locale_covers_every_english_key() {
+    assert_eq!(catalog_keys("en"), catalog_keys("es"));
+}
+
+#[test]
+fn language_switcher_sets_lang_and_dir() {
+    assert!(HTML.contains(r#"<select id="language""#));
+    assert!(HTML.find("/dashboard/i18n.js") < HTML.find("/dashboard/app.js"));
+    assert!(I18N.contains("navigator.language"));
+    assert!(I18N.contains("root.lang =") && I18N.contains("root.dir ="));
+}
+
+#[test]
+fn layout_uses_logical_properties() {
+    for physical in [
+        "left:",
+        "right:",
+        "-left",
+        "-right:",
+        "text-align: left",
+        "text-align: right",
+    ] {
+        assert!(
+            !CSS.contains(physical),
+            "physical property in CSS: {physical}"
+        );
+    }
+    assert!(CSS.contains("inset-inline-end: 0"));
+}
 
 #[test]
 fn dashboard_api_requests_use_canonical_v1_base() {
@@ -382,6 +489,27 @@ fn every_dashboard_helper_the_script_calls_is_defined() {
     }
 }
 
+#[test]
+fn dashboard_print_styles_hide_chrome_and_keep_table_readable() {
+    assert!(DASHBOARD_CSS.contains("@media print"), "print styles must be defined");
+    for needle in [
+        ".topbar,",
+        ".toolbar,",
+        ".summary,",
+        "#gate,",
+        ".detail,",
+        ".help,",
+        ".payments th,",
+        ".payments td {",
+        "page-break-inside: avoid;",
+    ] {
+        assert!(
+            DASHBOARD_CSS.contains(needle),
+            "print stylesheet must keep the dashboard chrome hidden and the table readable: missing {needle}"
+        );
+    }
+}
+
 /// The detail drawer is a real modal dialog (issue #715).
 ///
 /// An `<aside>` under a scrim is only *visually* on top: `Tab`, the address bar
@@ -535,7 +663,121 @@ fn payment_rows_are_keyboard_reachable_and_activate_on_enter() {
     );
 }
 
-const TEST_ADMIN_SECRET: &str = "test-admin-secret";
+/// The admin key-management panel must be present in the markup (#767–#769).
+///
+/// The panel is the only place an operator can see, issue or revoke a
+/// merchant's keys, so its controls and columns are pinned here: a rename in
+/// the HTML that the script does not follow would leave a dead button rather
+/// than a visible error.
+#[test]
+fn admin_key_management_markup_is_present() {
+    let markup = strip_html_comments(DASHBOARD_HTML);
+
+    // Merchant lookup (#767).
+    assert!(
+        markup.contains(r#"id="admin-merchant-id""#),
+        "the admin panel needs a merchant ID input"
+    );
+    assert!(
+        markup.contains(r#"id="admin-load-keys""#),
+        "the admin panel needs a Load keys action"
+    );
+    assert!(
+        markup.contains(r#"id="admin-issue-key""#),
+        "the admin panel needs an Issue key action (#768)"
+    );
+
+    // Keys table columns (#767).
+    for column in ["Key ID", "Prefix", "Created", "Revoked"] {
+        assert!(
+            markup.contains(column),
+            "the keys table must render a {column:?} column"
+        );
+    }
+
+    // One-time reveal panel (#768).
+    assert!(
+        markup.contains(r#"id="admin-key-reveal""#),
+        "a newly issued key needs a reveal panel"
+    );
+    assert!(
+        markup.contains(r#"id="admin-key-copy""#),
+        "the reveal panel needs a copy button"
+    );
+    assert!(
+        markup.to_lowercase().contains("shown only once"),
+        "the reveal panel must warn that the key is shown only once"
+    );
+
+    // Revoke confirmation (#769).
+    assert!(
+        markup.contains(r#"id="admin-revoke-confirm""#),
+        "revoking a key needs a confirmation control"
+    );
+    assert!(
+        markup.to_lowercase().contains("type the key prefix"),
+        "revocation must require the operator to type the key prefix"
+    );
+}
+
+/// Sortable payment columns (#770): the headers are buttons and the active one
+/// carries `aria-sort`.
+#[test]
+fn payment_columns_are_sortable_buttons() {
+    let markup = strip_html_comments(DASHBOARD_HTML);
+
+    assert!(
+        markup.contains("data-sort-key"),
+        "sortable column headers must be buttons carrying a sort key"
+    );
+    assert!(
+        markup.contains(r#"aria-sort="none""#),
+        "sortable headers must declare aria-sort, defaulting to none"
+    );
+    assert!(
+        DASHBOARD_JS.contains(r#"setAttribute("aria-sort""#),
+        "the active header's aria-sort must be updated when the sort changes"
+    );
+    assert!(
+        DASHBOARD_JS.to_lowercase().contains("loaded rows"),
+        "sorting is client-side over loaded rows only; the UI must say so when \
+         more pages remain"
+    );
+}
+
+/// No key material may be logged or placed in a URL by the admin panel
+/// (#767–#769).
+///
+/// The existing `dashboard_never_puts_the_api_key_in_a_url_or_the_console`
+/// check covers the operator's own credential; this one covers the merchant
+/// keys the admin panel handles, which are equally secret.
+#[test]
+fn admin_key_material_is_never_logged_or_put_in_a_url() {
+    for (name, source) in
+        std::iter::once(("dashboard.js", DASHBOARD_JS)).chain(MODULES.iter().map(|(p, b)| (*p, *b)))
+    {
+        for forbidden in [
+            "console.log",
+            "console.debug",
+            "console.info",
+            "console.warn",
+            "console.error",
+        ] {
+            assert!(
+                !source.contains(forbidden),
+                "{name} must not contain {forbidden:?}: key material must never \
+                 reach a log line or the console"
+            );
+        }
+        for forbidden in ["api_key=", "apikey=", "?key=", "?prefix="] {
+            assert!(
+                !source.contains(forbidden),
+                "{name} must not contain {forbidden:?}: key material must never \
+                 appear in a URL or query string"
+            );
+        }
+    }
+}
 
 /// The stored theme must be applied before the first paint (issue #713).
 ///

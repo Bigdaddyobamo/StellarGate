@@ -65,6 +65,26 @@ import { filterPayments } from "./format.js";
  * @property {string|null} selectedPaymentId
  * @property {number} activeRow
  * @property {boolean} helpOpen
+ * @property {string} merchantId
+ * @property {MerchantKey[]} merchantKeys
+ * @property {boolean} keysLoading
+ * @property {string} keysError
+ * @property {string|null} revealedKey
+ * @property {string} sortKey
+ * @property {string} sortDirection
+ */
+
+/**
+ * An API key as returned by `GET /v1/merchants/{id}/keys` (issue #767).
+ *
+ * Only the non-secret fields are modelled: the API never returns full key
+ * material for an existing key, and the dashboard must never hold it either.
+ *
+ * @typedef {object} MerchantKey
+ * @property {string} id
+ * @property {string} prefix
+ * @property {string} created_at
+ * @property {string|null} [revoked_at]
  */
 
 /** State a freshly loaded page starts from. */
@@ -86,6 +106,24 @@ export function initialState() {
     activeRow: -1,
     /** Whether the `?` shortcut overlay is open. */
     helpOpen: false,
+    /** Merchant whose API keys the admin panel is showing (issue #767). */
+    merchantId: "",
+    /** Keys loaded for `merchantId`; never contains full key material. */
+    merchantKeys: [],
+    /** Whether the key list is being fetched. */
+    keysLoading: false,
+    /** Human-readable error from the last key request, or "". */
+    keysError: "",
+    /**
+     * The one-time key material from a just-issued key (issue #768), or null.
+     * Transient: never serialised to the hash, and cleared as soon as the
+     * reveal panel closes.
+     */
+    revealedKey: null,
+    /** Column the payments table is sorted by (issue #770). */
+    sortKey: "",
+    /** "asc" or "desc"; only meaningful when `sortKey` is set. */
+    sortDirection: "asc",
   };
 }
 
@@ -180,6 +218,89 @@ export function createStore(seed) {
   }
 
   /**
+   * The rows currently on screen, ordered by the active sort column
+   * (issue #770).
+   *
+   * Sorting is client-side over the rows already loaded, so it is only a
+   * complete ordering once every page has been fetched; the renderer labels it
+   * as such while `cursor` is non-null. Ties fall back to the original load
+   * order so the sort is stable across re-renders.
+   */
+  function sortedPayments() {
+    var rows = visiblePayments();
+    var key = state.sortKey;
+    if (!key) return rows;
+    var dir = state.sortDirection === "desc" ? -1 : 1;
+    // Decorate with the original index so equal keys keep their load order.
+    return rows
+      .map(function (row, index) {
+        return { row: row, index: index };
+      })
+      .sort(function (a, b) {
+        var cmp = comparePayments(a.row, b.row, key);
+        if (cmp === 0) return a.index - b.index;
+        return cmp * dir;
+      })
+      .map(function (entry) {
+        return entry.row;
+      });
+  }
+
+  /**
+   * Compare two payments on `key`. Returns 0 for equal or missing values so
+   * rows without the field keep their relative order rather than jumping.
+   *
+   * @param {Payment} a
+   * @param {Payment} b
+   * @param {string} key
+   */
+  function comparePayments(a, b, key) {
+    var av = a ? a[key] : undefined;
+    var bv = b ? b[key] : undefined;
+    if (av === undefined || av === null) return 0;
+    if (bv === undefined || bv === null) return 0;
+    if (key === "amount") {
+      var an = Number(av);
+      var bn = Number(bv);
+      if (isNaN(an) || isNaN(bn)) return 0;
+      return an === bn ? 0 : an < bn ? -1 : 1;
+    }
+    // created_at is an ISO-8601 string, so lexical order is chronological.
+    var as = String(av);
+    var bs = String(bv);
+    return as === bs ? 0 : as < bs ? -1 : 1;
+  }
+
+  /**
+   * Toggle the sort on `key`: a new column starts ascending, the active column
+   * flips direction. Passing the active key twice returns to ascending rather
+   * than clearing the sort, so the header always reflects a known order.
+   *
+   * @param {string} key
+   */
+  function toggleSort(key) {
+    if (state.sortKey === key) {
+      return update({ sortDirection: state.sortDirection === "asc" ? "desc" : "asc" });
+    }
+    return update({ sortKey: key, sortDirection: "asc" });
+  }
+
+  /**
+   * Store the one-time key material from a just-issued key (issue #768).
+   * Callers must clear it via `clearRevealedKey()` once the panel closes.
+   *
+   * @param {string|null} material
+   */
+  function revealKey(material) {
+    return update({ revealedKey: material === undefined ? null : material });
+  }
+
+  /** Drop the revealed key from state so it is not held in memory. */
+  function clearRevealedKey() {
+    return update({ revealedKey: null });
+  }
+
+  /**
    * Clamp the highlighted row to the current result set.
    *
    * A filter change can leave the cursor past the end of the list — selecting
@@ -249,6 +370,10 @@ export function createStore(seed) {
     replace: replace,
     subscribe: subscribe,
     visiblePayments: visiblePayments,
+    sortedPayments: sortedPayments,
+    toggleSort: toggleSort,
+    revealKey: revealKey,
+    clearRevealedKey: clearRevealedKey,
     clampActiveRow: clampActiveRow,
     resetPaging: resetPaging,
     selectedPayment: selectedPayment,
@@ -315,6 +440,242 @@ export function createRequestTracker() {
   return { begin: begin, abort: abort, abortAll: abortAll };
 }
 
+/* ── Display preferences (#771, #772) ─────────────────────────────────────
+ * Page size, auto-refresh, theme, timezone and column visibility are display
+ * preferences, not secrets, so they are persisted in `localStorage` under a
+ * dedicated `stellargate.prefs.` namespace. That namespace is deliberately
+ * disjoint from the API-key keys owned by `session.js`: nothing here reads or
+ * writes the key, and nothing here logs a value, so a preference can never
+ * carry the key into storage, a URL or the console.
+ *
+ * Every read is defensive. `localStorage` can throw (Safari private mode, a
+ * disabled cookie policy) and a stored value can be hand-edited, so a bad or
+ * missing entry falls back to the default rather than breaking the page. */
+
+/** Prefix for every preference key. Never used for the API key. */
+export const PREFS_NAMESPACE = "stellargate.prefs.";
+
+/** The themes the stylesheet understands. */
+export const THEMES = ["system", "light", "dark"];
+
+/** Page sizes offered in the settings dialog. */
+export const PAGE_SIZES = [10, 25, 50, 100];
+
+/**
+ * A table column.
+ *
+ * `alwaysVisible` columns (Status and Payment ID) have no checkbox in the
+ * column menu and cannot be hidden: the status is the point of the table and
+ * the id is what a merchant quotes to support.
+ *
+ * @typedef {object} Column
+ * @property {string} id
+ * @property {string} label
+ * @property {boolean} alwaysVisible
+ */
+
+/** Every table column, in display order. The single source of truth. */
+export const COLUMNS = [
+  { id: "id", label: "Payment ID", alwaysVisible: true },
+  { id: "created_at", label: "Created", alwaysVisible: false },
+  { id: "amount", label: "Amount", alwaysVisible: false },
+  { id: "currency", label: "Currency", alwaysVisible: false },
+  { id: "status", label: "Status", alwaysVisible: true },
+  { id: "description", label: "Memo", alwaysVisible: false },
+  { id: "customer_email", label: "Customer", alwaysVisible: false },
+];
+
+/** The columns that can be toggled in the column menu. */
+export function toggleableColumns() {
+  return COLUMNS.filter(function (column) {
+    return !column.alwaysVisible;
+  });
+}
+
+/** The default display preferences. */
+export function defaultPrefs() {
+  var columns = {};
+  COLUMNS.forEach(function (column) {
+    columns[column.id] = true;
+  });
+  return {
+    pageSize: 25,
+    autoRefresh: false,
+    theme: "system",
+    timezone: "local",
+    columns: columns,
+  };
+}
+
+/** Coerce a stored page size to one of PAGE_SIZES, else the default. */
+function coercePageSize(value) {
+  var n = Number(value);
+  return PAGE_SIZES.indexOf(n) >= 0 ? n : defaultPrefs().pageSize;
+}
+
+/** Coerce a stored theme to one of THEMES, else the default. */
+function coerceTheme(value) {
+  return THEMES.indexOf(value) >= 0 ? value : defaultPrefs().theme;
+}
+
+/**
+ * Coerce a stored timezone. "local" and "utc" are the two the dashboard
+ * renders; anything else falls back to "local".
+ */
+function coerceTimezone(value) {
+  return value === "utc" ? "utc" : "local";
+}
+
+/**
+ * Coerce a stored column map. Always-visible columns are forced on, unknown
+ * ids are dropped, and a missing id takes its default, so a stale entry from an
+ * older build cannot hide a column that no longer has a checkbox.
+ */
+function coerceColumns(value) {
+  var out = {};
+  var stored = value && typeof value === "object" ? value : {};
+  COLUMNS.forEach(function (column) {
+    if (column.alwaysVisible) {
+      out[column.id] = true;
+    } else {
+      out[column.id] = stored[column.id] === undefined ? true : !!stored[column.id];
+    }
+  });
+  return out;
+}
+
+/**
+ * Normalise an arbitrary object into a complete, valid preference set.
+ *
+ * @param {Partial<ReturnType<typeof defaultPrefs>>} [raw]
+ */
+export function normalizePrefs(raw) {
+  var defaults = defaultPrefs();
+  var s = raw && typeof raw === "object" ? raw : {};
+  return {
+    pageSize: coercePageSize(s.pageSize),
+    autoRefresh: !!s.autoRefresh,
+    theme: coerceTheme(s.theme),
+    timezone: coerceTimezone(s.timezone),
+    columns: coerceColumns(s.columns),
+  };
+}
+
+/**
+ * The storage backing the preferences. Defaults to `window.localStorage` when
+ * present; tests pass a stub. Returns null when no storage is available.
+ *
+ * @param {Storage} [storage]
+ */
+function resolveStorage(storage) {
+  if (storage) return storage;
+  try {
+    if (typeof localStorage !== "undefined" && localStorage) return localStorage;
+  } catch (e) {
+    // Accessing localStorage can throw when storage is disabled.
+  }
+  return null;
+}
+
+/** Read one namespaced key, returning null on any failure. */
+function readKey(storage, name) {
+  try {
+    return storage.getItem(PREFS_NAMESPACE + name);
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Write one namespaced key, ignoring quota or disabled-storage failures. */
+function writeKey(storage, name, value) {
+  try {
+    storage.setItem(PREFS_NAMESPACE + name, value);
+  } catch (e) {
+    // A full or disabled store must not break the page.
+  }
+}
+
+/**
+ * Load the persisted preferences, falling back to defaults for anything
+ * missing or invalid. Never throws.
+ *
+ * @param {Storage} [storage]
+ */
+export function loadPrefs(storage) {
+  var store = resolveStorage(storage);
+  if (!store) return defaultPrefs();
+  var raw = {
+    pageSize: readKey(store, "pageSize"),
+    autoRefresh: readKey(store, "autoRefresh") === "1",
+    theme: readKey(store, "theme"),
+    timezone: readKey(store, "timezone"),
+    columns: null,
+  };
+  var columnsRaw = readKey(store, "columns");
+  if (columnsRaw) {
+    try {
+      raw.columns = JSON.parse(columnsRaw);
+    } catch (e) {
+      raw.columns = null;
+    }
+  }
+  return normalizePrefs(raw);
+}
+
+/**
+ * Persist a preference set. Values are normalised first so an invalid value is
+ * never written. Never throws.
+ *
+ * @param {Partial<ReturnType<typeof defaultPrefs>>} prefs
+ * @param {Storage} [storage]
+ */
+export function savePrefs(prefs, storage) {
+  var store = resolveStorage(storage);
+  var normalized = normalizePrefs(prefs);
+  if (!store) return normalized;
+  writeKey(store, "pageSize", String(normalized.pageSize));
+  writeKey(store, "autoRefresh", normalized.autoRefresh ? "1" : "0");
+  writeKey(store, "theme", normalized.theme);
+  writeKey(store, "timezone", normalized.timezone);
+  writeKey(store, "columns", JSON.stringify(normalized.columns));
+  return normalized;
+}
+
+/**
+ * Remove every namespaced preference key and return the defaults.
+ *
+ * Only keys under PREFS_NAMESPACE are removed, so the API-key keys owned by
+ * `session.js` are untouched. Never throws.
+ *
+ * @param {Storage} [storage]
+ */
+export function resetToDefaults(storage) {
+  var store = resolveStorage(storage);
+  if (store) {
+    var doomed = [];
+    try {
+      for (var i = 0; i < store.length; i++) {
+        var name = store.key(i);
+        if (name && name.indexOf(PREFS_NAMESPACE) === 0) doomed.push(name);
+      }
+    } catch (e) {
+      // Fall through to the known keys below.
+    }
+    // Remove the known keys even if enumeration failed.
+    ["pageSize", "autoRefresh", "theme", "timezone", "columns"].forEach(function (name) {
+      doomed.push(PREFS_NAMESPACE + name);
+    });
+    doomed.forEach(function (name) {
+      try {
+        store.removeItem(name);
+      } catch (e) {
+        // Ignore a disabled store.
+      }
+    });
+  }
+  return defaultPrefs();
+}
+
 /* ── URL-hash serialisation (#696) ────────────────────────────────────────
  * Filters live in the hash, never the query string. That is not a style
  * preference: anything in `location.search` is sent to the server, logged by
@@ -328,7 +689,8 @@ const HASH_KEYS = ["status", "search", "auto_refresh"];
  *
  * Only the keys in HASH_KEYS are honoured. An unrecognised key is ignored
  * rather than copied into state, so a hand-edited URL cannot set an arbitrary
- * field.
+ * field. `merchantId`, `revealedKey` and any key material are deliberately not
+ * in HASH_KEYS: they must never appear in a URL (issues #767–#769).
  *
  * @param {string} hash
  */
@@ -358,6 +720,10 @@ export function parseHash(hash) {
  * Serialise the filter fields of a state object to a hash string, without the
  * leading "#". Returns "" when no filter is set, which the controller turns into
  * a plain `location.pathname` so the URL does not collect a bare "#".
+ *
+ * Only HASH_KEYS are written, so the merchant id, the revealed key and the
+ * loaded key list can never reach the address bar even if they are present in
+ * the state object passed in.
  *
  * @param {Partial<DashboardState>} state
  */
