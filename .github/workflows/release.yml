@@ -1,0 +1,265 @@
+name: Release
+
+# Tagging a version is the only thing that publishes deployable artifacts.
+# CI (ci.yml) builds and tests every push/PR but produces nothing installable
+# — see DEPLOYMENT.md's "Upgrades and rollback" for how a tag here becomes a
+# running deployment.
+on:
+  push:
+    tags:
+      - "v*"
+
+# =============================================================================
+# SIGNING IDENTITY & COMPROMISE RESPONSE
+# =============================================================================
+# This workflow uses GitHub's KEYLESS attestation (Sigstore/Rekor via OIDC),
+# NOT a stored signing key. The signing identity IS the GitHub Actions OIDC
+# token scoped to this repo and workflow — there is no key material to rotate
+# or revoke in the traditional sense.
+#
+# IF the repository or Actions environment is compromised, the remediation
+# steps are:
+#
+#   1. Rotate ALL repository secrets immediately:
+#        GitHub → Settings → Secrets and variables → Actions → rotate each
+#   2. Revoke any personal access tokens or deploy keys associated with the repo
+#   3. Review and remove any malicious workflow runs from the Actions tab
+#   4. Verify published release artifacts by checking their attestations:
+#        Images:   gh attestation verify --owner <org> oci://<image>@<digest>
+#        Binaries: gh attestation verify <file> --owner <org>
+#   5. If a release was published under a compromised identity, delete and
+#      re-publish it from a clean state after rotating secrets
+#
+# The attestation is tied to the specific workflow run SHA. Old attestations
+# for legitimately-built artifacts remain valid even after rotating secrets,
+# because they were signed by a non-compromised run.
+#
+# Reference:
+#   https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds
+# =============================================================================
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  binaries:
+    name: binary (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+    strategy:
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+
+      # libsqlite3-sys builds its bundled SQLite from C source via the `cc`
+      # crate, so cross-compiling only needs a cross gcc + linker — no target
+      # sysroot package or `cross`/Docker required.
+      - name: Install aarch64 cross-compiler
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # Matches rust-toolchain.toml's MSRV pin, kept explicit here (as
+          # ci.yml's test matrix does) since release artifacts must be
+          # reproducible regardless of which toolchain a runner defaults to.
+          toolchain: "1.94"
+          targets: ${{ matrix.target }}
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-release-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      - name: Package and checksum
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          name="stellargate-${version}-${{ matrix.target }}"
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/${name}.tar.gz" stellargate
+          ( cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256" )
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*.tar.gz"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.target }}
+          path: dist/*
+          retention-days: 1
+
+  # Build the image once, run it, and wait for the healthcheck to report
+  # `healthy` before anything is pushed. This is the only place the shipped
+  # container is actually started; a broken healthcheck (e.g. a removed
+  # `healthcheck` subcommand) fails here instead of shipping silently.
+  docker-smoke:
+    name: docker smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: stellargate:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate compose files
+        run: |
+          set -euo pipefail
+          docker compose -f docker-compose.yml config > /dev/null
+          docker compose -f deploy/docker-compose.prod.yml config > /dev/null
+
+      - name: Run and wait for healthy
+        run: |
+          set -euo pipefail
+          docker run -d --name sg -p 3000:3000 \
+            -e STELLAR_GATEWAY_PUBLIC=UNCONFIGURED \
+            -e WEBHOOK_SECRET=$(openssl rand -hex 32) \
+            stellargate:ci
+          for i in $(seq 1 30); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' sg)
+            [ "$s" = healthy ] && exit 0
+            [ "$s" = unhealthy ] && break
+            sleep 2
+          done
+          docker logs sg
+          docker inspect sg --format '{{json .State.Health}}'
+          exit 1
+
+      - name: Probe endpoints
+        run: |
+          set -euo pipefail
+          curl -fsS localhost:3000/health
+          curl -fsS localhost:3000/ready
+          curl -fsS -o /dev/null -w '%{http_code}\n' localhost:3000/dashboard | grep 200
+
+      - name: Verify non-root uid and writable /data
+        run: |
+          set -euo pipefail
+          uid=$(docker exec sg id -u)
+          [ "$uid" = 1001 ] || { echo "expected uid 1001, got $uid"; exit 1; }
+          docker exec sg sh -c 'touch /data/.smoke && rm /data/.smoke'
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker logs sg || true
+
+  image:
+    name: container image
+    needs: [docker-smoke]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name and version
+        id: vars
+        run: |
+          set -euo pipefail
+          echo "image=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ steps.vars.outputs.version }}
+            ${{ steps.vars.outputs.image }}:${{ github.sha }}
+
+      # GitHub-native, Sigstore-backed attestation over GitHub's OIDC identity
+      # — no cosign key material to generate, store, or rotate. Verifiable
+      # with: gh attestation verify --owner <org> oci://<image>@<digest>
+      - name: Attest image provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ${{ steps.vars.outputs.image }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+  sbom:
+    name: SBOM
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: dist/stellargate.cdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: dist/stellargate.cdx.json
+          retention-days: 1
+
+  publish:
+    name: publish release
+    needs: [binaries, image, sbom]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: "binaries-*"
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: sbom
+          path: dist
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/**
+          generate_release_notes: true

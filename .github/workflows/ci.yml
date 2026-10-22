@@ -5,70 +5,241 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege by default; jobs grant more only where they need it.
+permissions:
+  contents: read
+
+# Cancel superseded runs on PR branches; never cancel a run on main.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
-  fmt-clippy:
-    name: fmt / clippy
+  fmt:
+    name: rustfmt
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-
-      - uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-
-
-      # RUSTUP_TOOLCHAIN takes precedence over rust-toolchain.toml, which would
-      # otherwise pin this job to the MSRV and quietly ignore the toolchain
-      # selected above.
-      - name: Check formatting
-        run: cargo fmt --check
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
-      - name: Clippy
-        run: cargo clippy --locked --all-targets -- -D warnings
-        env:
-          RUSTUP_TOOLCHAIN: stable
-
-  test:
-    name: test (${{ matrix.rust }})
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        rust: [1.88, stable]
-    steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: ${{ matrix.rust }}
+          toolchain: "1.94"
+          components: rustfmt, clippy
 
-      - uses: actions/cache@v6
+      - run: cargo fmt --all -- --check
+
+  # The clippy and test jobs below pinned
+  # `dtolnay/rust-toolchain@b3b07ba8b418998c39fb20f9d8b27520de0a4799 # stable`,
+  # a commit that does not exist in that repository (`gh api
+  # repos/dtolnay/rust-toolchain/commits/b3b07ba…` answers "No commit found for
+  # SHA"), so Actions failed them in "Set up job" before running any step.
+  # `@master` with the explicit `toolchain` input each job already passes is the
+  # form the fmt, coverage, dashboard and release workflows use.
+  clippy:
+    name: clippy (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, msrv]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain == 'msrv' && '1.94' || 'stable' }}
+          components: clippy
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (${{ matrix.toolchain }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        toolchain: [stable, msrv]
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.toolchain == 'msrv' && '1.94' || 'stable' }}
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
+      - run: cargo test --all-features --workspace
+
+  # Spec-shape lint. This job was merged under the `coverage` key, which the
+  # llvm-cov job below already owns; two `coverage:` keys in one `jobs:` map
+  # made Actions reject the whole file, so no CI job ran at all.
+  openapi:
+    name: openapi lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4.1.0
+        with:
+          node-version: 22
+
+      # Lints the spec's shape (redocly.yaml extends `recommended`). The
+      # complementary spec↔router cross-check — that documented paths actually
+      # resolve and that the deprecated mount carries its headers — is the
+      # `openapi_contract` integration test, which runs in the `test` job above.
+      # Major pinned to match what the spec was validated against locally.
+      - name: Lint openapi.yaml
+        run: npx --yes @redocly/cli@1 lint openapi.yaml
+
+  # Enforces Prettier formatting for the dashboard frontend under static/
+  # (issue #827). Scoping is handled by .prettierignore so only HTML/CSS/JS
+  # in static/ is checked; the config lives in .prettierrc.
+  prettier:
+    name: prettier (static/)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Check formatting
+        run: npx --yes prettier@3 --check "static/**/*.{html,css,js}"
+
+  deploy-consistency:
+    name: deploy asset consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Catches Dockerfile/compose port or healthcheck drift, and a real
+      # secret slipping into deploy/stellargate.env.example, before it merges
+      # rather than at deploy time (issues #444, #447).
+      - name: Check deploy assets against Dockerfile
+        run: bash scripts/check-deploy-consistency.sh
+
+  # Builds the image we actually ship and runs it, so a broken healthcheck
+  # (e.g. a removed `healthcheck` subcommand) fails CI instead of passing the
+  # static deploy-consistency check above (issue #872).
+  docker-smoke:
+    name: docker smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          load: true
+          tags: stellargate:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Validate compose files
+        run: |
+          docker compose -f docker-compose.yml config
+          docker compose -f deploy/docker-compose.prod.yml config
+
+      - name: Run and wait for healthy
+        run: |
+          docker run -d --name sg -p 3000:3000 \
+            -e STELLAR_GATEWAY_PUBLIC=UNCONFIGURED \
+            -e WEBHOOK_SECRET=$(openssl rand -hex 32) \
+            stellargate:ci
+          for i in $(seq 1 30); do
+            s=$(docker inspect -f '{{.State.Health.Status}}' sg)
+            [ "$s" = healthy ] && exit 0
+            [ "$s" = unhealthy ] && break
+            sleep 2
+          done
+          docker logs sg; docker inspect sg --format '{{json .State.Health}}'; exit 1
+
+      - name: Probe endpoints
+        run: |
+          curl -fsS localhost:3000/health
+          curl -fsS localhost:3000/ready
+          curl -fsS -o /dev/null -w '%{http_code}\n' localhost:3000/dashboard | grep 200
+
+      - name: Verify non-root uid and writable /data
+        run: |
+          test "$(docker exec sg id -u)" = 1001
+          docker exec sg sh -c 'touch /data/.smoke && rm /data/.smoke'
+
+      - name: Dump container logs on failure
+        if: failure()
+        run: docker logs sg || true
+
+  # Belt-and-suspenders alongside supply-chain.yml: running cargo audit
+  # directly in CI ensures every PR gets a RustSec advisory scan even without
+  # the scheduled weekly supply-chain workflow. Mirrors the same RUSTSEC ignore
+  # list kept in supply-chain.yml — see that file for the full triage rationale.
+  #
+  # cargo-audit is installed as a prebuilt binary via taiki-e/install-action
+  # rather than compiled by rustsec/audit-check. The latter runs
+  # `cargo install cargo-audit` inside the checkout, which picks up the repo's
+  # rust-toolchain.toml pin (1.94) and then fails to build the newest
+  # transitive deps (kstring 2.0.5 needs rustc 1.96). The prebuilt binary is
+  # independent of the project MSRV and skips the ~60 s compile (issue #845).
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: Run cargo audit
+        run: cargo audit
+
+  # Coverage is measured with cargo-llvm-cov (works on the pinned stable
+  # toolchain, no nightly required) and reported only — there is deliberately
+  # no absolute threshold here. The LCOV report is uploaded as a build
+  # artifact and to Codecov, whose status check flags regressions against the
+  # recorded baseline rather than enforcing a fixed floor (issue #292).
+  coverage:
+    name: coverage (llvm-cov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          components: llvm-tools-preview
+
+      - uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ matrix.rust }}-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-coverage-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-${{ matrix.rust }}-
+            ${{ runner.os }}-cargo-coverage-
 
-      # Without this the repo's rust-toolchain.toml would pin every matrix leg
-      # to the MSRV, so the `stable` leg would silently retest 1.88 and report
-      # a green check for a toolchain it never ran.
-      - name: Test with locked dependencies
-        run: cargo test --locked
-        env:
-          RUSTUP_TOOLCHAIN: ${{ matrix.rust }}
+      - name: Install cargo-llvm-cov
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Generate coverage report
+        run: cargo llvm-cov --locked --all-features --lcov --output-path lcov.info
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: lcov.info
+
+      - name: Upload to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
