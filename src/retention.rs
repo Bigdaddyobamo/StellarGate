@@ -205,7 +205,9 @@ mod tests {
             .expect("pending delivery count should load from sqlite");
         }
 
-        let (deliveries, _) = prune_once(&state).await.unwrap();
+        let (deliveries, _) = prune_once(&state)
+            .await
+            .expect("prune_once should succeed");
         assert_eq!(deliveries, 2, "both aged terminal rows should go");
 
         let left: Vec<String> = sqlx::query_scalar("SELECT id FROM webhook_deliveries ORDER BY id")
@@ -228,14 +230,14 @@ mod tests {
         )
         .execute(&state.pool)
         .await
-        .unwrap();
+        .expect("inserting the stuck pending delivery should succeed");
 
         prune_once(&state).await.unwrap();
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM webhook_deliveries")
             .fetch_one(&state.pool)
             .await
-            .unwrap();
+            .expect("counting remaining deliveries should succeed");
         assert_eq!(n, 1, "a pending delivery must survive pruning");
     }
 

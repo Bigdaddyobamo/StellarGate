@@ -298,7 +298,10 @@ mod tests {
                 let mut shutdown = shutdown_for_child.clone();
                 async move {
                     runs.fetch_add(1, Ordering::SeqCst);
-                    let next = exits.lock().unwrap().pop();
+                    let next = exits
+                        .lock()
+                        .expect("exits mutex should not be poisoned")
+                        .pop();
                     match next {
                         Some(exit) => exit,
                         None => {
